@@ -23,6 +23,12 @@ Exports:
         finite real vectors.
     precision_recall_fscore_support -- per-class or averaged precision,
         recall, F1, and support for two integer label vectors.
+    confusion_matrix -- unweighted or weighted, optionally normalized
+        confusion counts with true labels as rows and predicted labels as
+        columns.
+    precision_score -- precision entry of precision_recall_fscore_support.
+    recall_score -- recall entry of precision_recall_fscore_support.
+    f1_score -- F1 entry of precision_recall_fscore_support.
     dumps -- serialize a fitted KMeans/PCA model to whitespace-free JSON
         text (quantized to 10 decimal places with ROUND_HALF_UP).
     loads -- reconstruct an independent fitted KMeans/PCA model from text
@@ -63,6 +69,10 @@ __all__ = [
     "accuracy_score",
     "mean_squared_error",
     "precision_recall_fscore_support",
+    "confusion_matrix",
+    "precision_score",
+    "recall_score",
+    "f1_score",
     "dumps",
     "loads",
 ]
@@ -1547,6 +1557,246 @@ def precision_recall_fscore_support(
         per_class[k][2] * support[labels[k]] for k in range(len(labels))
     ) / n
     return p, r, f, None
+
+
+_CM_NORMALIZES = (None, "true", "pred", "all")
+
+
+def confusion_matrix(y_true, y_pred, sample_weight=None, normalize=None):
+    """Build a confusion matrix with true labels as rows and predictions as
+    columns.
+
+    ``y_true`` and ``y_pred`` must be non-empty lists of equal length whose
+    elements have type exactly ``int`` (booleans are rejected). The labels
+    are the sorted union of the labels appearing in either vector; rows and
+    columns share that order. ``sample_weight`` must be ``None`` or a list
+    of the same length whose elements are finite non-negative values of
+    type exactly ``int`` or ``float`` (booleans are rejected). ``normalize``
+    must be one of ``None``, ``"true"``, ``"pred"``, or ``"all"``. Any
+    violation raises ValueError.
+
+    Without weights, each sample contributes one exact ``int`` count, so
+    the matrix is an ``int`` matrix. With weights, each cell sums the
+    weights of its samples with ``math.fsum`` in sample order, giving a
+    ``float`` matrix. Normalization divides each row by its total
+    (``"true"``), each column by its total (``"pred"``), or every cell by
+    the grand total (``"all"``); a zero denominator, or a cell that is an
+    exact zero, becomes ``0.0``. Overflow or any non-finite intermediate
+    value raises FloatingPointError.
+
+    The inputs are not modified. Deterministic: same inputs, same result.
+    """
+    n = _check_metric_vectors(y_true, y_pred)
+    for value in y_true:
+        if type(value) is not int:
+            raise ValueError("y_true must contain only integers")
+    for value in y_pred:
+        if type(value) is not int:
+            raise ValueError("y_pred must contain only integers")
+    if normalize not in _CM_NORMALIZES:
+        raise ValueError(
+            "normalize must be one of None, 'true', 'pred', 'all'"
+        )
+
+    weighted = sample_weight is not None
+    if weighted:
+        if not isinstance(sample_weight, list) or len(sample_weight) != n:
+            raise ValueError(
+                "sample_weight must be a list with the same length as the "
+                "label vectors"
+            )
+        for value in sample_weight:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                ) from exc
+            if not finite or value < 0:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+
+    labels = sorted(set(y_true) | set(y_pred))
+    index = {label: k for k, label in enumerate(labels)}
+    size = len(labels)
+
+    if weighted:
+        # Per-cell weight lists, accumulated in sample order, so each cell
+        # is reduced with math.fsum in that exact order.
+        terms = [[[] for _ in range(size)] for _ in range(size)]
+        for i in range(n):
+            terms[index[y_true[i]]][index[y_pred[i]]].append(
+                float(sample_weight[i])
+            )
+        matrix = [[0.0] * size for _ in range(size)]
+        for r in range(size):
+            for c in range(size):
+                cell_terms = terms[r][c]
+                if not cell_terms:
+                    continue
+                try:
+                    total = math.fsum(cell_terms)
+                except (OverflowError, ValueError) as exc:
+                    raise FloatingPointError(
+                        "non-finite value encountered during confusion matrix"
+                    ) from exc
+                if not math.isfinite(total):
+                    raise FloatingPointError(
+                        "non-finite value encountered during confusion matrix"
+                    )
+                matrix[r][c] = total
+    else:
+        matrix = [[0 for _ in range(size)] for _ in range(size)]
+        for i in range(n):
+            matrix[index[y_true[i]]][index[y_pred[i]]] += 1
+
+    if normalize is None:
+        return matrix
+
+    def checked_quotient(numerator, denominator):
+        """``numerator / denominator`` with an exact-zero or zero
+        denominator normalized to ``0.0``; non-finite results raise."""
+        if numerator == 0 or denominator == 0:
+            return 0.0
+        try:
+            result = numerator / denominator
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during confusion matrix "
+                "normalization"
+            ) from exc
+        if not math.isfinite(result):
+            raise FloatingPointError(
+                "non-finite value encountered during confusion matrix "
+                "normalization"
+            )
+        return result
+
+    if normalize == "true":
+        normalized = [[0.0] * size for _ in range(size)]
+        for r in range(size):
+            try:
+                row_total = math.fsum(matrix[r])
+            except (OverflowError, ValueError) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during confusion matrix "
+                    "normalization"
+                ) from exc
+            if not math.isfinite(row_total):
+                raise FloatingPointError(
+                    "non-finite value encountered during confusion matrix "
+                    "normalization"
+                )
+            for c in range(size):
+                normalized[r][c] = checked_quotient(
+                    matrix[r][c], row_total
+                )
+        return normalized
+
+    if normalize == "pred":
+        normalized = [[0.0] * size for _ in range(size)]
+        column_totals = []
+        for c in range(size):
+            try:
+                column_total = math.fsum(matrix[r][c] for r in range(size))
+            except (OverflowError, ValueError) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during confusion matrix "
+                    "normalization"
+                ) from exc
+            if not math.isfinite(column_total):
+                raise FloatingPointError(
+                    "non-finite value encountered during confusion matrix "
+                    "normalization"
+                )
+            column_totals.append(column_total)
+        for r in range(size):
+            for c in range(size):
+                normalized[r][c] = checked_quotient(
+                    matrix[r][c], column_totals[c]
+                )
+        return normalized
+
+    # normalize == "all"
+    try:
+        grand_total = math.fsum(
+            matrix[r][c] for r in range(size) for c in range(size)
+        )
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during confusion matrix "
+            "normalization"
+        ) from exc
+    if not math.isfinite(grand_total):
+        raise FloatingPointError(
+            "non-finite value encountered during confusion matrix "
+            "normalization"
+        )
+    normalized = [[0.0] * size for _ in range(size)]
+    for r in range(size):
+        for c in range(size):
+            normalized[r][c] = checked_quotient(
+                matrix[r][c], grand_total
+            )
+    return normalized
+
+
+def precision_score(
+    y_true, y_pred, average="binary", pos_label=1, zero_division=0
+):
+    """Return the precision entry of
+    :func:`precision_recall_fscore_support` for the same arguments.
+
+    Return types, validation, zero-denominator handling, and exceptions are
+    exactly those of the underlying function: a float for the averaging
+    modes and a list of floats when ``average`` is ``None``.
+    """
+    return precision_recall_fscore_support(
+        y_true, y_pred, average=average, pos_label=pos_label,
+        zero_division=zero_division
+    )[0]
+
+
+def recall_score(
+    y_true, y_pred, average="binary", pos_label=1, zero_division=0
+):
+    """Return the recall entry of
+    :func:`precision_recall_fscore_support` for the same arguments.
+
+    Return types, validation, zero-denominator handling, and exceptions are
+    exactly those of the underlying function: a float for the averaging
+    modes and a list of floats when ``average`` is ``None``.
+    """
+    return precision_recall_fscore_support(
+        y_true, y_pred, average=average, pos_label=pos_label,
+        zero_division=zero_division
+    )[1]
+
+
+def f1_score(
+    y_true, y_pred, average="binary", pos_label=1, zero_division=0
+):
+    """Return the F1 entry of
+    :func:`precision_recall_fscore_support` for the same arguments.
+
+    Return types, validation, zero-denominator handling, and exceptions are
+    exactly those of the underlying function: a float for the averaging
+    modes and a list of floats when ``average`` is ``None``.
+    """
+    return precision_recall_fscore_support(
+        y_true, y_pred, average=average, pos_label=pos_label,
+        zero_division=zero_division
+    )[2]
 
 
 _SERIAL_KEYS_KMEANS = (
