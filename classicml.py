@@ -9,6 +9,9 @@ Exports:
         using squared Euclidean distances.
     DecisionTreeClassifier -- deterministic binary decision tree classifier
         using Gini impurity splits.
+    RandomForestClassifier -- deterministic random forest classifier built
+        from bootstrap samples and random feature subsets, using the same
+        Gini split rules as DecisionTreeClassifier(max_depth=None).
     StandardScaler -- deterministic standardization by column mean and
         population standard deviation.
     accuracy_score -- fraction of positions where two integer label
@@ -33,6 +36,7 @@ from __future__ import annotations
 
 import json
 import math
+import random
 import sys
 from decimal import Decimal, ROUND_HALF_UP
 
@@ -41,6 +45,7 @@ __all__ = [
     "LogisticRegression",
     "KNeighborsClassifier",
     "DecisionTreeClassifier",
+    "RandomForestClassifier",
     "StandardScaler",
     "accuracy_score",
     "mean_squared_error",
@@ -681,6 +686,154 @@ class DecisionTreeClassifier:
                 else:
                     node = node.right
             results.append(node.label)
+        return results
+
+
+def _build_forest_tree(X, y, indices, rng, max_features, width):
+    """Build one random-forest tree over a bootstrap sample.
+
+    Follows the DecisionTreeClassifier(max_depth=None) rules exactly, except
+    that at every non-pure node the candidate features are restricted to
+    ``sorted(rng.sample(range(width), max_features))``. The sample call is
+    made at each non-pure node in left-first recursive order; pure nodes do
+    not consume randomness. Nodes with no strictly improving split become
+    leaves.
+    """
+    labels = [y[i] for i in indices]
+    node = _DecisionTreeNode(_majority_label(labels))
+
+    pure = True
+    first = labels[0]
+    for label in labels:
+        if label != first:
+            pure = False
+            break
+    if pure:
+        return node
+
+    features = sorted(rng.sample(range(width), max_features))
+    parent_gini = _gini_impurity(labels)
+    n = len(indices)
+    best = None  # (score, feature index, threshold)
+    for j in features:
+        values = sorted(set(X[i][j] for i in indices))
+        for t in values[:-1]:
+            left_labels = []
+            right_labels = []
+            for i in indices:
+                if X[i][j] <= t:
+                    left_labels.append(y[i])
+                else:
+                    right_labels.append(y[i])
+            score = (
+                len(left_labels) * _gini_impurity(left_labels)
+                + len(right_labels) * _gini_impurity(right_labels)
+            ) / n
+            if score < parent_gini and (
+                best is None or (score, j, t) < best
+            ):
+                best = (score, j, t)
+    if best is None:
+        return node
+
+    _, feature, threshold = best
+    left_indices = [i for i in indices if X[i][feature] <= threshold]
+    right_indices = [i for i in indices if X[i][feature] > threshold]
+    node.feature = feature
+    node.threshold = threshold
+    node.left = _build_forest_tree(
+        X, y, left_indices, rng, max_features, width
+    )
+    node.right = _build_forest_tree(
+        X, y, right_indices, rng, max_features, width
+    )
+    return node
+
+
+class RandomForestClassifier:
+    """Deterministic random forest classifier.
+
+    Each of the ``n_estimators`` trees is trained on a bootstrap sample of
+    the training rows: ``n`` draws from ``rng.randrange(n)`` with
+    replacement, duplicate rows kept in draw order, where
+    ``rng = random.Random(seed)`` is created fresh in every ``fit`` call.
+    At each non-pure node (in left-first recursive order) the candidate
+    features are ``sorted(rng.sample(range(p), max_features))``; split
+    scoring, thresholds, stopping, and tie-breaking follow
+    ``DecisionTreeClassifier(max_depth=None)`` exactly. Prediction is a
+    majority vote over the trees in training order, with ties going to the
+    smallest label. Deterministic for the same parameters and inputs.
+    """
+
+    def __init__(self, n_estimators=10, max_features=1, seed=0):
+        for name, value in (
+            ("n_estimators", n_estimators),
+            ("max_features", max_features),
+            ("seed", seed),
+        ):
+            if type(value) is not int:
+                raise ValueError("%s must be an integer" % name)
+        if n_estimators < 1:
+            raise ValueError("n_estimators must be at least 1")
+        if max_features < 1:
+            raise ValueError("max_features must be at least 1")
+        self.n_estimators = n_estimators
+        self.max_features = max_features
+        self.seed = seed
+        self._trees = None
+        self._n_features = None
+
+    def fit(self, X, y):
+        self._trees = None
+        self._n_features = None
+        width = _check_tree_matrix(X)
+        _check_label_vector(y, len(X))
+        if self.max_features > width:
+            raise ValueError(
+                "max_features must not exceed the number of features"
+            )
+
+        rng = random.Random(self.seed)
+        n = len(X)
+        trees = []
+        for _ in range(self.n_estimators):
+            sample_indices = [rng.randrange(n) for _ in range(n)]
+            boot_X = [X[i] for i in sample_indices]
+            boot_y = [y[i] for i in sample_indices]
+            trees.append(
+                _build_forest_tree(
+                    boot_X,
+                    boot_y,
+                    list(range(n)),
+                    rng,
+                    self.max_features,
+                    width,
+                )
+            )
+        self._trees = trees
+        self._n_features = width
+        return self
+
+    def predict(self, X):
+        if self._trees is None:
+            raise ValueError("model must be fitted before predict is called")
+        width = _check_tree_matrix(X)
+        if width != self._n_features:
+            raise ValueError(
+                "X must have the same number of features as the training data"
+            )
+        results = []
+        for row in X:
+            votes = []
+            for tree in self._trees:
+                node = tree
+                while node.feature is not None:
+                    if row[node.feature] <= node.threshold:
+                        node = node.left
+                    else:
+                        node = node.right
+                votes.append(node.label)
+            results.append(_majority_label(votes))
         return results
 
 
