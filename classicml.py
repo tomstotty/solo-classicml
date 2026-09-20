@@ -21,6 +21,8 @@ Exports:
         vectors agree.
     mean_squared_error -- mean of squared element-wise differences of two
         finite real vectors.
+    silhouette_score -- mean silhouette coefficient of an integer
+        clustering over a finite real matrix.
     precision_recall_fscore_support -- per-class or averaged precision,
         recall, F1, and support for two integer label vectors.
     confusion_matrix -- unweighted or weighted, optionally normalized
@@ -81,6 +83,7 @@ __all__ = [
     "PCA",
     "accuracy_score",
     "mean_squared_error",
+    "silhouette_score",
     "precision_recall_fscore_support",
     "confusion_matrix",
     "precision_score",
@@ -1424,6 +1427,194 @@ def mean_squared_error(y_true, y_pred):
     if result == 0:
         result = 0.0
     return result
+
+
+def silhouette_score(X, labels):
+    """Return the mean silhouette coefficient of a clustering.
+
+    ``X`` must be a non-empty rectangular list of non-empty rows whose
+    elements are finite values of type exactly ``int`` or ``float``
+    (booleans are rejected). ``labels`` must be a list of the same
+    length whose elements are of type exactly ``int``, and the number of
+    distinct labels must lie in ``[2, len(X) - 1]``. Any violation,
+    including an OverflowError from the finiteness check, raises
+    ValueError. The inputs are not modified.
+
+    The distance between samples ``i`` and ``j`` is
+    ``sqrt(math.fsum((X[i][k] - X[j][k]) ** 2))`` with terms in column
+    order. Clusters are ordered by ascending label and, within a
+    cluster, by input order; every sum uses ``math.fsum`` in that order.
+    A sample alone in its cluster scores ``0.0``; otherwise ``a_i`` is
+    its mean distance to the other members of its cluster, ``b_i`` is
+    the minimum over the other clusters of its mean distance to that
+    cluster, and with ``m = max(a_i, b_i)`` the score is ``0.0`` when
+    ``m == 0`` and ``(b_i - a_i) / m`` otherwise. The result is
+    ``math.fsum(s_i in input order) / len(X)`` as a float, with an exact
+    zero normalized to ``0.0``.
+
+    After validation, any subtraction, squaring, square root, ``fsum``,
+    or division that raises OverflowError/ValueError or yields a
+    non-finite value raises FloatingPointError. Deterministic: same
+    inputs, same result.
+    """
+    if not isinstance(X, list) or len(X) == 0:
+        raise ValueError("X must be a non-empty list of rows")
+    width = None
+    for row in X:
+        if not isinstance(row, list) or len(row) == 0:
+            raise ValueError("X rows must be non-empty lists")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError("X must be rectangular")
+        for value in row:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "X must contain only finite non-boolean numbers"
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "X must contain only finite non-boolean numbers"
+                ) from exc
+            if not finite:
+                raise ValueError(
+                    "X must contain only finite non-boolean numbers"
+                )
+    n = len(X)
+    if not isinstance(labels, list) or len(labels) != n:
+        raise ValueError("labels must be a list with the same length as X")
+    for value in labels:
+        if type(value) is not int:
+            raise ValueError("labels must contain only integers")
+    distinct = sorted(set(labels))
+    if not 2 <= len(distinct) <= n - 1:
+        raise ValueError(
+            "the number of distinct labels must be in [2, len(X) - 1]"
+        )
+
+    def non_finite():
+        return FloatingPointError(
+            "non-finite value encountered during silhouette score"
+        )
+
+    def distance(i, j):
+        terms = []
+        for k in range(width):
+            try:
+                diff = X[i][k] - X[j][k]
+            except (OverflowError, ValueError) as exc:
+                raise non_finite() from exc
+            if isinstance(diff, float) and not math.isfinite(diff):
+                raise non_finite()
+            try:
+                square = diff ** 2
+            except (OverflowError, ValueError) as exc:
+                raise non_finite() from exc
+            if isinstance(square, float) and not math.isfinite(square):
+                raise non_finite()
+            terms.append(square)
+        try:
+            total = math.fsum(terms)
+        except (OverflowError, ValueError) as exc:
+            raise non_finite() from exc
+        if not math.isfinite(total):
+            raise non_finite()
+        try:
+            dist = math.sqrt(total)
+        except (OverflowError, ValueError) as exc:
+            raise non_finite() from exc
+        if not math.isfinite(dist):
+            raise non_finite()
+        return dist
+
+    def checked_mean(terms, count):
+        try:
+            total = math.fsum(terms)
+        except (OverflowError, ValueError) as exc:
+            raise non_finite() from exc
+        if not math.isfinite(total):
+            raise non_finite()
+        try:
+            mean = total / count
+        except (OverflowError, ValueError) as exc:
+            raise non_finite() from exc
+        if not math.isfinite(mean):
+            raise non_finite()
+        return mean
+
+    distances = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = distance(i, j)
+            distances[i][j] = d
+            distances[j][i] = d
+
+    clusters = []
+    cluster_of = [0] * n
+    for label in distinct:
+        members = [i for i in range(n) if labels[i] == label]
+        for i in members:
+            cluster_of[i] = len(clusters)
+        clusters.append(members)
+
+    scores = []
+    for i in range(n):
+        own = cluster_of[i]
+        members = clusters[own]
+        if len(members) == 1:
+            scores.append(0.0)
+            continue
+        a_i = checked_mean(
+            [distances[i][j] for j in members if j != i],
+            len(members) - 1,
+        )
+        b_i = None
+        for c in range(len(clusters)):
+            if c == own:
+                continue
+            mean = checked_mean(
+                [distances[i][j] for j in clusters[c]],
+                len(clusters[c]),
+            )
+            if b_i is None or mean < b_i:
+                b_i = mean
+        m = a_i if a_i >= b_i else b_i
+        if m == 0:
+            scores.append(0.0)
+            continue
+        try:
+            diff = b_i - a_i
+        except (OverflowError, ValueError) as exc:
+            raise non_finite() from exc
+        if not math.isfinite(diff):
+            raise non_finite()
+        try:
+            s_i = diff / m
+        except (OverflowError, ValueError) as exc:
+            raise non_finite() from exc
+        if not math.isfinite(s_i):
+            raise non_finite()
+        scores.append(s_i)
+
+    try:
+        total = math.fsum(scores)
+    except (OverflowError, ValueError) as exc:
+        raise non_finite() from exc
+    if not math.isfinite(total):
+        raise non_finite()
+    try:
+        result = total / n
+    except (OverflowError, ValueError) as exc:
+        raise non_finite() from exc
+    if not math.isfinite(result):
+        raise non_finite()
+    if result == 0:
+        result = 0.0
+    return float(result)
 
 
 _PRF_AVERAGES = (None, "binary", "micro", "macro", "weighted")
