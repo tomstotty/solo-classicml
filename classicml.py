@@ -7,6 +7,8 @@ Exports:
         optional L2 penalty, trained by full-batch gradient descent.
     KNeighborsClassifier -- deterministic k-nearest-neighbors classifier
         using squared Euclidean distances.
+    StandardScaler -- deterministic standardization by column mean and
+        standard deviation.
 
 CLI:
     python classicml.py train-linear
@@ -28,7 +30,7 @@ import math
 import sys
 from decimal import Decimal, ROUND_HALF_UP
 
-__all__ = ["LinearRegression", "LogisticRegression", "KNeighborsClassifier"]
+__all__ = ["LinearRegression", "LogisticRegression", "KNeighborsClassifier", "StandardScaler"]
 
 _QUANTUM = Decimal("1E-10")
 _TRAIN_KEYS = ("X", "y", "lr", "l2", "max_iter", "tol")
@@ -451,6 +453,110 @@ class KNeighborsClassifier:
                     best_count = counts[label]
                     best_label = label
             results.append(best_label)
+        return results
+
+
+class StandardScaler:
+    """Standardize columns by subtracting the mean and dividing by scale.
+
+    Column means are ``math.fsum`` of the column values divided by the
+    number of rows; column scales are the population standard deviation
+    ``sqrt(math.fsum((value - mean) ** 2) / n)``. A zero-variance column
+    uses a scale of ``1.0``. Rows and columns are processed in input
+    order, and no randomness is used.
+    """
+
+    def __init__(self):
+        self.mean_ = None
+        self.scale_ = None
+        self.n_features_in_ = None
+
+    def fit(self, X):
+        self.mean_ = None
+        self.scale_ = None
+        self.n_features_in_ = None
+
+        width = _check_matrix(X)
+        n = len(X)
+
+        means = []
+        scales = []
+        for j in range(width):
+            try:
+                m = math.fsum(X[i][j] for i in range(n)) / n
+            except (OverflowError, ValueError) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during fit"
+                ) from exc
+            if not math.isfinite(m):
+                raise FloatingPointError(
+                    "non-finite value encountered during fit"
+                )
+
+            try:
+                v = math.fsum((X[i][j] - m) ** 2 for i in range(n)) / n
+            except (OverflowError, ValueError) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during fit"
+                ) from exc
+            if not math.isfinite(v):
+                raise FloatingPointError(
+                    "non-finite value encountered during fit"
+                )
+
+            if v == 0:
+                s = 1.0
+            else:
+                try:
+                    s = math.sqrt(v)
+                except (OverflowError, ValueError) as exc:
+                    raise FloatingPointError(
+                        "non-finite value encountered during fit"
+                    ) from exc
+                if not math.isfinite(s):
+                    raise FloatingPointError(
+                        "non-finite value encountered during fit"
+                    )
+
+            means.append(m)
+            scales.append(s)
+
+        self.mean_ = means
+        self.scale_ = scales
+        self.n_features_in_ = width
+        return self
+
+    def transform(self, X):
+        if (
+            self.mean_ is None
+            or self.scale_ is None
+            or self.n_features_in_ is None
+        ):
+            raise ValueError("scaler must be fitted before transform is called")
+        width = _check_matrix(X)
+        if width != self.n_features_in_:
+            raise ValueError(
+                "X must have the same number of features as the training data"
+            )
+
+        results = []
+        for row in X:
+            scaled_row = []
+            for j in range(width):
+                try:
+                    value = (row[j] - self.mean_[j]) / self.scale_[j]
+                except (OverflowError, ValueError) as exc:
+                    raise FloatingPointError(
+                        "non-finite value encountered during transform"
+                    ) from exc
+                if not math.isfinite(value):
+                    raise FloatingPointError(
+                        "non-finite value encountered during transform"
+                    )
+                if value == 0:
+                    value = 0.0
+                scaled_row.append(value)
+            results.append(scaled_row)
         return results
 
 
