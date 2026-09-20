@@ -32,6 +32,10 @@ Exports:
     roc_curve -- false/true positive rates and thresholds for a binary
         score ranking.
     roc_auc_score -- trapezoidal area under the roc_curve.
+    precision_recall_curve -- precision/recall pairs at descending score
+        thresholds for a binary score ranking.
+    average_precision_score -- stepwise area under the
+        precision_recall_curve.
     dumps -- serialize a fitted KMeans/PCA model to whitespace-free JSON
         text (quantized to 10 decimal places with ROUND_HALF_UP).
     loads -- reconstruct an independent fitted KMeans/PCA model from text
@@ -78,6 +82,8 @@ __all__ = [
     "f1_score",
     "roc_curve",
     "roc_auc_score",
+    "precision_recall_curve",
+    "average_precision_score",
     "dumps",
     "loads",
 ]
@@ -2013,6 +2019,198 @@ def roc_auc_score(y_true, y_score, pos_label=1, sample_weight=None):
     if auc == 0:
         auc = 0.0
     return auc
+
+
+def _pr_float(value):
+    """Convert a validated score/weight to float; overflow, invalid
+    operations, and non-finite results raise FloatingPointError."""
+    try:
+        result = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during precision-recall "
+            "computation"
+        ) from exc
+    if not math.isfinite(result):
+        raise FloatingPointError(
+            "non-finite value encountered during precision-recall "
+            "computation"
+        )
+    return result
+
+
+def precision_recall_curve(y_true, y_score, pos_label=1, sample_weight=None):
+    """Compute precision/recall pairs at descending score thresholds.
+
+    ``y_true`` and ``y_score`` must be non-empty lists of equal length.
+    ``y_true`` must contain values of type exactly ``int`` (booleans are
+    rejected) drawn from exactly two distinct labels, and ``pos_label``
+    must be an exact ``int`` equal to one of them; the other label is the
+    negative class. ``y_score`` must contain finite values of type exactly
+    ``int`` or ``float`` (booleans are rejected). ``sample_weight`` must be
+    ``None`` -- every sample then weighs ``1.0`` -- or a list of the same
+    length whose elements are finite non-negative values of type exactly
+    ``int`` or ``float``. The total weight of the positive class must be
+    greater than zero. Any violation raises ValueError.
+
+    The thresholds are the distinct score values in descending order,
+    each converted to ``float``. ``precision`` and ``recall`` start at
+    ``1.0`` and ``0.0``; each subsequent entry is computed from the
+    ``math.fsum`` of the weights -- taken in input order -- of the samples
+    whose score is greater than or equal to the threshold: precision is
+    ``tp / (tp + fp)`` (``1.0`` when the denominator is zero) and recall
+    is ``tp`` divided by the total positive-class weight. An exact zero
+    value is normalized to ``0.0``. Overflow, invalid operations, or
+    non-finite intermediate values after validation raise
+    FloatingPointError.
+
+    The return value is ``(precision, recall, thresholds)``: the first two
+    are lists of floats one element longer than the thresholds list. The
+    inputs are not modified. Deterministic: same inputs, same result.
+    """
+    n = _check_roc_vectors(y_true, y_score)
+    for value in y_true:
+        if type(value) is not int:
+            raise ValueError("y_true must contain only integers")
+    if type(pos_label) is not int:
+        raise ValueError("pos_label must be an integer")
+    labels = set(y_true)
+    if len(labels) != 2 or pos_label not in labels:
+        raise ValueError(
+            "y_true must contain exactly two distinct labels with "
+            "pos_label among them"
+        )
+    for value in y_score:
+        _check_finite_score(value, "y_score")
+
+    if sample_weight is None:
+        weights = [1.0] * n
+    else:
+        if not isinstance(sample_weight, list) or len(sample_weight) != n:
+            raise ValueError(
+                "sample_weight must be a list with the same length as "
+                "y_true"
+            )
+        for value in sample_weight:
+            _check_finite_score(value, "sample_weight")
+            if value < 0:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+        weights = [_pr_float(value) for value in sample_weight]
+
+    pos_terms_total = []
+    for i in range(n):
+        if y_true[i] == pos_label:
+            pos_terms_total.append(weights[i])
+    try:
+        pos_total = math.fsum(pos_terms_total)
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during precision-recall "
+            "computation"
+        ) from exc
+    if not math.isfinite(pos_total):
+        raise FloatingPointError(
+            "non-finite value encountered during precision-recall "
+            "computation"
+        )
+    if pos_total <= 0.0:
+        raise ValueError(
+            "the total weight of the positive class must be greater than 0"
+        )
+
+    thresholds = []
+    for value in sorted(set(y_score), reverse=True):
+        thresholds.append(_pr_float(value))
+
+    precisions = [1.0]
+    recalls = [0.0]
+    for threshold in thresholds:
+        fp_terms = []
+        tp_terms = []
+        for i in range(n):
+            if y_score[i] >= threshold:
+                if y_true[i] == pos_label:
+                    tp_terms.append(weights[i])
+                else:
+                    fp_terms.append(weights[i])
+        try:
+            fp = math.fsum(fp_terms)
+            tp = math.fsum(tp_terms)
+            denominator = tp + fp
+            if denominator == 0.0:
+                precision = 1.0
+            else:
+                precision = tp / denominator
+            recall = tp / pos_total
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during precision-recall "
+                "computation"
+            ) from exc
+        if not math.isfinite(precision) or not math.isfinite(recall):
+            raise FloatingPointError(
+                "non-finite value encountered during precision-recall "
+                "computation"
+            )
+        if precision == 0:
+            precision = 0.0
+        if recall == 0:
+            recall = 0.0
+        precisions.append(precision)
+        recalls.append(recall)
+    return precisions, recalls, thresholds
+
+
+def average_precision_score(y_true, y_score, pos_label=1, sample_weight=None):
+    """Return the stepwise area under :func:`precision_recall_curve` for
+    the same arguments.
+
+    Validation and exceptions are exactly those of
+    :func:`precision_recall_curve`. The score is the ``math.fsum`` -- over
+    threshold indices ``i`` in ascending order -- of the terms
+    ``(recall[i + 1] - recall[i]) * precision[i + 1]``; an exact zero
+    result is normalized to ``0.0``. Overflow, invalid operations, or
+    non-finite intermediate values raise FloatingPointError.
+
+    The return value is a float. The inputs are not modified.
+    Deterministic: same inputs, same result.
+    """
+    precisions, recalls, thresholds = precision_recall_curve(
+        y_true, y_score, pos_label=pos_label, sample_weight=sample_weight
+    )
+    terms = []
+    for i in range(len(thresholds)):
+        try:
+            term = (recalls[i + 1] - recalls[i]) * precisions[i + 1]
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during average-precision "
+                "computation"
+            ) from exc
+        if not math.isfinite(term):
+            raise FloatingPointError(
+                "non-finite value encountered during average-precision "
+                "computation"
+            )
+        terms.append(term)
+    try:
+        ap = math.fsum(terms)
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during average-precision "
+            "computation"
+        ) from exc
+    if not math.isfinite(ap):
+        raise FloatingPointError(
+            "non-finite value encountered during average-precision "
+            "computation"
+        )
+    if ap == 0:
+        ap = 0.0
+    return ap
 
 
 _SERIAL_KEYS_KMEANS = (
