@@ -29,6 +29,9 @@ Exports:
     precision_score -- precision entry of precision_recall_fscore_support.
     recall_score -- recall entry of precision_recall_fscore_support.
     f1_score -- F1 entry of precision_recall_fscore_support.
+    roc_curve -- false-positive rates, true-positive rates, and thresholds
+        for binary integer labels and finite real scores.
+    roc_auc_score -- area under the roc_curve by the trapezoidal rule.
     dumps -- serialize a fitted KMeans/PCA model to whitespace-free JSON
         text (quantized to 10 decimal places with ROUND_HALF_UP).
     loads -- reconstruct an independent fitted KMeans/PCA model from text
@@ -73,6 +76,8 @@ __all__ = [
     "precision_score",
     "recall_score",
     "f1_score",
+    "roc_curve",
+    "roc_auc_score",
     "dumps",
     "loads",
 ]
@@ -1797,6 +1802,202 @@ def f1_score(
         y_true, y_pred, average=average, pos_label=pos_label,
         zero_division=zero_division
     )[2]
+
+
+def _check_finite_score(value, name):
+    """Validate one score or weight: a finite value of type exactly ``int``
+    or ``float`` (booleans are rejected); anything else raises ValueError."""
+    if type(value) not in (int, float):
+        raise ValueError(
+            "%s must contain only finite non-boolean numbers" % name
+        )
+    # math.isfinite raises OverflowError for ints too large to convert to
+    # float; such values fail the finite requirement.
+    try:
+        finite = math.isfinite(value)
+    except OverflowError as exc:
+        raise ValueError(
+            "%s must contain only finite non-boolean numbers" % name
+        ) from exc
+    if not finite:
+        raise ValueError(
+            "%s must contain only finite non-boolean numbers" % name
+        )
+
+
+def _roc_fsum(terms, context):
+    """``math.fsum`` with overflow, invalid operations, and non-finite
+    results reported as FloatingPointError."""
+    try:
+        total = math.fsum(terms)
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during %s" % context
+        ) from exc
+    if not math.isfinite(total):
+        raise FloatingPointError(
+            "non-finite value encountered during %s" % context
+        )
+    return total
+
+
+def _check_roc_inputs(y_true, y_score, pos_label, sample_weight):
+    """Validate the shared roc_curve/roc_auc_score inputs and return
+    ``(n, weights, pos_total, neg_total)`` where ``weights`` is a fresh
+    list of floats (``1.0`` per sample when ``sample_weight`` is None)."""
+    n = _check_metric_vectors(y_true, y_score)
+    for value in y_true:
+        if type(value) is not int:
+            raise ValueError("y_true must contain only integers")
+    labels = set(y_true)
+    if len(labels) != 2:
+        raise ValueError("y_true must contain exactly two distinct labels")
+    if type(pos_label) is not int or pos_label not in labels:
+        raise ValueError(
+            "pos_label must be an integer equal to one of the two labels"
+        )
+    for value in y_score:
+        _check_finite_score(value, "y_score")
+
+    if sample_weight is None:
+        weights = [1.0] * n
+    else:
+        if not isinstance(sample_weight, list) or len(sample_weight) != n:
+            raise ValueError(
+                "sample_weight must be a list with the same length as "
+                "y_true and y_score"
+            )
+        weights = []
+        for value in sample_weight:
+            _check_finite_score(value, "sample_weight")
+            if value < 0:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+            weights.append(float(value))
+
+    pos_terms = []
+    neg_terms = []
+    for i in range(n):
+        if y_true[i] == pos_label:
+            pos_terms.append(weights[i])
+        else:
+            neg_terms.append(weights[i])
+    pos_total = _roc_fsum(pos_terms, "roc curve")
+    neg_total = _roc_fsum(neg_terms, "roc curve")
+    if pos_total <= 0 or neg_total <= 0:
+        raise ValueError(
+            "the total weight of each class must be positive"
+        )
+    return n, weights, pos_total, neg_total
+
+
+def roc_curve(y_true, y_score, pos_label=1, sample_weight=None):
+    """Return ``(fpr, tpr, thresholds)`` for binary labels and real scores.
+
+    ``y_true`` and ``y_score`` must be non-empty lists of equal length.
+    ``y_true`` must contain values of type exactly ``int`` forming exactly
+    two distinct classes (booleans are rejected); ``pos_label`` must be one
+    of those classes as a value of type exactly ``int``. ``y_score`` must
+    contain finite values of type exactly ``int`` or ``float`` (booleans
+    are rejected). ``sample_weight`` must be ``None`` or a list of the same
+    length whose elements are finite non-negative values of type exactly
+    ``int`` or ``float``; the default weight is ``1.0`` per sample. The
+    total weight of each class must be positive. Any violation raises
+    ValueError.
+
+    The thresholds are ``[math.inf]`` followed by the distinct score
+    values converted to ``float`` in descending order. ``fpr`` and ``tpr``
+    start at ``0.0``; each subsequent entry sums, with ``math.fsum`` in
+    input order, the weights of the negative (respectively positive)
+    samples whose score is greater than or equal to the threshold, divided
+    by that class's total weight. An exact zero quotient is written as
+    ``0.0``. All three results are lists of floats of equal length.
+
+    Overflow, invalid operations, or non-finite values during the
+    post-validation conversions and arithmetic raise FloatingPointError.
+    The inputs are not modified. Deterministic: same inputs, same result.
+    """
+    n, weights, pos_total, neg_total = _check_roc_inputs(
+        y_true, y_score, pos_label, sample_weight
+    )
+
+    distinct = sorted(set(y_score), reverse=True)
+    thresholds = [math.inf]
+    try:
+        for value in distinct:
+            thresholds.append(float(value))
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during roc curve"
+        ) from exc
+
+    def checked_rate(terms, total):
+        numerator = _roc_fsum(terms, "roc curve")
+        if numerator == 0:
+            return 0.0
+        try:
+            result = numerator / total
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during roc curve"
+            ) from exc
+        if not math.isfinite(result):
+            raise FloatingPointError(
+                "non-finite value encountered during roc curve"
+            )
+        return result
+
+    fpr = [0.0]
+    tpr = [0.0]
+    for threshold in thresholds[1:]:
+        pos_terms = []
+        neg_terms = []
+        for i in range(n):
+            if y_score[i] >= threshold:
+                if y_true[i] == pos_label:
+                    pos_terms.append(weights[i])
+                else:
+                    neg_terms.append(weights[i])
+        fpr.append(checked_rate(neg_terms, neg_total))
+        tpr.append(checked_rate(pos_terms, pos_total))
+    return fpr, tpr, thresholds
+
+
+def roc_auc_score(y_true, y_score, pos_label=1, sample_weight=None):
+    """Return the area under :func:`roc_curve` for the same arguments.
+
+    Validation and exceptions are exactly those of :func:`roc_curve`. The
+    area is the ``math.fsum`` of the trapezoid terms formed by adjacent
+    curve points: the ``fpr`` difference times half the sum of the two
+    endpoint ``tpr`` values. An exact zero result is normalized to ``0.0``.
+    Overflow, invalid operations, or non-finite intermediate values raise
+    FloatingPointError. The inputs are not modified. Deterministic: same
+    inputs, same result.
+    """
+    fpr, tpr, _ = roc_curve(
+        y_true, y_score, pos_label=pos_label, sample_weight=sample_weight
+    )
+    terms = []
+    for i in range(len(fpr) - 1):
+        try:
+            width = fpr[i + 1] - fpr[i]
+            height = tpr[i] + tpr[i + 1]
+            term = width * height / 2
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during roc auc score"
+            ) from exc
+        if not math.isfinite(term):
+            raise FloatingPointError(
+                "non-finite value encountered during roc auc score"
+            )
+        terms.append(term)
+    total = _roc_fsum(terms, "roc auc score")
+    if total == 0:
+        total = 0.0
+    return total
 
 
 _SERIAL_KEYS_KMEANS = (
