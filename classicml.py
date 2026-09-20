@@ -21,6 +21,8 @@ Exports:
         vectors agree.
     mean_squared_error -- mean of squared element-wise differences of two
         finite real vectors.
+    precision_recall_fscore_support -- per-class or averaged precision,
+        recall, F-score, and support for two integer label vectors.
     dumps -- serialize a fitted KMeans/PCA model to whitespace-free JSON
         text (quantized to 10 decimal places with ROUND_HALF_UP).
     loads -- reconstruct an independent fitted KMeans/PCA model from text
@@ -60,6 +62,7 @@ __all__ = [
     "PCA",
     "accuracy_score",
     "mean_squared_error",
+    "precision_recall_fscore_support",
     "dumps",
     "loads",
 ]
@@ -1391,6 +1394,133 @@ def mean_squared_error(y_true, y_pred):
     if result == 0:
         result = 0.0
     return result
+
+
+_AVERAGES = (None, "binary", "micro", "macro", "weighted")
+
+
+def _per_class_prf(y_true, y_pred, labels, zero_division):
+    """Count per-class tp/fp/fn/support (true labels as rows, predicted as
+    columns) and derive per-class precision, recall, and F-score."""
+    index = {label: i for i, label in enumerate(labels)}
+    k = len(labels)
+    tp = [0] * k
+    fp = [0] * k
+    fn = [0] * k
+    support = [0] * k
+    for i in range(len(y_true)):
+        row = index[y_true[i]]
+        col = index[y_pred[i]]
+        support[row] += 1
+        if row == col:
+            tp[row] += 1
+        else:
+            fn[row] += 1
+            fp[col] += 1
+    zero = float(zero_division)
+    precisions = []
+    recalls = []
+    fscores = []
+    for c in range(k):
+        p = tp[c] / (tp[c] + fp[c]) if tp[c] + fp[c] > 0 else zero
+        r = tp[c] / support[c] if support[c] > 0 else zero
+        f = 2 * p * r / (p + r) if p + r > 0 else zero
+        precisions.append(p)
+        recalls.append(r)
+        fscores.append(f)
+    return tp, fp, fn, support, precisions, recalls, fscores
+
+
+def precision_recall_fscore_support(
+    y_true, y_pred, average=None, pos_label=1, zero_division=0
+):
+    """Compute precision, recall, F-score, and support for integer labels.
+
+    Both ``y_true`` and ``y_pred`` must be non-empty lists of equal length
+    whose elements are exactly ``int`` (booleans are rejected); anything
+    else raises ``ValueError``. The label set is the sorted union of the
+    labels present in both vectors. Counts are accumulated with the true
+    label as the row and the predicted label as the column; for each class
+    ``tp``, ``fp``, ``fn``, and ``support`` give
+    ``P = tp / (tp + fp)``, ``R = tp / support``, and
+    ``F = 2 * P * R / (P + R)``, where any zero denominator yields
+    ``float(zero_division)``.
+
+    ``average`` must be one of ``None``, ``"binary"``, ``"micro"``,
+    ``"macro"``, or ``"weighted"``. ``pos_label`` must be exactly ``int``
+    and ``zero_division`` must be exactly the ``int`` ``0`` or ``1``;
+    violations raise ``ValueError``. ``"binary"`` requires exactly two
+    classes and a ``pos_label`` among them; every other mode requires
+    ``pos_label == 1``.
+
+    With ``average=None`` the result is ``(P, R, F, support)`` as lists in
+    ascending class order, with ``support`` a list of ints. ``"binary"``
+    selects the ``pos_label`` class; ``"micro"`` aggregates the counts
+    globally first; ``"macro"`` averages per class with ``math.fsum``;
+    ``"weighted"`` averages weighted by support over the number of
+    samples. The four averaging modes return ``(P, R, F, None)`` with
+    ``P``, ``R``, ``F`` as floats. The inputs are not modified.
+    Deterministic: same inputs, same result.
+    """
+    n = _check_metric_vectors(y_true, y_pred)
+    for name, values in (("y_true", y_true), ("y_pred", y_pred)):
+        for value in values:
+            if type(value) is not int:
+                raise ValueError("%s must contain only integers" % name)
+    if average not in _AVERAGES:
+        raise ValueError(
+            'average must be one of None, "binary", "micro", "macro", '
+            '"weighted"'
+        )
+    if type(pos_label) is not int:
+        raise ValueError("pos_label must be an integer")
+    if type(zero_division) is not int or zero_division not in (0, 1):
+        raise ValueError("zero_division must be the integer 0 or 1")
+
+    labels = sorted(set(y_true) | set(y_pred))
+    if average == "binary":
+        if len(labels) != 2:
+            raise ValueError(
+                "binary average requires exactly two classes"
+            )
+        if pos_label not in labels:
+            raise ValueError("pos_label must be one of the classes")
+    elif pos_label != 1:
+        raise ValueError("pos_label must be 1 unless average is 'binary'")
+
+    tp, fp, fn, support, precisions, recalls, fscores = _per_class_prf(
+        y_true, y_pred, labels, zero_division
+    )
+
+    if average is None:
+        return precisions, recalls, fscores, support
+    if average == "binary":
+        c = labels.index(pos_label)
+        return precisions[c], recalls[c], fscores[c], None
+    if average == "micro":
+        zero = float(zero_division)
+        tp_sum = sum(tp)
+        fp_sum = sum(fp)
+        fn_sum = sum(fn)
+        p = tp_sum / (tp_sum + fp_sum) if tp_sum + fp_sum > 0 else zero
+        r = tp_sum / (tp_sum + fn_sum) if tp_sum + fn_sum > 0 else zero
+        f = 2 * p * r / (p + r) if p + r > 0 else zero
+        return p, r, f, None
+    if average == "macro":
+        k = len(labels)
+        return (
+            math.fsum(precisions) / k,
+            math.fsum(recalls) / k,
+            math.fsum(fscores) / k,
+            None,
+        )
+    # weighted
+    return (
+        math.fsum(precisions[c] * support[c] for c in range(len(labels))) / n,
+        math.fsum(recalls[c] * support[c] for c in range(len(labels))) / n,
+        math.fsum(fscores[c] * support[c] for c in range(len(labels))) / n,
+        None,
+    )
 
 
 _SERIAL_KEYS_KMEANS = (
