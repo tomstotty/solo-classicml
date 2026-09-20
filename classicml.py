@@ -21,6 +21,11 @@ Exports:
         vectors agree.
     mean_squared_error -- mean of squared element-wise differences of two
         finite real vectors.
+    dumps -- serialize a fitted KMeans/PCA model to whitespace-free JSON
+        text (quantized to 10 decimal places with ROUND_HALF_UP).
+    loads -- reconstruct an independent fitted KMeans/PCA model from text
+        produced by dumps; anything outside that byte format raises
+        ValueError.
 
 CLI:
     python classicml.py train-linear
@@ -40,8 +45,9 @@ from __future__ import annotations
 import json
 import math
 import random
+import re
 import sys
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_UP, localcontext
 
 __all__ = [
     "LinearRegression",
@@ -54,6 +60,8 @@ __all__ = [
     "PCA",
     "accuracy_score",
     "mean_squared_error",
+    "dumps",
+    "loads",
 ]
 
 _QUANTUM = Decimal("1E-10")
@@ -1383,6 +1391,493 @@ def mean_squared_error(y_true, y_pred):
     if result == 0:
         result = 0.0
     return result
+
+
+_SERIAL_KEYS_KMEANS = (
+    "class",
+    "n_clusters",
+    "max_iter",
+    "tol",
+    "seed",
+    "cluster_centers",
+)
+_SERIAL_KEYS_PCA = ("class", "mean", "components")
+
+
+def _quantize_fixed(value):
+    """Quantize a finite non-boolean real to 10 decimal places (HALF_UP)
+    and return its canonical fixed-point JSON lexical form.
+
+    ``Decimal(str(float(value)))`` performs the quantization; negative zero
+    normalizes to ``0.0000000000``. The decimal context is given enough
+    precision for any magnitude a binary float could carry. Every rejection
+    (booleans, non-numbers, non-finite or unconvertibly large values) is a
+    ValueError.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("serialized values must be finite real numbers")
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "serialized values must be finite real numbers"
+        ) from exc
+    if not math.isfinite(number):
+        raise ValueError("serialized values must be finite real numbers")
+    with localcontext() as ctx:
+        ctx.prec = 400
+        decimal_value = Decimal(str(number)).quantize(
+            _QUANTUM, rounding=ROUND_HALF_UP
+        )
+    if decimal_value == 0:
+        return "0.0000000000"
+    return format(decimal_value, "f")
+
+
+def _encode_matrix(matrix):
+    if not isinstance(matrix, list) or len(matrix) == 0:
+        raise ValueError("cluster_centers_ must be a non-empty list of rows")
+    width = None
+    encoded_rows = []
+    for row in matrix:
+        if not isinstance(row, list) or len(row) == 0:
+            raise ValueError("centroid rows must be non-empty lists")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError("cluster_centers_ must be rectangular")
+        encoded_rows.append(
+            "[" + ",".join(_quantize_fixed(v) for v in row) + "]"
+        )
+    return "[" + ",".join(encoded_rows) + "]", width
+
+
+def _encode_vector(vector, length):
+    if not isinstance(vector, list) or len(vector) != length:
+        raise ValueError("state vector has the wrong type or shape")
+    return "[" + ",".join(_quantize_fixed(v) for v in vector) + "]"
+
+
+def dumps(model):
+    """Serialize a fitted KMeans or PCA model to compact JSON text.
+
+    The result contains no whitespace and no trailing newline. Integers
+    (``n_clusters``, ``max_iter``, ``seed``) are emitted as JSON integers;
+    ``tol`` and every array coordinate is quantized to 10 decimal places
+    with ROUND_HALF_UP (negative zero becomes ``0.0000000000``). A positive
+    ``tol`` that quantizes to zero is rejected, as are any non-fitted
+    models, non-KMeans/PCA objects, invalid construction parameters, and
+    malformed or non-finite state. The argument is not modified.
+    """
+    if isinstance(model, KMeans):
+        try:
+            return _dumps_kmeans(model)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("invalid KMeans state") from exc
+
+    if isinstance(model, PCA):
+        try:
+            return _dumps_pca(model)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("invalid PCA state") from exc
+
+    raise ValueError("dumps only supports fitted KMeans and PCA models")
+
+
+def _dumps_kmeans(model):
+    centers = model.cluster_centers_
+    if centers is None:
+        raise ValueError("KMeans must be fitted before dumps is called")
+    n_clusters = model.n_clusters
+    max_iter = model.max_iter
+    tol = model.tol
+    seed = model.seed
+    # Re-validate the construction parameters exactly as __init__ does.
+    if (
+        type(n_clusters) is not int
+        or n_clusters <= 0
+        or type(max_iter) is not int
+        or max_iter <= 0
+        or not _is_valid_tol(tol)
+        or type(seed) is not int
+    ):
+        raise ValueError("KMeans has invalid construction parameters")
+    centers_text, width = _encode_matrix(centers)
+    if len(centers) != n_clusters:
+        raise ValueError("number of centroids must equal n_clusters")
+    if type(model._n_features) is not int or model._n_features != width:
+        raise ValueError("KMeans feature count does not match centroids")
+    tol_text = _quantize_fixed(tol)
+    if Decimal(tol_text) == 0:
+        raise ValueError(
+            "tol must remain positive after quantization to 10 decimals"
+        )
+    return (
+        '{"class":"KMeans","n_clusters":'
+        + str(n_clusters)
+        + ',"max_iter":'
+        + str(max_iter)
+        + ',"tol":'
+        + tol_text
+        + ',"seed":'
+        + str(seed)
+        + ',"cluster_centers":'
+        + centers_text
+        + "}"
+    )
+
+
+def _is_valid_tol(tol):
+    """Mirror KMeans.__init__'s tol check without raising on ints too
+    large for ``math.isfinite`` to convert."""
+    if isinstance(tol, bool) or not isinstance(tol, (int, float)):
+        return False
+    try:
+        return math.isfinite(tol) and tol > 0
+    except OverflowError:
+        return False
+
+
+def _dumps_pca(model):
+    if model.mean_ is None or model.components_ is None:
+        raise ValueError("PCA must be fitted before dumps is called")
+    mean_text = _encode_vector(model.mean_, 2)
+    components = model.components_
+    if (
+        not isinstance(components, list)
+        or len(components) != 1
+        or not isinstance(components[0], list)
+        or len(components[0]) != 2
+    ):
+        raise ValueError("components_ must have shape [1][2]")
+    components_text = "[" + _encode_vector(components[0], 2) + "]"
+    return (
+        '{"class":"PCA","mean":'
+        + mean_text
+        + ',"components":'
+        + components_text
+        + "}"
+    )
+
+
+_JSON_INT_RE = re.compile(r"^(0|-?[1-9][0-9]*)$")
+_JSON_FLOAT_RE = re.compile(r"^-?(0|[1-9][0-9]*)\.[0-9]{10}$")
+# The only strings in the format are fixed keys and class names: plain
+# printable ASCII without quotes, backslashes, or control characters.
+_JSON_STRING_RE = re.compile(r'"[^"\\\x00-\x1f]*"')
+_JSON_NUMBER_RE = re.compile(
+    r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?"
+)
+_JSON_WS_RE = re.compile(r"[ \t\n\r]")
+_JSON_LITERAL_RE = re.compile(r"true|false|null")
+
+
+class _Object(list):
+    """Marker list holding an object's (key, value) pairs, distinct from a
+    plain JSON array (also represented by a list)."""
+
+
+def _decode_json(text):
+    """Strict recursive-descent JSON parser.
+
+    Accepts the JSON grammar while rejecting whitespace anywhere, trailing
+    characters, duplicate object keys, and numeric lexical forms outside
+    the serialized byte format (exponent notation, leading-plus fractions,
+    non-10-digit decimals). Booleans/null are parsed so that their presence
+    as values can be rejected by the structural validators.
+    """
+    return _JsonParser(text).parse()
+
+
+class _JsonParser:
+    def __init__(self, text):
+        self.text = text
+        self.n = len(text)
+        self.pos = 0
+
+    def error(self):
+        raise ValueError("malformed serialized model")
+
+    def parse(self):
+        value = self.parse_value()
+        if self.pos != self.n:
+            self.error()
+        return value
+
+    def parse_value(self):
+        if self.pos >= self.n:
+            self.error()
+        char = self.text[self.pos]
+        if char == "{":
+            return self.parse_object()
+        if char == "[":
+            return self.parse_array()
+        if char == '"':
+            return self.parse_string_token()
+        if char == "-" or "0" <= char <= "9":
+            return self.parse_number_token()
+        match = _JSON_LITERAL_RE.match(self.text, self.pos)
+        if match is not None:
+            literal = match.group(0)
+            self.pos = match.end()
+            if literal == "true":
+                return True
+            if literal == "false":
+                return False
+            return None
+        self.error()
+
+    def parse_object(self):
+        pairs = _Object()
+        self.pos += 1
+        if self.pos < self.n and self.text[self.pos] == "}":
+            self.pos += 1
+            return pairs
+        while True:
+            if self.pos >= self.n or self.text[self.pos] != '"':
+                self.error()
+            key = self.parse_string_token()
+            if self.pos >= self.n or self.text[self.pos] != ":":
+                self.error()
+            self.pos += 1
+            value = self.parse_value()
+            pairs.append((key, value))
+            if self.pos >= self.n:
+                self.error()
+            if self.text[self.pos] == ",":
+                self.pos += 1
+                continue
+            if self.text[self.pos] == "}":
+                self.pos += 1
+                break
+            self.error()
+        return pairs
+
+    def parse_array(self):
+        items = []
+        self.pos += 1
+        if self.pos < self.n and self.text[self.pos] == "]":
+            self.pos += 1
+            return items
+        while True:
+            items.append(self.parse_value())
+            if self.pos >= self.n:
+                self.error()
+            if self.text[self.pos] == ",":
+                self.pos += 1
+                continue
+            if self.text[self.pos] == "]":
+                self.pos += 1
+                break
+            self.error()
+        return items
+
+    def parse_string_token(self):
+        match = _JSON_STRING_RE.match(self.text, self.pos)
+        if match is None:
+            self.error()
+        self.pos = match.end()
+        return match.group(0)[1:-1]
+
+    def parse_number_token(self):
+        match = _JSON_NUMBER_RE.match(self.text, self.pos)
+        if match is None:
+            self.error()
+        token = match.group(0)
+        self.pos = match.end()
+        if _JSON_INT_RE.match(token):
+            return ("int", token)
+        if _JSON_FLOAT_RE.match(token):
+            return ("fixed", token)
+        # Any other valid JSON numeric form (e.g. exponents) is not part of
+        # the serialized byte format.
+        self.error()
+
+
+def _convert(node):
+    """Convert parser output into nested dicts/lists.
+
+    Number leaves keep their ``("int"|"fixed", token)`` tuples so callers
+    can enforce lexical/type rules; booleans and null are rejected.
+    """
+    if isinstance(node, _Object):
+        result = {}
+        for key, value in node:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = _convert(value)
+        return result
+    if isinstance(node, list):
+        return [_convert(item) for item in node]
+    if isinstance(node, tuple) and node[0] in ("int", "fixed"):
+        return node
+    if isinstance(node, str):
+        return node
+    # bool and None reached a value position.
+    raise ValueError("unexpected boolean or null in serialized model")
+
+
+def _expect_int(entry, name):
+    if not (
+        isinstance(entry, tuple)
+        and entry[0] == "int"
+        and _JSON_INT_RE.match(entry[1])
+    ):
+        raise ValueError("%s must be a JSON integer" % name)
+    return int(entry[1])
+
+
+def _expect_fixed(entry, name):
+    if not (
+        isinstance(entry, tuple)
+        and entry[0] == "fixed"
+        and _JSON_FLOAT_RE.match(entry[1])
+    ):
+        raise ValueError("%s must be a fixed 10-decimal JSON number" % name)
+    token = entry[1]
+    value = float(token)
+    if not math.isfinite(value):
+        raise ValueError("%s must be finite" % name)
+    # dumps normalizes negative zero to "0.0000000000".
+    if value == 0.0 and token[0] == "-":
+        raise ValueError("%s must not be negative zero" % name)
+    return value
+
+
+def _expect_fixed_vector(node, length, name):
+    if not isinstance(node, list) or len(node) != length:
+        raise ValueError("%s must have length %d" % (name, length))
+    return [_expect_fixed(item, name + " element") for item in node]
+
+
+def _load_kmeans(pairs):
+    keys = tuple(key for key, _ in pairs)
+    if keys != _SERIAL_KEYS_KMEANS:
+        raise ValueError("KMeans JSON must have exactly the serialized keys "
+                         "in the serialized order")
+    data = _convert(pairs)
+
+    class_name = data["class"]
+    if not isinstance(class_name, str) or class_name != "KMeans":
+        raise ValueError('class must be "KMeans"')
+
+    n_clusters = _expect_int(data["n_clusters"], "n_clusters")
+    max_iter = _expect_int(data["max_iter"], "max_iter")
+    seed = _expect_int(data["seed"], "seed")
+    if n_clusters <= 0:
+        raise ValueError("n_clusters must be greater than 0")
+    if max_iter <= 0:
+        raise ValueError("max_iter must be greater than 0")
+
+    tol = _expect_fixed(data["tol"], "tol")
+    if tol <= 0.0:
+        raise ValueError("tol must be greater than 0")
+
+    centers_node = data["cluster_centers"]
+    if not isinstance(centers_node, list) or len(centers_node) != n_clusters:
+        raise ValueError("number of centroid rows must equal n_clusters")
+    centers = []
+    width = None
+    for row in centers_node:
+        if not isinstance(row, list) or len(row) == 0:
+            raise ValueError("centroid rows must be non-empty lists")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError("centroids must be rectangular")
+        centers.append(
+            [_expect_fixed(v, "centroid coordinate") for v in row]
+        )
+
+    model = KMeans(
+        n_clusters=n_clusters, max_iter=max_iter, tol=tol, seed=seed
+    )
+    model.cluster_centers_ = [list(row) for row in centers]
+    model._n_features = width
+    return model
+
+
+def _load_pca(pairs):
+    keys = tuple(key for key, _ in pairs)
+    if keys != _SERIAL_KEYS_PCA:
+        raise ValueError("PCA JSON must have exactly the serialized keys "
+                         "in the serialized order")
+    data = _convert(pairs)
+
+    class_name = data["class"]
+    if not isinstance(class_name, str) or class_name != "PCA":
+        raise ValueError('class must be "PCA"')
+
+    mean = _expect_fixed_vector(data["mean"], 2, "mean")
+
+    components_node = data["components"]
+    if not isinstance(components_node, list) or len(components_node) != 1:
+        raise ValueError("components must have shape [[2]]")
+    components = [
+        _expect_fixed_vector(components_node[0], 2, "components row")
+    ]
+
+    model = PCA()
+    model.mean_ = list(mean)
+    model.components_ = [list(components[0])]
+    return model
+
+
+def loads(text):
+    """Reconstruct a fitted KMeans or PCA from text produced by dumps.
+
+    Only the exact byte format emitted by :func:`dumps` is accepted: a
+    ``str`` holding compact JSON with no whitespace, no duplicate keys,
+    the exact key sets in order, JSON integers for integer parameters,
+    10-decimal fixed-point numbers for floats, and consistent array
+    shapes. Anything else -- including non-str input, empty strings,
+    parse failures, booleans, exponent notation, non-finite values, or
+    illegal parameters -- raises ValueError. The returned model is
+    independent of the input and fitted; KMeans recovers its column count
+    from centroid width. The argument is not modified.
+    """
+    if not isinstance(text, str) or len(text) == 0:
+        raise ValueError("loads requires a non-empty str")
+    if _JSON_WS_RE.search(text):
+        raise ValueError("serialized model must contain no whitespace")
+
+    try:
+        pairs = _decode_json(text)
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError("malformed serialized model") from exc
+
+    if not isinstance(pairs, _Object) or len(pairs) == 0:
+        raise ValueError("top-level JSON value must be an object")
+
+    class_entry = None
+    for key, value in pairs:
+        if key == "class":
+            class_entry = value
+            break
+    if not isinstance(class_entry, str):
+        raise ValueError('object must contain a string "class" key')
+
+    if class_entry == "KMeans":
+        try:
+            return _load_kmeans(pairs)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("malformed serialized model") from exc
+    if class_entry == "PCA":
+        try:
+            return _load_pca(pairs)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("malformed serialized model") from exc
+    raise ValueError("unknown class in serialized model")
 
 
 def _format_fixed(value):
