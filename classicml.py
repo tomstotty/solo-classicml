@@ -42,6 +42,8 @@ Exports:
         binary probability vector.
     log_loss -- weighted logistic (cross-entropy) loss for a binary
         probability vector with clamped probabilities.
+    silhouette_score -- mean silhouette coefficient of a clustering over
+        a finite real matrix and an integer label vector.
     dumps -- serialize a fitted KMeans/PCA model to whitespace-free JSON
         text (quantized to 10 decimal places with ROUND_HALF_UP).
     loads -- reconstruct an independent fitted KMeans/PCA model from text
@@ -93,6 +95,7 @@ __all__ = [
     "calibration_curve",
     "brier_score_loss",
     "log_loss",
+    "silhouette_score",
     "dumps",
     "loads",
 ]
@@ -2764,6 +2767,205 @@ def log_loss(y_true, y_prob, pos_label=1, sample_weight=None):
     if loss == 0:
         loss = 0.0
     return loss
+
+
+def silhouette_score(X, labels):
+    """Compute the mean silhouette coefficient of a clustering.
+
+    ``X`` must be a non-empty rectangular ``list`` of non-empty ``list``
+    rows whose elements are finite values of type exactly ``int`` or
+    ``float`` (booleans and subclasses are rejected). ``labels`` must be
+    a ``list`` of the same length whose elements have type exactly
+    ``int``, and the number of distinct labels must lie in
+    ``[2, len(X) - 1]``. Any violation -- including overflow during the
+    finiteness checks -- raises ValueError.
+
+    The distance between samples ``i`` and ``j`` is
+    ``sqrt(math.fsum((X[i][k] - X[j][k]) ** 2))`` with terms accumulated
+    in column order. Clusters are the label groups in ascending label
+    order, keeping input order within each cluster. When the cluster of
+    sample ``i`` holds only ``i``, ``s_i`` is ``0.0``; otherwise ``a_i``
+    is the mean distance from ``i`` to the other samples of its cluster
+    and ``b_i`` is the smallest, over the other clusters, mean distance
+    from ``i`` to a cluster's samples, with every sum taken by
+    ``math.fsum`` in cluster input order. With ``m = max(a_i, b_i)``,
+    ``s_i`` is ``0.0`` when ``m == 0`` and ``(b_i - a_i) / m`` otherwise.
+    The result is ``math.fsum(s_i in input order) / len(X)`` with an
+    exact zero normalized to ``0.0``. Overflow, invalid operations, or
+    non-finite intermediate values after validation raise
+    FloatingPointError.
+
+    The return value is a float. The inputs are not modified.
+    Deterministic: same inputs, same result.
+    """
+    if not isinstance(X, list) or len(X) == 0:
+        raise ValueError("X must be a non-empty list of rows")
+    width = None
+    for row in X:
+        if not isinstance(row, list) or len(row) == 0:
+            raise ValueError("X rows must be non-empty lists")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError("X must be rectangular")
+        for value in row:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "X must contain only finite non-boolean numbers"
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "X must contain only finite non-boolean numbers"
+                ) from exc
+            if not finite:
+                raise ValueError(
+                    "X must contain only finite non-boolean numbers"
+                )
+    n = len(X)
+    if not isinstance(labels, list) or len(labels) != n:
+        raise ValueError("labels must be a list with the same length as X")
+    for value in labels:
+        if type(value) is not int:
+            raise ValueError("labels must contain only integers")
+    distinct = sorted(set(labels))
+    if len(distinct) < 2 or len(distinct) > n - 1:
+        raise ValueError(
+            "labels must contain between 2 and len(X) - 1 distinct labels"
+        )
+
+    clusters = {}
+    for i in range(n):
+        clusters.setdefault(labels[i], []).append(i)
+    groups = [clusters[label] for label in distinct]
+
+    def fail():
+        raise FloatingPointError(
+            "non-finite value encountered during silhouette score"
+        )
+
+    # Pairwise distances; d(i, j) == d(j, i) exactly, so each unordered
+    # pair is computed once with the smaller index first.
+    distances = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        row_i = X[i]
+        for j in range(i + 1, n):
+            row_j = X[j]
+            terms = []
+            for k in range(width):
+                try:
+                    diff = row_i[k] - row_j[k]
+                except (OverflowError, ValueError) as exc:
+                    raise FloatingPointError(
+                        "non-finite value encountered during silhouette "
+                        "score"
+                    ) from exc
+                if isinstance(diff, float) and not math.isfinite(diff):
+                    fail()
+                try:
+                    square = diff ** 2
+                except (OverflowError, ValueError) as exc:
+                    raise FloatingPointError(
+                        "non-finite value encountered during silhouette "
+                        "score"
+                    ) from exc
+                if isinstance(square, float) and not math.isfinite(square):
+                    fail()
+                terms.append(square)
+            try:
+                total = math.fsum(terms)
+            except (OverflowError, ValueError) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during silhouette score"
+                ) from exc
+            if not math.isfinite(total):
+                fail()
+            try:
+                distance = math.sqrt(total)
+            except (OverflowError, ValueError) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during silhouette score"
+                ) from exc
+            if not math.isfinite(distance):
+                fail()
+            distances[i][j] = distance
+            distances[j][i] = distance
+
+    def checked_mean(total_terms, count):
+        """``math.fsum(total_terms) / count`` with overflow, invalid
+        operations, and non-finite values raising FloatingPointError."""
+        try:
+            total = math.fsum(total_terms)
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during silhouette score"
+            ) from exc
+        if not math.isfinite(total):
+            fail()
+        try:
+            mean = total / count
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during silhouette score"
+            ) from exc
+        if not math.isfinite(mean):
+            fail()
+        return mean
+
+    s_values = []
+    for i in range(n):
+        own = clusters[labels[i]]
+        if len(own) == 1:
+            s_values.append(0.0)
+            continue
+        a_i = checked_mean(
+            [distances[i][j] for j in own if j != i], len(own) - 1
+        )
+        b_i = None
+        for group in groups:
+            if group is own:
+                continue
+            mean = checked_mean(
+                [distances[i][j] for j in group], len(group)
+            )
+            if b_i is None or mean < b_i:
+                b_i = mean
+        m = max(a_i, b_i)
+        if m == 0:
+            s_values.append(0.0)
+            continue
+        try:
+            s_i = (b_i - a_i) / m
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during silhouette score"
+            ) from exc
+        if not math.isfinite(s_i):
+            fail()
+        s_values.append(s_i)
+
+    try:
+        total = math.fsum(s_values)
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during silhouette score"
+        ) from exc
+    if not math.isfinite(total):
+        fail()
+    try:
+        result = total / n
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during silhouette score"
+        ) from exc
+    if not math.isfinite(result):
+        fail()
+    if result == 0:
+        result = 0.0
+    return result
 
 
 _SERIAL_KEYS_KMEANS = (
