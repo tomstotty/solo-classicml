@@ -17,6 +17,8 @@ Exports:
         seeded centroid initialization.
     PCA -- deterministic first-principal-component projection for
         two-dimensional data.
+    dumps -- serialize a fitted KMeans/PCA model to compact JSON text.
+    loads -- reconstruct a fitted KMeans/PCA model from that text.
     accuracy_score -- fraction of positions where two integer label
         vectors agree.
     mean_squared_error -- mean of squared element-wise differences of two
@@ -40,8 +42,9 @@ from __future__ import annotations
 import json
 import math
 import random
+import re
 import sys
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_UP, localcontext
 
 __all__ = [
     "LinearRegression",
@@ -52,6 +55,8 @@ __all__ = [
     "StandardScaler",
     "KMeans",
     "PCA",
+    "dumps",
+    "loads",
     "accuracy_score",
     "mean_squared_error",
 ]
@@ -1271,6 +1276,298 @@ class PCA:
     def fit_transform(self, X):
         self.fit(X)
         return self.transform(X)
+
+
+_KMEANS_KEYS = (
+    "class",
+    "n_clusters",
+    "max_iter",
+    "tol",
+    "seed",
+    "cluster_centers",
+)
+_PCA_KEYS = ("class", "mean", "components")
+_FIXED_RE = re.compile(r"^-?(?:0|[1-9][0-9]*)\.[0-9]{10}$")
+_INT_RE = re.compile(r"^(?:0|-?[1-9][0-9]*)$")
+
+
+def _serial_number_token(token):
+    # json.loads hook: keep the raw number lexeme so lexical validity can
+    # be checked against the exact byte specification.
+    return ("__number__", token)
+
+
+def _serial_error():
+    return ValueError("unsupported object for dumps")
+
+
+def _is_finite_scalar(value):
+    """True for finite values of exact type int or float (bools rejected)."""
+    if type(value) is int:
+        return True
+    return type(value) is float and math.isfinite(value)
+
+
+def _quantize_serial(value):
+    """Quantize a finite non-boolean int/float to 10 fixed decimal places."""
+    try:
+        value = float(value)
+        if not math.isfinite(value):
+            raise _serial_error()
+        # The largest finite float needs ~319 fixed-decimal digits; widen
+        # the context so quantize never clips a representable magnitude.
+        with localcontext() as context:
+            context.prec = 500
+            decimal_value = Decimal(str(value)).quantize(
+                _QUANTUM, rounding=ROUND_HALF_UP
+            )
+    except (ArithmeticError, ValueError, OverflowError, TypeError) as exc:
+        raise _serial_error() from exc
+    if not decimal_value.is_finite():
+        raise _serial_error()
+    if decimal_value == 0:
+        decimal_value = Decimal("0.0000000000")
+    return format(decimal_value, "f")
+
+
+def _serial_center_matrix(centers, n_clusters):
+    if (
+        type(centers) is not list
+        or len(centers) == 0
+        or len(centers) != n_clusters
+    ):
+        raise _serial_error()
+    width = None
+    rows = []
+    for row in centers:
+        if type(row) is not list or len(row) == 0:
+            raise _serial_error()
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise _serial_error()
+        formatted = []
+        for value in row:
+            if not _is_finite_scalar(value):
+                raise _serial_error()
+            formatted.append(_quantize_serial(value))
+        rows.append("[" + ",".join(formatted) + "]")
+    return "[" + ",".join(rows) + "]"
+
+
+def _serial_vector(values):
+    if type(values) is not list or len(values) != 2:
+        raise _serial_error()
+    formatted = []
+    for value in values:
+        if not _is_finite_scalar(value):
+            raise _serial_error()
+        formatted.append(_quantize_serial(value))
+    return "[" + ",".join(formatted) + "]"
+
+
+def dumps(model):
+    """Serialize a fitted KMeans/PCA model to compact JSON text.
+
+    Only fitted ``KMeans`` and ``PCA`` instances are accepted. Floating
+    point values are converted to ``float`` and written with exactly 10
+    digits after the decimal point using ``Decimal`` half-up rounding; a
+    negative zero is written as ``0.0000000000``. The returned string has
+    no whitespace and no trailing newline. Anything else -- other types,
+    unfitted models, invalid construction parameters, or state with the
+    wrong type, shape, or non-finite values -- raises ``ValueError``.
+    """
+    try:
+        return _dumps_impl(model)
+    except ValueError:
+        raise
+    except (TypeError, IndexError, AttributeError, OverflowError) as exc:
+        raise ValueError("unsupported object for dumps") from exc
+
+
+def _dumps_impl(model):
+    if type(model) is KMeans:
+        if type(model.n_clusters) is not int or model.n_clusters <= 0:
+            raise _serial_error()
+        if type(model.max_iter) is not int or model.max_iter <= 0:
+            raise _serial_error()
+        if type(model.seed) is not int:
+            raise _serial_error()
+        tol = model.tol
+        if not _is_finite_scalar(tol) or tol <= 0:
+            raise _serial_error()
+        tol_text = _quantize_serial(tol)
+        if Decimal(tol_text) <= 0:
+            raise _serial_error()
+        centers_text = _serial_center_matrix(
+            model.cluster_centers_, model.n_clusters
+        )
+        return (
+            '{"class":"KMeans","n_clusters":'
+            + str(model.n_clusters)
+            + ',"max_iter":'
+            + str(model.max_iter)
+            + ',"tol":'
+            + tol_text
+            + ',"seed":'
+            + str(model.seed)
+            + ',"cluster_centers":'
+            + centers_text
+            + "}"
+        )
+    if type(model) is PCA:
+        components_text = "[" + _serial_vector(model.components_[0]) + "]"
+        return (
+            '{"class":"PCA","mean":'
+            + _serial_vector(model.mean_)
+            + ',"components":'
+            + components_text
+            + "}"
+        )
+    raise _serial_error()
+
+
+def _serial_pairs_hook(pairs):
+    result = {}
+    for key, value in pairs:
+        if type(key) is not str or key in result:
+            raise ValueError("invalid serialized model")
+        result[key] = value
+    return result
+
+
+def _loads_error():
+    return ValueError("invalid serialized model")
+
+
+def _parse_int(value):
+    if (
+        type(value) is not tuple
+        or len(value) != 2
+        or value[0] != "__number__"
+        or not _INT_RE.fullmatch(value[1])
+    ):
+        raise _loads_error()
+    return int(value[1])
+
+
+def _parse_fixed(value):
+    if (
+        type(value) is not tuple
+        or len(value) != 2
+        or value[0] != "__number__"
+        or not _FIXED_RE.fullmatch(value[1])
+    ):
+        raise _loads_error()
+    token = value[1]
+    try:
+        decimal_value = Decimal(token)
+    except (ArithmeticError, ValueError) as exc:
+        raise _loads_error() from exc
+    # A negative zero can never appear in dumps output (zeros are written
+    # unsigned), so reject its lexical form outright.
+    if (not decimal_value.is_finite()) or (
+        decimal_value == 0 and token[0] == "-"
+    ):
+        raise _loads_error()
+    try:
+        result = float(decimal_value)
+    except (OverflowError, ValueError) as exc:
+        raise _loads_error() from exc
+    if not math.isfinite(result):
+        raise _loads_error()
+    return result
+
+
+def _parse_vector2(value):
+    if type(value) is not list or len(value) != 2:
+        raise _loads_error()
+    return [_parse_fixed(item) for item in value]
+
+
+def _serial_constant(token):
+    # NaN/Infinity never occur in dumps output.
+    raise ValueError("invalid serialized model")
+
+
+def loads(text):
+    """Reconstruct a fitted KMeans/PCA model from ``dumps`` output.
+
+    The argument must be a ``str`` conforming byte-for-byte to the format
+    produced by :func:`dumps`: compact JSON with no whitespace, the exact
+    key sets and key order, JSON integer parameters, fixed 10-decimal
+    numeric values, and consistent shapes. The returned model is
+    independent of the input and already fitted. Anything else raises
+    ``ValueError``.
+    """
+    if type(text) is not str or text == "":
+        raise ValueError("invalid serialized model")
+    # dumps output never contains whitespace or escape sequences; reject
+    # any input that does before parsing.
+    if any(ch in text for ch in " \t\n\r") or "\\" in text:
+        raise ValueError("invalid serialized model")
+    try:
+        data = json.loads(
+            text,
+            object_pairs_hook=_serial_pairs_hook,
+            parse_int=_serial_number_token,
+            parse_float=_serial_number_token,
+            parse_constant=_serial_constant,
+        )
+    except ValueError as exc:
+        raise ValueError("invalid serialized model") from exc
+    if type(data) is not dict:
+        raise ValueError("invalid serialized model")
+    keys = tuple(data.keys())
+
+    if keys == _KMEANS_KEYS:
+        if data["class"] != "KMeans":
+            raise ValueError("invalid serialized model")
+        n_clusters = _parse_int(data["n_clusters"])
+        max_iter = _parse_int(data["max_iter"])
+        seed = _parse_int(data["seed"])
+        if n_clusters <= 0 or max_iter <= 0:
+            raise ValueError("invalid serialized model")
+        tol = _parse_fixed(data["tol"])
+        if tol <= 0.0:
+            raise ValueError("invalid serialized model")
+
+        centers_value = data["cluster_centers"]
+        if type(centers_value) is not list or len(centers_value) != n_clusters:
+            raise ValueError("invalid serialized model")
+        centers = []
+        width = None
+        for row in centers_value:
+            if type(row) is not list or len(row) == 0:
+                raise ValueError("invalid serialized model")
+            if width is None:
+                width = len(row)
+            elif len(row) != width:
+                raise ValueError("invalid serialized model")
+            centers.append([_parse_fixed(item) for item in row])
+
+        model = KMeans(
+            n_clusters=n_clusters,
+            max_iter=max_iter,
+            tol=tol,
+            seed=seed,
+        )
+        model.cluster_centers_ = centers
+        model._n_features = width
+        return model
+
+    if keys == _PCA_KEYS:
+        if data["class"] != "PCA":
+            raise ValueError("invalid serialized model")
+        components_value = data["components"]
+        if type(components_value) is not list or len(components_value) != 1:
+            raise ValueError("invalid serialized model")
+        model = PCA()
+        model.mean_ = _parse_vector2(data["mean"])
+        model.components_ = [_parse_vector2(components_value[0])]
+        return model
+
+    raise ValueError("invalid serialized model")
 
 
 def _check_metric_vectors(y_true, y_pred):
