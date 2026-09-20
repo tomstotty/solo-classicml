@@ -40,6 +40,8 @@ Exports:
         predicted probabilities for a binary probability vector.
     brier_score_loss -- weighted mean squared probability error for a
         binary probability vector.
+    log_loss -- weighted mean negative log-likelihood for a binary
+        probability vector.
     dumps -- serialize a fitted KMeans/PCA model to whitespace-free JSON
         text (quantized to 10 decimal places with ROUND_HALF_UP).
     loads -- reconstruct an independent fitted KMeans/PCA model from text
@@ -90,6 +92,7 @@ __all__ = [
     "average_precision_score",
     "calibration_curve",
     "brier_score_loss",
+    "log_loss",
     "dumps",
     "loads",
 ]
@@ -2594,6 +2597,168 @@ def brier_score_loss(y_true, y_prob, pos_label=1, sample_weight=None):
     if not math.isfinite(total_error) or not math.isfinite(loss):
         raise FloatingPointError(
             "non-finite value encountered during brier-score computation"
+        )
+    if loss == 0:
+        loss = 0.0
+    return loss
+
+
+def _logloss_float(value):
+    """Convert a validated probability/weight to float; overflow, invalid
+    operations, and non-finite results raise FloatingPointError."""
+    try:
+        result = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during log-loss computation"
+        ) from exc
+    if not math.isfinite(result):
+        raise FloatingPointError(
+            "non-finite value encountered during log-loss computation"
+        )
+    return result
+
+
+def log_loss(y_true, y_prob, pos_label=1, sample_weight=None):
+    """Compute the weighted mean negative log-likelihood.
+
+    ``y_true`` and ``y_prob`` must be non-empty lists of equal length.
+    ``y_true`` must contain values of type exactly ``int`` (booleans are
+    rejected) drawn from exactly two distinct labels, and ``pos_label``
+    must be an exact ``int`` equal to one of them. ``y_prob`` must contain
+    finite values in the closed interval ``[0, 1]`` whose type is exactly
+    ``int`` or ``float`` (booleans are rejected). ``sample_weight`` must be
+    ``None`` -- every sample then weighs ``1.0`` -- or a list of the same
+    length whose elements are finite non-negative values of type exactly
+    ``int`` or ``float`` (booleans are rejected). The total weight must be
+    greater than zero. Any violation (including overflow during the
+    finiteness checks) raises ValueError.
+
+    After validation, the probabilities and weights are converted to
+    ``float``; each probability is clipped to
+    ``min(max(p, 1e-15), 1 - 1e-15)`` and ``t_i`` is true when the label
+    equals ``pos_label``. The per-sample loss is ``-math.log(p_i)`` when
+    ``t_i`` is true and ``-math.log1p(-p_i)`` otherwise. The result is the
+    quotient of two ``math.fsum`` sums accumulated in input order -- one of
+    ``w_i * loss_i``, the other of the ``w_i`` -- with an exact zero
+    normalized to ``0.0``. Overflow, invalid operations during the
+    post-validation conversion or arithmetic, and non-finite intermediate
+    values or results raise FloatingPointError.
+
+    The return value is a float. The inputs are not modified.
+    Deterministic: same inputs, same result.
+    """
+    if not isinstance(y_true, list) or not isinstance(y_prob, list):
+        raise ValueError("y_true and y_prob must be lists")
+    if len(y_true) == 0 or len(y_prob) == 0:
+        raise ValueError("y_true and y_prob must be non-empty lists")
+    if len(y_true) != len(y_prob):
+        raise ValueError("y_true and y_prob must have the same length")
+    n = len(y_true)
+
+    for value in y_true:
+        if type(value) is not int:
+            raise ValueError("y_true must contain only integers")
+    if type(pos_label) is not int:
+        raise ValueError("pos_label must be an integer")
+    labels = set(y_true)
+    if len(labels) != 2 or pos_label not in labels:
+        raise ValueError(
+            "y_true must contain exactly two distinct labels with "
+            "pos_label among them"
+        )
+
+    for value in y_prob:
+        if type(value) not in (int, float):
+            raise ValueError(
+                "y_prob must contain only finite numbers in [0, 1]"
+            )
+        # math.isfinite raises OverflowError for ints too large to
+        # convert to float; such values fail the finite requirement.
+        try:
+            finite = math.isfinite(value)
+        except OverflowError as exc:
+            raise ValueError(
+                "y_prob must contain only finite numbers in [0, 1]"
+            ) from exc
+        if not finite or value < 0 or value > 1:
+            raise ValueError(
+                "y_prob must contain only finite numbers in [0, 1]"
+            )
+
+    if sample_weight is None:
+        weights = [1.0] * n
+    else:
+        if not isinstance(sample_weight, list) or len(sample_weight) != n:
+            raise ValueError(
+                "sample_weight must be a list with the same length as "
+                "y_true"
+            )
+        for value in sample_weight:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                ) from exc
+            if not finite or value < 0:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+        weights = [_logloss_float(value) for value in sample_weight]
+
+    try:
+        total_weight = math.fsum(weights)
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during log-loss computation"
+        ) from exc
+    if not math.isfinite(total_weight):
+        raise FloatingPointError(
+            "non-finite value encountered during log-loss computation"
+        )
+    if total_weight <= 0.0:
+        raise ValueError("the total weight must be greater than 0")
+
+    loss_terms = []
+    for i in range(n):
+        p = _logloss_float(y_prob[i])
+        p = min(max(p, 1e-15), 1.0 - 1e-15)
+        try:
+            if y_true[i] == pos_label:
+                sample_loss = -math.log(p)
+            else:
+                sample_loss = -math.log1p(-p)
+            term = weights[i] * sample_loss
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during log-loss computation"
+            ) from exc
+        if not math.isfinite(term):
+            raise FloatingPointError(
+                "non-finite value encountered during log-loss computation"
+            )
+        loss_terms.append(term)
+
+    try:
+        total_loss = math.fsum(loss_terms)
+        loss = total_loss / total_weight
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during log-loss computation"
+        ) from exc
+    if not math.isfinite(total_loss) or not math.isfinite(loss):
+        raise FloatingPointError(
+            "non-finite value encountered during log-loss computation"
         )
     if loss == 0:
         loss = 0.0
