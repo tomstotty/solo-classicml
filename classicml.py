@@ -7,6 +7,8 @@ Exports:
         optional L2 penalty, trained by full-batch gradient descent.
     KNeighborsClassifier -- deterministic k-nearest-neighbors classifier
         using squared Euclidean distances.
+    DecisionTreeClassifier -- deterministic CART-style decision tree
+        classifier using Gini impurity.
     StandardScaler -- deterministic standardization by column mean and
         population standard deviation.
     accuracy_score -- fraction of positions where two integer label
@@ -38,6 +40,7 @@ __all__ = [
     "LinearRegression",
     "LogisticRegression",
     "KNeighborsClassifier",
+    "DecisionTreeClassifier",
     "StandardScaler",
     "accuracy_score",
     "mean_squared_error",
@@ -485,6 +488,194 @@ class KNeighborsClassifier:
                     best_count = counts[label]
                     best_label = label
             results.append(best_label)
+        return results
+
+
+def _gini_impurity(counts, total):
+    """Gini impurity ``1 - sum((c / total) ** 2)`` from per-label counts.
+
+    Counts are iterated in ascending label order. The divisions, powers,
+    and ``math.fsum`` are checked; overflow, invalid operations, and
+    non-finite results raise FloatingPointError.
+    """
+    terms = []
+    for c in counts:
+        try:
+            ratio = c / total
+            term = ratio ** 2
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during gini computation"
+            ) from exc
+        if isinstance(term, float) and not math.isfinite(term):
+            raise FloatingPointError(
+                "non-finite value encountered during gini computation"
+            )
+        terms.append(term)
+    try:
+        summed = math.fsum(terms)
+        result = 1 - summed
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during gini computation"
+        ) from exc
+    if isinstance(result, float) and not math.isfinite(result):
+        raise FloatingPointError(
+            "non-finite value encountered during gini computation"
+        )
+    return result
+
+
+class DecisionTreeClassifier:
+    """Deterministic CART-style decision tree classifier using Gini impurity.
+
+    For each split, every feature's values in the node are deduplicated and
+    sorted ascending; each value other than the maximum is tried as a
+    threshold ``t`` with ``x <= t`` going to the left child. The candidate
+    score is ``(|L| * gini(L) + |R| * gini(R)) / |S|``; only candidates with
+    a score strictly smaller than the parent node's Gini impurity are
+    accepted, and the split with the smallest ``(score, feature index, t)``
+    is chosen. A node becomes a leaf when its labels are pure, when
+    ``max_depth`` is reached, or when no split improves the impurity. Leaf
+    labels are the modal label with ties broken toward the smallest label.
+    The root is at depth 0. No randomness is used.
+    """
+
+    def __init__(self, max_depth=None):
+        if max_depth is not None and (
+            type(max_depth) is not int or max_depth <= 0
+        ):
+            raise ValueError("max_depth must be None or a positive integer")
+        self.max_depth = max_depth
+        self._tree = None
+        self._width = None
+
+    @staticmethod
+    def _validate(X):
+        # Elements are accepted only when type(value) is exactly int or
+        # float and math.isfinite(value) is true; booleans are rejected.
+        # math.isfinite raises OverflowError for ints too large to convert
+        # to float; such values fail the finite-number requirement.
+        try:
+            return _check_matrix_exact(X)
+        except OverflowError as exc:
+            raise ValueError(
+                "X must contain only finite non-boolean numbers"
+            ) from exc
+
+    def fit(self, X, y):
+        # Discard any previously fitted model before validating the new
+        # inputs; a failed fit leaves the estimator unfitted.
+        self._tree = None
+        self._width = None
+
+        width = self._validate(X)
+        _check_label_vector(y, len(X))
+
+        tree = self._build(X, y, width, 0)
+        self._tree = tree
+        self._width = width
+        return self
+
+    def _modal_label(self, counts):
+        """Smallest label attaining the maximum count."""
+        best_label = None
+        best_count = -1
+        for label in sorted(counts):
+            if counts[label] > best_count:
+                best_count = counts[label]
+                best_label = label
+        return best_label
+
+    def _counts(self, y, indices):
+        counts = {}
+        for i in indices:
+            label = y[i]
+            counts[label] = counts.get(label, 0) + 1
+        return counts
+
+    def _gini(self, counts, total):
+        return _gini_impurity(
+            [counts[label] for label in sorted(counts)], total
+        )
+
+    def _build(self, X, y, width, depth):
+        indices = list(range(len(X)))
+        return self._build_node(X, y, width, depth, indices)
+
+    def _build_node(self, X, y, width, depth, indices):
+        counts = self._counts(y, indices)
+        label = self._modal_label(counts)
+        total = len(indices)
+        parent_gini = self._gini(counts, total)
+
+        if len(counts) == 1:
+            return (label, None, None, None, None)
+        if self.max_depth is not None and depth >= self.max_depth:
+            return (label, None, None, None, None)
+
+        best = None
+        for j in range(width):
+            values = sorted({X[i][j] for i in indices})
+            thresholds = values[:-1]
+            for t in thresholds:
+                left = []
+                right = []
+                left_counts = {}
+                right_counts = {}
+                for i in indices:
+                    label_i = y[i]
+                    if X[i][j] <= t:
+                        left.append(i)
+                        left_counts[label_i] = left_counts.get(label_i, 0) + 1
+                    else:
+                        right.append(i)
+                        right_counts[label_i] = (
+                            right_counts.get(label_i, 0) + 1
+                        )
+                gini_left = self._gini(left_counts, len(left))
+                gini_right = self._gini(right_counts, len(right))
+                try:
+                    score = (
+                        len(left) * gini_left + len(right) * gini_right
+                    ) / total
+                except (OverflowError, ValueError) as exc:
+                    raise FloatingPointError(
+                        "non-finite value encountered during split scoring"
+                    ) from exc
+                if isinstance(score, float) and not math.isfinite(score):
+                    raise FloatingPointError(
+                        "non-finite value encountered during split scoring"
+                    )
+                if score < parent_gini and (
+                    best is None or (score, j, t) < best[0]
+                ):
+                    best = ((score, j, t), left, right)
+
+        if best is None:
+            return (label, None, None, None, None)
+
+        _, feature, threshold = best[0]
+        left_tree = self._build_node(X, y, width, depth + 1, best[1])
+        right_tree = self._build_node(X, y, width, depth + 1, best[2])
+        return (label, feature, threshold, left_tree, right_tree)
+
+    def predict(self, X):
+        if self._tree is None or self._width is None:
+            raise ValueError("model must be fitted before predict is called")
+        width = self._validate(X)
+        if width != self._width:
+            raise ValueError(
+                "X must have the same number of features as the training data"
+            )
+
+        results = []
+        for row in X:
+            node = self._tree
+            while node[1] is not None:
+                _, feature, threshold, left_tree, right_tree = node
+                node = left_tree if row[feature] <= threshold else right_tree
+            results.append(node[0])
         return results
 
 
