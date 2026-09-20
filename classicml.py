@@ -3,6 +3,9 @@
 Exports:
     LinearRegression -- deterministic ordinary least squares regression with
         an optional L2 (ridge) penalty, trained by full-batch gradient descent.
+    LogisticRegression -- deterministic binary logistic regression (labels 0
+        and 1) with an optional L2 penalty, trained by full-batch gradient
+        descent.
 
 CLI:
     python classicml.py train-linear
@@ -10,6 +13,10 @@ CLI:
         ``X, y, lr, l2, max_iter, tol`` (in that order) and writes a compact
         JSON object with the keys
         ``class, lr, l2, max_iter, tol, w, b`` (in that order).
+    python classicml.py train-logistic
+        Uses the exact same input/output schema and formatting as
+        ``train-linear``; only the ``class`` field differs and is
+        ``"LogisticRegression"``.
 """
 
 from __future__ import annotations
@@ -19,7 +26,7 @@ import math
 import sys
 from decimal import Decimal, ROUND_HALF_UP
 
-__all__ = ["LinearRegression"]
+__all__ = ["LinearRegression", "LogisticRegression"]
 
 _QUANTUM = Decimal("1E-10")
 _TRAIN_KEYS = ("X", "y", "lr", "l2", "max_iter", "tol")
@@ -65,6 +72,27 @@ def _check_vector(y, n):
     for value in y:
         if not _is_finite_number(value):
             raise ValueError("y must contain only finite non-boolean numbers")
+
+
+def _check_labels(y, n):
+    """Validate a binary label vector of plain ints equal to 0 or 1."""
+    if not isinstance(y, list) or len(y) != n:
+        raise ValueError("y must be a list with the same length as X")
+    for value in y:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value not in (0, 1)
+        ):
+            raise ValueError("y must contain only integers equal to 0 or 1")
+
+
+def _sigmoid(z):
+    """Numerically stable logistic function s(z)."""
+    if z >= 0:
+        return 1.0 / (1.0 + math.exp(-z))
+    e = math.exp(z)
+    return e / (1.0 + e)
 
 
 class LinearRegression:
@@ -192,6 +220,104 @@ class LinearRegression:
         return results
 
 
+class LogisticRegression(LinearRegression):
+    """Binary logistic regression fitted with full-batch gradient descent.
+
+    Targets must be plain integers equal to 0 or 1. The objective is the mean
+    cross-entropy loss plus ``l2 * sum(w**2)``; the intercept is not penalized.
+    Training uses no randomness.
+    """
+
+    def fit(self, X, y):
+        width = _check_matrix(X)
+        _check_labels(y, len(X))
+
+        n = len(X)
+        w = [0.0] * width
+        b = 0.0
+        lr = self.lr
+        l2 = self.l2
+
+        for _ in range(self.max_iter):
+            probs = []
+            for row in X:
+                z = math.fsum(w[j] * row[j] for j in range(width)) + b
+                if not math.isfinite(z):
+                    raise FloatingPointError(
+                        "non-finite logit encountered during fit"
+                    )
+                p = _sigmoid(z)
+                if not math.isfinite(p):
+                    raise FloatingPointError(
+                        "non-finite probability encountered during fit"
+                    )
+                probs.append(p)
+
+            new_w = [0.0] * width
+            for j in range(width):
+                grad = (
+                    math.fsum(
+                        (probs[i] - y[i]) * X[i][j] for i in range(n)
+                    )
+                    / n
+                    + 2.0 * l2 * w[j]
+                )
+                if not math.isfinite(grad):
+                    raise FloatingPointError(
+                        "non-finite weight gradient encountered during fit"
+                    )
+                updated = w[j] - lr * grad
+                if not math.isfinite(updated):
+                    raise FloatingPointError(
+                        "non-finite weight value encountered during fit"
+                    )
+                new_w[j] = updated
+
+            grad_b = math.fsum(probs[i] - y[i] for i in range(n)) / n
+            if not math.isfinite(grad_b):
+                raise FloatingPointError(
+                    "non-finite bias gradient encountered during fit"
+                )
+            new_b = b - lr * grad_b
+            if not math.isfinite(new_b):
+                raise FloatingPointError(
+                    "non-finite bias value encountered during fit"
+                )
+
+            max_step = abs(new_b - b)
+            for j in range(width):
+                step = abs(new_w[j] - w[j])
+                if step > max_step:
+                    max_step = step
+
+            w = new_w
+            b = new_b
+
+            if max_step <= self.tol:
+                break
+
+        self.w = w
+        self.b = b
+        return self
+
+    def predict(self, X):
+        if self.w is None or self.b is None:
+            raise ValueError("model must be fitted before predict is called")
+        width = _check_matrix(X)
+        if width != len(self.w):
+            raise ValueError(
+                "X must have the same number of features as the training data"
+            )
+
+        results = []
+        for row in X:
+            z = math.fsum(self.w[j] * row[j] for j in range(width)) + self.b
+            if not math.isfinite(z):
+                raise FloatingPointError("non-finite logit encountered")
+            results.append(1 if z >= 0 else 0)
+        return results
+
+
 def _format_fixed(value):
     """Format a real number with exactly 10 digits after the decimal point."""
     return format(value + 0.0, ".10f")
@@ -206,7 +332,7 @@ def _object_pairs(pairs):
     return result
 
 
-def _train_linear(raw_bytes):
+def _train(raw_bytes, cls):
     text = raw_bytes.decode("utf-8")
     data = json.loads(text, object_pairs_hook=_object_pairs)
     if not isinstance(data, dict) or tuple(data.keys()) != _TRAIN_KEYS:
@@ -215,7 +341,7 @@ def _train_linear(raw_bytes):
             "X, y, lr, l2, max_iter, tol in that order"
         )
 
-    model = LinearRegression(
+    model = cls(
         lr=data["lr"],
         l2=data["l2"],
         max_iter=data["max_iter"],
@@ -225,7 +351,9 @@ def _train_linear(raw_bytes):
 
     weights = ",".join(_format_fixed(value) for value in model.w)
     return (
-        '{"class":"LinearRegression",'
+        '{"class":"'
+        + cls.__name__
+        + '",'
         + '"lr":'
         + _format_fixed(model.lr)
         + ',"l2":'
@@ -244,11 +372,14 @@ def _train_linear(raw_bytes):
 
 
 def main(argv):
-    if len(argv) != 2 or argv[1] != "train-linear":
+    if len(argv) != 2 or argv[1] not in ("train-linear", "train-logistic"):
         sys.stderr.write("ValueError: unknown or missing subcommand\n")
         return 2
+    cls = (
+        LinearRegression if argv[1] == "train-linear" else LogisticRegression
+    )
     try:
-        payload = _train_linear(sys.stdin.buffer.read())
+        payload = _train(sys.stdin.buffer.read(), cls)
     except Exception as exc:
         sys.stderr.write("ValueError: %s\n" % exc)
         return 2
