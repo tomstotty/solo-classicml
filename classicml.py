@@ -15,6 +15,8 @@ Exports:
         population standard deviation.
     KMeans -- deterministic k-means clustering with Lloyd's iterations and
         seeded centroid initialization.
+    PCA -- deterministic two-feature principal-component analysis with a
+        single principal component.
     accuracy_score -- fraction of positions where two integer label
         vectors agree.
     mean_squared_error -- mean of squared element-wise differences of two
@@ -49,6 +51,7 @@ __all__ = [
     "RandomForestClassifier",
     "StandardScaler",
     "KMeans",
+    "PCA",
     "accuracy_score",
     "mean_squared_error",
 ]
@@ -982,16 +985,42 @@ class StandardScaler:
 
 def _check_exact_matrix(X):
     """Validate a non-empty rectangular matrix whose elements have type
-    exactly ``int`` or are finite values of type exactly ``float``
-    (booleans and subclasses are rejected)."""
-    # math.isfinite raises OverflowError for ints too large to convert to
-    # float; such values fail the finite-number requirement.
-    try:
-        return _check_matrix_exact(X)
-    except OverflowError as exc:
-        raise ValueError(
-            "X must contain only finite non-boolean numbers"
-        ) from exc
+    exactly ``int`` (any magnitude) or are finite values of type exactly
+    ``float`` (booleans and subclasses are rejected).
+
+    Unlike the broader matrix checks, arbitrarily large exact integers are
+    accepted at validation time; arithmetic overflowing the float range
+    later on is reported as FloatingPointError.
+    """
+    if not isinstance(X, list) or len(X) == 0:
+        raise ValueError("X must be a non-empty list of rows")
+    width = None
+    for row in X:
+        if not isinstance(row, list) or len(row) == 0:
+            raise ValueError("X rows must be non-empty lists")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError("X must be rectangular")
+        for value in row:
+            if type(value) is int:
+                continue
+            if type(value) is float and math.isfinite(value):
+                continue
+            raise ValueError(
+                "X must contain only finite non-boolean numbers"
+            )
+    return width
+
+
+def _check_exact_two_column_matrix(X):
+    """Validate a non-empty rectangular matrix with exactly two columns whose
+    elements have type exactly ``int`` (any magnitude) or are finite values
+    of type exactly ``float`` (booleans and subclasses are rejected)."""
+    width = _check_exact_matrix(X)
+    if width != 2:
+        raise ValueError("X must have exactly two columns")
+    return width
 
 
 class KMeans:
@@ -1136,6 +1165,132 @@ class KMeans:
             )
 
         return [self._assign(row, self.cluster_centers_) for row in X]
+
+
+class PCA:
+    """Deterministic two-feature principal-component analysis.
+
+    Fits a single principal component from exactly two feature columns.
+    For ``n`` training rows, the column means are
+    ``mu_j = fsum(x_ij over ascending i) / n`` and the covariance entries
+    are ``C_jk = fsum((x_ij - mu_j) * (x_ik - mu_k)) / n``, accumulated in
+    ascending row order with ``math.fsum``. The component direction is
+    ``v = [cos(theta), sin(theta)]`` where
+    ``theta = atan2(2 * C_01, C_00 - C_11) / 2``; if the coordinate of
+    ``v`` with the largest absolute value (ties resolved to coordinate 0)
+    is negative, the whole vector is sign-flipped. ``transform`` projects
+    each row about ``mean_`` onto ``v`` as ``fsum((x_j - mu_j) * v_j)`` in
+    ascending column order; exact zero projections are normalized to
+    ``0.0``. Neither ``fit`` nor ``transform`` modifies its input. No
+    randomness is used.
+    """
+
+    def __init__(self):
+        self.mean_ = None
+        self.components_ = None
+
+    def fit(self, X):
+        self.mean_ = None
+        self.components_ = None
+
+        _check_exact_two_column_matrix(X)
+        n = len(X)
+        try:
+            mu0 = math.fsum(X[i][0] for i in range(n)) / n
+            mu1 = math.fsum(X[i][1] for i in range(n)) / n
+            if not math.isfinite(mu0) or not math.isfinite(mu1):
+                raise FloatingPointError(
+                    "non-finite value encountered during fit"
+                )
+
+            c00 = (
+                math.fsum(
+                    (X[i][0] - mu0) * (X[i][0] - mu0) for i in range(n)
+                )
+                / n
+            )
+            c01 = (
+                math.fsum(
+                    (X[i][0] - mu0) * (X[i][1] - mu1) for i in range(n)
+                )
+                / n
+            )
+            c11 = (
+                math.fsum(
+                    (X[i][1] - mu1) * (X[i][1] - mu1) for i in range(n)
+                )
+                / n
+            )
+            if (
+                not math.isfinite(c00)
+                or not math.isfinite(c01)
+                or not math.isfinite(c11)
+            ):
+                raise FloatingPointError(
+                    "non-finite value encountered during fit"
+                )
+
+            two_c01 = 2 * c01
+            spread = c00 - c11
+            if not math.isfinite(two_c01) or not math.isfinite(spread):
+                raise FloatingPointError(
+                    "non-finite value encountered during fit"
+                )
+            theta = math.atan2(two_c01, spread) / 2
+            v0 = math.cos(theta)
+            v1 = math.sin(theta)
+            if (
+                not math.isfinite(theta)
+                or not math.isfinite(v0)
+                or not math.isfinite(v1)
+            ):
+                raise FloatingPointError(
+                    "non-finite value encountered during fit"
+                )
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during fit"
+            ) from exc
+
+        if abs(v0) >= abs(v1):
+            dominant = 0
+        else:
+            dominant = 1
+        if (v0 if dominant == 0 else v1) < 0:
+            v0 = -v0
+            v1 = -v1
+
+        self.mean_ = [mu0, mu1]
+        self.components_ = [[v0, v1]]
+        return self
+
+    def transform(self, X):
+        if self.mean_ is None or self.components_ is None:
+            raise ValueError("model must be fitted before transform is called")
+        _check_exact_two_column_matrix(X)
+
+        mu = self.mean_
+        v = self.components_[0]
+        results = []
+        for row in X:
+            try:
+                value = math.fsum((row[j] - mu[j]) * v[j] for j in range(2))
+            except (OverflowError, ValueError) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during transform"
+                ) from exc
+            if not math.isfinite(value):
+                raise FloatingPointError(
+                    "non-finite value encountered during transform"
+                )
+            if value == 0:
+                value = 0.0
+            results.append([value])
+        return results
+
+    def fit_transform(self, X):
+        self.fit(X)
+        return self.transform(X)
 
 
 def _check_metric_vectors(y_true, y_pred):
