@@ -36,6 +36,8 @@ Exports:
         thresholds for a binary score ranking.
     average_precision_score -- stepwise area under the
         precision_recall_curve.
+    calibration_curve -- per-bin positive-class weight fractions and mean
+        predicted probabilities for a binary probability vector.
     dumps -- serialize a fitted KMeans/PCA model to whitespace-free JSON
         text (quantized to 10 decimal places with ROUND_HALF_UP).
     loads -- reconstruct an independent fitted KMeans/PCA model from text
@@ -84,6 +86,7 @@ __all__ = [
     "roc_auc_score",
     "precision_recall_curve",
     "average_precision_score",
+    "calibration_curve",
     "dumps",
     "loads",
 ]
@@ -2140,6 +2143,11 @@ def precision_recall_curve(y_true, y_score, pos_label=1, sample_weight=None):
             fp = math.fsum(fp_terms)
             tp = math.fsum(tp_terms)
             denominator = tp + fp
+            if not math.isfinite(denominator):
+                raise FloatingPointError(
+                    "non-finite value encountered during precision-recall "
+                    "computation"
+                )
             if denominator == 0.0:
                 precision = 1.0
             else:
@@ -2211,6 +2219,225 @@ def average_precision_score(y_true, y_score, pos_label=1, sample_weight=None):
     if ap == 0:
         ap = 0.0
     return ap
+
+
+def _cal_float(value):
+    """Convert a validated calibration probability/weight to float;
+    overflow, invalid operations, and non-finite results raise
+    FloatingPointError."""
+    try:
+        result = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during calibration computation"
+        ) from exc
+    if not math.isfinite(result):
+        raise FloatingPointError(
+            "non-finite value encountered during calibration computation"
+        )
+    return result
+
+
+def calibration_curve(
+    y_true, y_prob, n_bins=5, pos_label=1, sample_weight=None
+):
+    """Compute per-bin positive-class fractions and mean probabilities.
+
+    ``y_true`` and ``y_prob`` must be non-empty lists of equal length.
+    ``y_true`` must contain values of type exactly ``int`` (booleans are
+    rejected) drawn from exactly two distinct labels, and ``pos_label``
+    must be an exact ``int`` equal to one of them; the other label is the
+    negative class. ``y_prob`` must contain finite values in the closed
+    interval ``[0, 1]`` whose type is exactly ``int`` or ``float``
+    (booleans are rejected; the only accepted ``int`` values are ``0``
+    and ``1``). ``n_bins`` must be a positive exact ``int``.
+    ``sample_weight`` must be ``None`` -- every sample then weighs
+    ``1.0`` -- or a list of the same length whose elements are finite
+    non-negative values of type exactly ``int`` or ``float`` (booleans
+    are rejected). The total weight must be greater than zero. Any
+    violation (including overflow during the finiteness checks) raises
+    ValueError.
+
+    Equal-width bins are indexed ``min(int(p * n_bins), n_bins - 1)``.
+    Bins are visited in ascending bin index; within a bin, samples are
+    accumulated in input order with ``math.fsum`` to obtain the total
+    weight ``W``, the positive-class weight ``T``, and the weighted
+    probability sum ``P`` (the ``math.fsum`` of the ``w * p`` products).
+    Bins with ``W == 0`` are omitted; each retained bin appends ``T / W``
+    to the first returned list and ``P / W`` to the second, with an exact
+    zero normalized to ``0.0``. Overflow, invalid operations during
+    post-validation conversion or arithmetic, and non-finite results
+    raise FloatingPointError.
+
+    The return value is ``(fraction_of_positives, mean_predicted_value)``,
+    two lists of floats. The inputs are not modified. Deterministic: same
+    inputs, same result.
+    """
+    if not isinstance(y_true, list) or not isinstance(y_prob, list):
+        raise ValueError("y_true and y_prob must be lists")
+    if len(y_true) == 0 or len(y_prob) == 0:
+        raise ValueError("y_true and y_prob must be non-empty lists")
+    if len(y_true) != len(y_prob):
+        raise ValueError("y_true and y_prob must have the same length")
+    n = len(y_true)
+
+    for value in y_true:
+        if type(value) is not int:
+            raise ValueError("y_true must contain only integers")
+    if type(pos_label) is not int:
+        raise ValueError("pos_label must be an integer")
+    labels = set(y_true)
+    if len(labels) != 2 or pos_label not in labels:
+        raise ValueError(
+            "y_true must contain exactly two distinct labels with "
+            "pos_label among them"
+        )
+
+    for value in y_prob:
+        if type(value) not in (int, float):
+            raise ValueError(
+                "y_prob must contain only finite numbers in [0, 1]"
+            )
+        # math.isfinite raises OverflowError for ints too large to
+        # convert to float; such values fail the finite requirement.
+        try:
+            finite = math.isfinite(value)
+        except OverflowError as exc:
+            raise ValueError(
+                "y_prob must contain only finite numbers in [0, 1]"
+            ) from exc
+        if not finite or value < 0 or value > 1:
+            raise ValueError(
+                "y_prob must contain only finite numbers in [0, 1]"
+            )
+
+    if type(n_bins) is not int or n_bins < 1:
+        raise ValueError("n_bins must be a positive integer")
+
+    if sample_weight is None:
+        weights = [1.0] * n
+    else:
+        if not isinstance(sample_weight, list) or len(sample_weight) != n:
+            raise ValueError(
+                "sample_weight must be a list with the same length as "
+                "y_true"
+            )
+        for value in sample_weight:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                ) from exc
+            if not finite or value < 0:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+        weights = [_cal_float(value) for value in sample_weight]
+
+    try:
+        total_weight = math.fsum(weights)
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during calibration computation"
+        ) from exc
+    if not math.isfinite(total_weight):
+        raise FloatingPointError(
+            "non-finite value encountered during calibration computation"
+        )
+    if total_weight <= 0.0:
+        raise ValueError("the total weight must be greater than 0")
+
+    # Each occupied bin maps to its W, T, and w*p term lists, all kept in
+    # input order. A dict avoids allocating n_bins lists (n_bins is
+    # unbounded) while still letting bins be emitted in index order.
+    bins = {}
+    last_bin = n_bins - 1
+    for i in range(n):
+        p = y_prob[i]
+        w = weights[i]
+        try:
+            scaled = p * n_bins
+            if isinstance(scaled, float) and not math.isfinite(scaled):
+                raise FloatingPointError(
+                    "non-finite value encountered during calibration "
+                    "computation"
+                )
+            bin_index = min(int(scaled), last_bin)
+            wp = w * p
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during calibration "
+                "computation"
+            ) from exc
+        if isinstance(wp, float) and not math.isfinite(wp):
+            raise FloatingPointError(
+                "non-finite value encountered during calibration "
+                "computation"
+            )
+
+        entry = bins.get(bin_index)
+        if entry is None:
+            entry = ([], [], [])
+            bins[bin_index] = entry
+        entry[0].append(w)
+        if y_true[i] == pos_label:
+            entry[1].append(w)
+        entry[2].append(wp)
+
+    fractions = []
+    mean_probs = []
+    for bin_index in sorted(bins):
+        w_terms, pos_terms, wp_terms = bins[bin_index]
+        try:
+            bin_weight = math.fsum(w_terms)
+            pos_weight = math.fsum(pos_terms)
+            prob_weight = math.fsum(wp_terms)
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during calibration "
+                "computation"
+            ) from exc
+        if (
+            not math.isfinite(bin_weight)
+            or not math.isfinite(pos_weight)
+            or not math.isfinite(prob_weight)
+        ):
+            raise FloatingPointError(
+                "non-finite value encountered during calibration "
+                "computation"
+            )
+        if bin_weight == 0.0:
+            continue
+        try:
+            fraction = pos_weight / bin_weight
+            mean_prob = prob_weight / bin_weight
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during calibration "
+                "computation"
+            ) from exc
+        if not math.isfinite(fraction) or not math.isfinite(mean_prob):
+            raise FloatingPointError(
+                "non-finite value encountered during calibration "
+                "computation"
+            )
+        if fraction == 0:
+            fraction = 0.0
+        if mean_prob == 0:
+            mean_prob = 0.0
+        fractions.append(fraction)
+        mean_probs.append(mean_prob)
+    return fractions, mean_probs
 
 
 _SERIAL_KEYS_KMEANS = (
