@@ -9,6 +9,10 @@ Exports:
         using squared Euclidean distances.
     StandardScaler -- deterministic standardization by column mean and
         population standard deviation.
+    accuracy_score -- fraction of positions where two integer label
+        vectors agree.
+    mean_squared_error -- mean of squared element-wise differences of two
+        finite real vectors.
 
 CLI:
     python classicml.py train-linear
@@ -35,6 +39,8 @@ __all__ = [
     "LogisticRegression",
     "KNeighborsClassifier",
     "StandardScaler",
+    "accuracy_score",
+    "mean_squared_error",
 ]
 
 _QUANTUM = Decimal("1E-10")
@@ -72,6 +78,27 @@ def _check_matrix(X):
         for value in row:
             if not _is_finite_number(value):
                 raise ValueError("X must contain only finite non-boolean numbers")
+    return width
+
+
+def _check_matrix_exact(X):
+    """Validate a non-empty rectangular matrix of finite numbers whose type
+    is exactly int or float (booleans and subclasses are rejected)."""
+    if not isinstance(X, list) or len(X) == 0:
+        raise ValueError("X must be a non-empty list of rows")
+    width = None
+    for row in X:
+        if not isinstance(row, list) or len(row) == 0:
+            raise ValueError("X rows must be non-empty lists")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError("X must be rectangular")
+        for value in row:
+            if type(value) not in (int, float) or not math.isfinite(value):
+                raise ValueError(
+                    "X must contain only finite non-boolean numbers"
+                )
     return width
 
 
@@ -473,10 +500,12 @@ class StandardScaler:
 
     @staticmethod
     def _validate(X):
+        # Elements are accepted only when type(value) is exactly int or
+        # float and math.isfinite(value) is true; booleans are rejected.
         # math.isfinite raises OverflowError for ints too large to convert
         # to float; such values fail the finite-number requirement.
         try:
-            return _check_matrix(X)
+            return _check_matrix_exact(X)
         except OverflowError as exc:
             raise ValueError(
                 "X must contain only finite non-boolean numbers"
@@ -604,6 +633,118 @@ class StandardScaler:
                 scaled_row.append(value)
             results.append(scaled_row)
         return results
+
+
+def _check_metric_vectors(y_true, y_pred):
+    """Validate that both metric inputs are non-empty lists of equal length."""
+    if not isinstance(y_true, list) or not isinstance(y_pred, list):
+        raise ValueError("y_true and y_pred must be lists")
+    if len(y_true) == 0 or len(y_pred) == 0:
+        raise ValueError("y_true and y_pred must be non-empty lists")
+    if len(y_true) != len(y_pred):
+        raise ValueError("y_true and y_pred must have the same length")
+    return len(y_true)
+
+
+def accuracy_score(y_true, y_pred):
+    """Return the fraction of positions where two label vectors agree.
+
+    Both arguments must be non-empty lists of equal length whose elements
+    are exactly ``int`` (booleans are rejected). The inputs are not
+    modified. Deterministic: same inputs, same result.
+    """
+    n = _check_metric_vectors(y_true, y_pred)
+    for value in y_true:
+        if type(value) is not int:
+            raise ValueError("y_true must contain only integers")
+    for value in y_pred:
+        if type(value) is not int:
+            raise ValueError("y_pred must contain only integers")
+
+    correct = 0
+    for i in range(n):
+        if y_true[i] == y_pred[i]:
+            correct += 1
+    return correct / n
+
+
+def mean_squared_error(y_true, y_pred):
+    """Return the mean of the squared element-wise differences.
+
+    Both arguments must be non-empty lists of equal length whose elements
+    are finite values of type exactly ``int`` or ``float`` (booleans are
+    rejected). The inputs are not modified. Differences, squares, the
+    ``math.fsum`` total, and the final division are all checked; overflow,
+    invalid operations, and non-finite intermediate values raise
+    FloatingPointError. An exact zero result is normalized to ``0.0``.
+    Deterministic: same inputs, same result.
+    """
+    n = _check_metric_vectors(y_true, y_pred)
+    for name, values in (("y_true", y_true), ("y_pred", y_pred)):
+        for value in values:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "%s must contain only finite non-boolean numbers" % name
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "%s must contain only finite non-boolean numbers" % name
+                ) from exc
+            if not finite:
+                raise ValueError(
+                    "%s must contain only finite non-boolean numbers" % name
+                )
+
+    terms = []
+    for i in range(n):
+        try:
+            d = y_true[i] - y_pred[i]
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during mean squared error"
+            ) from exc
+        if isinstance(d, float) and not math.isfinite(d):
+            raise FloatingPointError(
+                "non-finite value encountered during mean squared error"
+            )
+        try:
+            square = d ** 2
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during mean squared error"
+            ) from exc
+        if isinstance(square, float) and not math.isfinite(square):
+            raise FloatingPointError(
+                "non-finite value encountered during mean squared error"
+            )
+        terms.append(square)
+    try:
+        total = math.fsum(terms)
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during mean squared error"
+        ) from exc
+    if not math.isfinite(total):
+        raise FloatingPointError(
+            "non-finite value encountered during mean squared error"
+        )
+    try:
+        result = total / n
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during mean squared error"
+        ) from exc
+    if not math.isfinite(result):
+        raise FloatingPointError(
+            "non-finite value encountered during mean squared error"
+        )
+    if result == 0:
+        result = 0.0
+    return result
 
 
 def _format_fixed(value):
