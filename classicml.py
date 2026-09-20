@@ -2024,6 +2024,144 @@ def roc_auc_score(y_true, y_score, pos_label=1, sample_weight=None):
     return auc
 
 
+def _brier_float(value):
+    """Convert a validated probability/weight to float; overflow, invalid
+    operations, and non-finite results raise FloatingPointError."""
+    try:
+        result = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during brier score computation"
+        ) from exc
+    if not math.isfinite(result):
+        raise FloatingPointError(
+            "non-finite value encountered during brier score computation"
+        )
+    return result
+
+
+def brier_score_loss(y_true, y_prob, pos_label=1, sample_weight=None):
+    """Compute the Brier score loss of predicted class probabilities.
+
+    ``y_true`` and ``y_prob`` must be non-empty lists of equal length.
+    ``y_true`` must contain values of type exactly ``int`` (booleans are
+    rejected) drawn from exactly two distinct labels, and ``pos_label``
+    must be an exact ``int`` equal to one of them. ``y_prob`` must
+    contain finite values of type exactly ``int`` or ``float``
+    (booleans are rejected) within ``[0, 1]``. ``sample_weight`` must be
+    ``None`` -- every sample then weighs ``1.0`` -- or a list of the
+    same length whose elements are finite non-negative values of type
+    exactly ``int`` or ``float``. The total weight must be greater than
+    zero. Any violation of these length, label, range, or finiteness
+    requirements raises ValueError -- including when a finiteness check
+    itself triggers OverflowError -- and so does a non-positive total
+    weight.
+
+    The probabilities and weights are first converted to ``float``.
+    Then, in input order, ``t_i`` is ``1.0`` when the label equals
+    ``pos_label`` and ``0.0`` otherwise, and the result is the
+    ``math.fsum`` of the terms ``w_i * (p_i - t_i) ** 2`` divided by the
+    ``math.fsum`` of the weights ``w_i``. An exact zero result is
+    normalized to ``0.0``. Overflow, invalid operations, or non-finite
+    intermediate values or results after validation raise
+    FloatingPointError.
+
+    The return value is a float. The inputs are not modified.
+    Deterministic: same inputs, same result.
+    """
+    if not isinstance(y_true, list) or not isinstance(y_prob, list):
+        raise ValueError("y_true and y_prob must be lists")
+    if len(y_true) == 0 or len(y_prob) == 0:
+        raise ValueError("y_true and y_prob must be non-empty lists")
+    if len(y_true) != len(y_prob):
+        raise ValueError("y_true and y_prob must have the same length")
+    n = len(y_true)
+    for value in y_true:
+        if type(value) is not int:
+            raise ValueError("y_true must contain only integers")
+    if type(pos_label) is not int:
+        raise ValueError("pos_label must be an integer")
+    labels = set(y_true)
+    if len(labels) != 2 or pos_label not in labels:
+        raise ValueError(
+            "y_true must contain exactly two distinct labels with "
+            "pos_label among them"
+        )
+    for value in y_prob:
+        _check_finite_score(value, "y_prob")
+        if value < 0 or value > 1:
+            raise ValueError(
+                "y_prob must contain only values in the interval [0, 1]"
+            )
+
+    if sample_weight is None:
+        weights = [1.0] * n
+    else:
+        if not isinstance(sample_weight, list) or len(sample_weight) != n:
+            raise ValueError(
+                "sample_weight must be a list with the same length as "
+                "y_true"
+            )
+        for value in sample_weight:
+            _check_finite_score(value, "sample_weight")
+            if value < 0:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+        weights = [_brier_float(value) for value in sample_weight]
+
+    probs = [_brier_float(value) for value in y_prob]
+
+    try:
+        weight_total = math.fsum(weights)
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during brier score computation"
+        ) from exc
+    if not math.isfinite(weight_total):
+        raise FloatingPointError(
+            "non-finite value encountered during brier score computation"
+        )
+    if weight_total <= 0.0:
+        raise ValueError("the total weight must be greater than 0")
+
+    terms = []
+    for i in range(n):
+        if y_true[i] == pos_label:
+            t_i = 1.0
+        else:
+            t_i = 0.0
+        try:
+            term = weights[i] * (probs[i] - t_i) ** 2
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during brier score "
+                "computation"
+            ) from exc
+        if not math.isfinite(term):
+            raise FloatingPointError(
+                "non-finite value encountered during brier score "
+                "computation"
+            )
+        terms.append(term)
+
+    try:
+        numerator = math.fsum(terms)
+        result = numerator / weight_total
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during brier score computation"
+        ) from exc
+    if not math.isfinite(result):
+        raise FloatingPointError(
+            "non-finite value encountered during brier score computation"
+        )
+    if result == 0:
+        result = 0.0
+    return result
+
+
 def _pr_float(value):
     """Convert a validated score/weight to float; overflow, invalid
     operations, and non-finite results raise FloatingPointError."""
