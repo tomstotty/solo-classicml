@@ -7,6 +7,8 @@ Exports:
         optional L2 penalty, trained by full-batch gradient descent.
     KNeighborsClassifier -- deterministic k-nearest-neighbors classifier
         using squared Euclidean distances.
+    DecisionTreeClassifier -- deterministic binary decision tree classifier
+        using Gini impurity splits.
     StandardScaler -- deterministic standardization by column mean and
         population standard deviation.
     accuracy_score -- fraction of positions where two integer label
@@ -38,6 +40,7 @@ __all__ = [
     "LinearRegression",
     "LogisticRegression",
     "KNeighborsClassifier",
+    "DecisionTreeClassifier",
     "StandardScaler",
     "accuracy_score",
     "mean_squared_error",
@@ -485,6 +488,199 @@ class KNeighborsClassifier:
                     best_count = counts[label]
                     best_label = label
             results.append(best_label)
+        return results
+
+
+def _check_tree_matrix(X):
+    """Validate a non-empty rectangular matrix whose elements have type
+    exactly ``int`` or are finite values of type exactly ``float``
+    (booleans and subclasses are rejected)."""
+    if not isinstance(X, list) or len(X) == 0:
+        raise ValueError("X must be a non-empty list of rows")
+    width = None
+    for row in X:
+        if not isinstance(row, list) or len(row) == 0:
+            raise ValueError("X rows must be non-empty lists")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError("X must be rectangular")
+        for value in row:
+            if type(value) is int:
+                continue
+            if type(value) is float and math.isfinite(value):
+                continue
+            raise ValueError(
+                "X must contain only finite non-boolean numbers"
+            )
+    return width
+
+
+def _majority_label(labels):
+    """Return the most frequent label; ties go to the smallest label."""
+    counts = {}
+    for label in labels:
+        counts[label] = counts.get(label, 0) + 1
+    best_label = None
+    best_count = -1
+    for label in sorted(counts):
+        if counts[label] > best_count:
+            best_count = counts[label]
+            best_label = label
+    return best_label
+
+
+def _gini_impurity(labels):
+    """Gini impurity ``1 - fsum((c / n) ** 2)`` of a non-empty label list.
+
+    Counts are accumulated in ascending label order. Any overflow, invalid
+    operation, or non-finite intermediate value in the division, power, or
+    ``math.fsum`` steps raises FloatingPointError.
+    """
+    counts = {}
+    for label in labels:
+        counts[label] = counts.get(label, 0) + 1
+    n = len(labels)
+    terms = []
+    for label in sorted(counts):
+        try:
+            ratio = counts[label] / n
+            square = ratio ** 2
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during gini computation"
+            ) from exc
+        if not math.isfinite(ratio) or not math.isfinite(square):
+            raise FloatingPointError(
+                "non-finite value encountered during gini computation"
+            )
+        terms.append(square)
+    try:
+        total = math.fsum(terms)
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during gini computation"
+        ) from exc
+    if not math.isfinite(total):
+        raise FloatingPointError(
+            "non-finite value encountered during gini computation"
+        )
+    return 1.0 - total
+
+
+class _DecisionTreeNode:
+    """Node of a DecisionTreeClassifier tree (leaf when feature is None)."""
+
+    __slots__ = ("label", "feature", "threshold", "left", "right")
+
+    def __init__(self, label):
+        self.label = label
+        self.feature = None
+        self.threshold = None
+        self.left = None
+        self.right = None
+
+
+class DecisionTreeClassifier:
+    """Deterministic binary decision tree classifier with Gini splits.
+
+    Each node is labeled with the majority label of its samples (ties go to
+    the smallest label). A node becomes a leaf when its labels are pure,
+    when it reaches ``max_depth`` (the root is at depth 0), or when no
+    candidate split strictly improves on the node's Gini impurity. For every
+    feature, the distinct values in ascending order -- except the maximum --
+    serve as thresholds ``t`` with ``x <= t`` going to the left child. A
+    candidate's score is ``(|L| * gini(L) + |R| * gini(R)) / |S|``; only
+    scores strictly below the parent Gini impurity are accepted, and the
+    best candidate is the first in ascending ``(score, feature index, t)``
+    order. Children are built left first, then right. No randomness is used.
+    """
+
+    def __init__(self, max_depth=None):
+        if max_depth is not None:
+            if type(max_depth) is not int or max_depth < 1:
+                raise ValueError(
+                    "max_depth must be None or a positive integer"
+                )
+        self.max_depth = max_depth
+        self._root = None
+        self._n_features = None
+
+    def fit(self, X, y):
+        self._root = None
+        self._n_features = None
+        width = _check_tree_matrix(X)
+        _check_label_vector(y, len(X))
+        root = self._build(X, y, list(range(len(X))), 0, width)
+        self._root = root
+        self._n_features = width
+        return self
+
+    def _build(self, X, y, indices, depth, width):
+        labels = [y[i] for i in indices]
+        node = _DecisionTreeNode(_majority_label(labels))
+
+        pure = True
+        first = labels[0]
+        for label in labels:
+            if label != first:
+                pure = False
+                break
+        if pure:
+            return node
+        if self.max_depth is not None and depth >= self.max_depth:
+            return node
+
+        parent_gini = _gini_impurity(labels)
+        n = len(indices)
+        best = None  # (score, feature index, threshold)
+        for j in range(width):
+            values = sorted(set(X[i][j] for i in indices))
+            for t in values[:-1]:
+                left_labels = []
+                right_labels = []
+                for i in indices:
+                    if X[i][j] <= t:
+                        left_labels.append(y[i])
+                    else:
+                        right_labels.append(y[i])
+                score = (
+                    len(left_labels) * _gini_impurity(left_labels)
+                    + len(right_labels) * _gini_impurity(right_labels)
+                ) / n
+                if score < parent_gini and (
+                    best is None or (score, j, t) < best
+                ):
+                    best = (score, j, t)
+        if best is None:
+            return node
+
+        _, feature, threshold = best
+        left_indices = [i for i in indices if X[i][feature] <= threshold]
+        right_indices = [i for i in indices if X[i][feature] > threshold]
+        node.feature = feature
+        node.threshold = threshold
+        node.left = self._build(X, y, left_indices, depth + 1, width)
+        node.right = self._build(X, y, right_indices, depth + 1, width)
+        return node
+
+    def predict(self, X):
+        if self._root is None:
+            raise ValueError("model must be fitted before predict is called")
+        width = _check_tree_matrix(X)
+        if width != self._n_features:
+            raise ValueError(
+                "X must have the same number of features as the training data"
+            )
+        results = []
+        for row in X:
+            node = self._root
+            while node.feature is not None:
+                if row[node.feature] <= node.threshold:
+                    node = node.left
+                else:
+                    node = node.right
+            results.append(node.label)
         return results
 
 
