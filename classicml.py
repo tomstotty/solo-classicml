@@ -5,6 +5,8 @@ Exports:
         an optional L2 (ridge) penalty, trained by full-batch gradient descent.
     LogisticRegression -- deterministic binary logistic regression with an
         optional L2 penalty, trained by full-batch gradient descent.
+    KNeighborsClassifier -- deterministic k-nearest-neighbors classifier
+        using squared Euclidean distances.
 
 CLI:
     python classicml.py train-linear
@@ -13,6 +15,10 @@ CLI:
         ``X, y, lr, l2, max_iter, tol`` (in that order) and writes a compact
         JSON object with the keys
         ``class, lr, l2, max_iter, tol, w, b`` (in that order).
+    python classicml.py predict-knn
+        Reads a UTF-8 JSON object from stdin with the keys
+        ``X, y, n_neighbors, Q`` (in that order) and writes a compact
+        JSON object with the keys ``class, predictions`` (in that order).
 """
 
 from __future__ import annotations
@@ -22,10 +28,11 @@ import math
 import sys
 from decimal import Decimal, ROUND_HALF_UP
 
-__all__ = ["LinearRegression", "LogisticRegression"]
+__all__ = ["LinearRegression", "LogisticRegression", "KNeighborsClassifier"]
 
 _QUANTUM = Decimal("1E-10")
 _TRAIN_KEYS = ("X", "y", "lr", "l2", "max_iter", "tol")
+_KNN_KEYS = ("X", "y", "n_neighbors", "Q")
 
 
 def _is_finite_number(value):
@@ -320,10 +327,130 @@ class LogisticRegression:
 
         results = []
         for row in X:
-            z = math.fsum(self.w[j] * row[j] for j in range(width)) + self.b
+            try:
+                z = math.fsum(self.w[j] * row[j] for j in range(width))
+            except (OverflowError, ValueError) as exc:
+                raise FloatingPointError(
+                    "non-finite prediction encountered"
+                ) from exc
+            z += self.b
             if not math.isfinite(z):
                 raise FloatingPointError("non-finite prediction encountered")
             results.append(1 if z >= 0 else 0)
+        return results
+
+
+def _check_label_vector(y, n):
+    """Validate an integer class-label vector with the same length as X."""
+    if not isinstance(y, list) or len(y) != n:
+        raise ValueError("y must be a list with the same length as X")
+    for value in y:
+        if type(value) is not int:
+            raise ValueError("y must contain only integers")
+
+
+def _squared_distance(query, row):
+    """Squared Euclidean distance between two equal-length rows.
+
+    Every subtraction, squaring, and summation step is checked; overflow,
+    invalid operations, and non-finite intermediate values raise
+    FloatingPointError.
+    """
+    terms = []
+    for j in range(len(query)):
+        try:
+            diff = query[j] - row[j]
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during distance computation"
+            ) from exc
+        if isinstance(diff, float) and not math.isfinite(diff):
+            raise FloatingPointError(
+                "non-finite value encountered during distance computation"
+            )
+        try:
+            square = diff ** 2
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during distance computation"
+            ) from exc
+        if isinstance(square, float) and not math.isfinite(square):
+            raise FloatingPointError(
+                "non-finite value encountered during distance computation"
+            )
+        terms.append(square)
+    try:
+        total = math.fsum(terms)
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during distance computation"
+        ) from exc
+    if not math.isfinite(total):
+        raise FloatingPointError(
+            "non-finite value encountered during distance computation"
+        )
+    return total
+
+
+class KNeighborsClassifier:
+    """Deterministic k-nearest-neighbors classifier.
+
+    Distances are squared Euclidean distances accumulated with
+    ``math.fsum`` in feature order. Neighbors are selected by ascending
+    ``(distance, training row index)``; ties in the majority vote are
+    broken in favor of the smallest label. No randomness is used.
+    """
+
+    def __init__(self, n_neighbors=5):
+        if isinstance(n_neighbors, bool) or not isinstance(n_neighbors, int):
+            raise ValueError("n_neighbors must be an integer")
+        if n_neighbors < 1:
+            raise ValueError("n_neighbors must be at least 1")
+        self.n_neighbors = n_neighbors
+        self._X = None
+        self._y = None
+        self._width = None
+
+    def fit(self, X, y):
+        width = _check_matrix(X)
+        _check_label_vector(y, len(X))
+        self._X = X
+        self._y = y
+        self._width = width
+        return self
+
+    def predict(self, X):
+        if self._X is None:
+            raise ValueError("model must be fitted before predict is called")
+        width = _check_matrix(X)
+        if width != self._width:
+            raise ValueError(
+                "X must have the same number of features as the training data"
+            )
+        if self.n_neighbors > len(self._X):
+            raise ValueError(
+                "n_neighbors must not exceed the number of training samples"
+            )
+
+        results = []
+        for query in X:
+            distances = [
+                _squared_distance(query, train_row) for train_row in self._X
+            ]
+            order = sorted(
+                range(len(self._X)), key=lambda i: (distances[i], i)
+            )
+            counts = {}
+            for i in order[: self.n_neighbors]:
+                label = self._y[i]
+                counts[label] = counts.get(label, 0) + 1
+            best_label = None
+            best_count = -1
+            for label in sorted(counts):
+                if counts[label] > best_count:
+                    best_count = counts[label]
+                    best_label = label
+            results.append(best_label)
         return results
 
 
@@ -380,8 +507,32 @@ def _train(raw_bytes, model_class, class_name):
     )
 
 
+def _predict_knn(raw_bytes):
+    text = raw_bytes.decode("utf-8")
+    data = json.loads(text, object_pairs_hook=_object_pairs)
+    if not isinstance(data, dict) or tuple(data.keys()) != _KNN_KEYS:
+        raise ValueError(
+            "input JSON must be an object with exactly the keys "
+            "X, y, n_neighbors, Q in that order"
+        )
+
+    model = KNeighborsClassifier(n_neighbors=data["n_neighbors"])
+    model.fit(data["X"], data["y"])
+    predictions = model.predict(data["Q"])
+
+    return (
+        '{"class":"KNeighborsClassifier","predictions":['
+        + ",".join(str(value) for value in predictions)
+        + "]}"
+    )
+
+
 def main(argv):
-    if len(argv) != 2 or argv[1] not in ("train-linear", "train-logistic"):
+    if len(argv) != 2 or argv[1] not in (
+        "train-linear",
+        "train-logistic",
+        "predict-knn",
+    ):
         sys.stderr.write("ValueError: unknown or missing subcommand\n")
         return 2
     try:
@@ -389,10 +540,12 @@ def main(argv):
             payload = _train(
                 sys.stdin.buffer.read(), LinearRegression, "LinearRegression"
             )
-        else:
+        elif argv[1] == "train-logistic":
             payload = _train(
                 sys.stdin.buffer.read(), LogisticRegression, "LogisticRegression"
             )
+        else:
+            payload = _predict_knn(sys.stdin.buffer.read())
     except Exception as exc:
         sys.stderr.write("ValueError: %s\n" % exc)
         return 2
