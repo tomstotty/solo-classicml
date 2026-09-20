@@ -13,6 +13,8 @@ Exports:
         trees with per-node random feature subsampling.
     StandardScaler -- deterministic standardization by column mean and
         population standard deviation.
+    KMeans -- deterministic k-means clustering with random-seeded initial
+        centroids and squared Euclidean distances.
     accuracy_score -- fraction of positions where two integer label
         vectors agree.
     mean_squared_error -- mean of squared element-wise differences of two
@@ -46,6 +48,7 @@ __all__ = [
     "DecisionTreeClassifier",
     "RandomForestClassifier",
     "StandardScaler",
+    "KMeans",
     "accuracy_score",
     "mean_squared_error",
 ]
@@ -975,6 +978,172 @@ class StandardScaler:
                 scaled_row.append(value)
             results.append(scaled_row)
         return results
+
+
+class KMeans:
+    """Deterministic k-means clustering with random-seeded initial centroids.
+
+    The initial centroids are copies of ``n_clusters`` training rows, taken
+    in the order returned by ``random.Random(seed).sample(range(n),
+    n_clusters)``. Each iteration assigns every row to the centroid with
+    the smallest squared Euclidean distance, accumulated per row with
+    ``math.fsum`` over ``(x_j - c_j) ** 2`` in column order; exact ties go
+    to the smallest centroid index. Each non-empty cluster centroid is then
+    updated synchronously, column by column, to ``fsum(member values) /
+    member count``; empty clusters keep their previous centroid. Iteration
+    stops when the largest absolute coordinate change is at most ``tol``,
+    or after ``max_iter`` iterations. The final centroids are retained and
+    prediction reuses the assignment rule. The same parameters and inputs
+    always give the same result.
+    """
+
+    def __init__(self, n_clusters=8, max_iter=300, tol=1e-4, seed=0):
+        if type(n_clusters) is not int:
+            raise ValueError("n_clusters must be an integer")
+        if n_clusters <= 0:
+            raise ValueError("n_clusters must be greater than 0")
+        if type(max_iter) is not int:
+            raise ValueError("max_iter must be an integer")
+        if max_iter <= 0:
+            raise ValueError("max_iter must be greater than 0")
+        if not _is_finite_number(tol) or tol <= 0:
+            raise ValueError("tol must be a finite non-boolean number > 0")
+        if type(seed) is not int:
+            raise ValueError("seed must be an integer")
+
+        self.n_clusters = n_clusters
+        self.max_iter = max_iter
+        self.tol = tol
+        self.seed = seed
+        self._centroids = None
+        self._n_features = None
+
+    @staticmethod
+    def _validate(X):
+        # Elements are accepted only when type(value) is exactly int or
+        # float and math.isfinite(value) is true; booleans are rejected.
+        # math.isfinite raises OverflowError for ints too large to convert
+        # to float; such values fail the finite-number requirement.
+        try:
+            return _check_matrix_exact(X)
+        except OverflowError as exc:
+            raise ValueError(
+                "X must contain only finite non-boolean numbers"
+            ) from exc
+
+    def fit(self, X):
+        self._centroids = None
+        self._n_features = None
+
+        width = self._validate(X)
+        n = len(X)
+        if self.n_clusters > n:
+            raise ValueError(
+                "n_clusters must not exceed the number of training samples"
+            )
+        k = self.n_clusters
+
+        rng = random.Random(self.seed)
+        centroids = [list(X[i]) for i in rng.sample(range(n), k)]
+
+        for _ in range(self.max_iter):
+            assignments = self._assign(X, width, centroids)
+
+            new_centroids = [list(centroid) for centroid in centroids]
+            for c in range(k):
+                members = [i for i in range(n) if assignments[i] == c]
+                if not members:
+                    continue
+                for j in range(width):
+                    try:
+                        value = math.fsum(
+                            X[i][j] for i in members
+                        ) / len(members)
+                    except (OverflowError, ValueError) as exc:
+                        raise FloatingPointError(
+                            "non-finite value encountered during fit"
+                        ) from exc
+                    if isinstance(value, float) and not math.isfinite(value):
+                        raise FloatingPointError(
+                            "non-finite value encountered during fit"
+                        )
+                    new_centroids[c][j] = value
+
+            max_change = 0.0
+            for c in range(k):
+                for j in range(width):
+                    try:
+                        change = abs(new_centroids[c][j] - centroids[c][j])
+                    except (OverflowError, ValueError) as exc:
+                        raise FloatingPointError(
+                            "non-finite value encountered during fit"
+                        ) from exc
+                    if isinstance(change, float) and not math.isfinite(change):
+                        raise FloatingPointError(
+                            "non-finite value encountered during fit"
+                        )
+                    if change > max_change:
+                        max_change = change
+
+            centroids = new_centroids
+            if max_change <= self.tol:
+                break
+
+        self._centroids = centroids
+        self._n_features = width
+        return self
+
+    @staticmethod
+    def _assign(X, width, centroids):
+        assignments = []
+        for row in X:
+            best_cluster = 0
+            best_distance = None
+            for c in range(len(centroids)):
+                centroid = centroids[c]
+                terms = []
+                for j in range(width):
+                    try:
+                        diff = row[j] - centroid[j]
+                        square = diff ** 2
+                    except (OverflowError, ValueError) as exc:
+                        raise FloatingPointError(
+                            "non-finite value encountered during distance "
+                            "computation"
+                        ) from exc
+                    if isinstance(square, float) and not math.isfinite(square):
+                        raise FloatingPointError(
+                            "non-finite value encountered during distance "
+                            "computation"
+                        )
+                    terms.append(square)
+                try:
+                    distance = math.fsum(terms)
+                except (OverflowError, ValueError) as exc:
+                    raise FloatingPointError(
+                        "non-finite value encountered during distance "
+                        "computation"
+                    ) from exc
+                if isinstance(distance, float) and not math.isfinite(distance):
+                    raise FloatingPointError(
+                        "non-finite value encountered during distance "
+                        "computation"
+                    )
+                if best_distance is None or distance < best_distance:
+                    best_distance = distance
+                    best_cluster = c
+            assignments.append(best_cluster)
+        return assignments
+
+    def predict(self, X):
+        if self._centroids is None:
+            raise ValueError("model must be fitted before predict is called")
+        width = self._validate(X)
+        if width != self._n_features:
+            raise ValueError(
+                "X must have the same number of features as the training data"
+            )
+        return self._assign(X, width, self._centroids)
 
 
 def _check_metric_vectors(y_true, y_pred):
