@@ -36,6 +36,8 @@ Exports:
         thresholds for a binary score ranking.
     average_precision_score -- stepwise area under the
         precision_recall_curve.
+    calibration_curve -- empirical positive fractions and mean predicted
+        probabilities over equal-width probability bins.
     dumps -- serialize a fitted KMeans/PCA model to whitespace-free JSON
         text (quantized to 10 decimal places with ROUND_HALF_UP).
     loads -- reconstruct an independent fitted KMeans/PCA model from text
@@ -84,6 +86,7 @@ __all__ = [
     "roc_auc_score",
     "precision_recall_curve",
     "average_precision_score",
+    "calibration_curve",
     "dumps",
     "loads",
 ]
@@ -2140,6 +2143,17 @@ def precision_recall_curve(y_true, y_score, pos_label=1, sample_weight=None):
             fp = math.fsum(fp_terms)
             tp = math.fsum(tp_terms)
             denominator = tp + fp
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during precision-recall "
+                "computation"
+            ) from exc
+        if not math.isfinite(denominator):
+            raise FloatingPointError(
+                "non-finite value encountered during precision-recall "
+                "computation"
+            )
+        try:
             if denominator == 0.0:
                 precision = 1.0
             else:
@@ -2211,6 +2225,209 @@ def average_precision_score(y_true, y_score, pos_label=1, sample_weight=None):
     if ap == 0:
         ap = 0.0
     return ap
+
+
+def _cal_float(value):
+    """Convert a validated probability/weight to float; overflow, invalid
+    operations, and non-finite results raise FloatingPointError."""
+    try:
+        result = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during calibration curve "
+            "computation"
+        ) from exc
+    if not math.isfinite(result):
+        raise FloatingPointError(
+            "non-finite value encountered during calibration curve "
+            "computation"
+        )
+    return result
+
+
+def calibration_curve(
+    y_true, y_prob, n_bins=5, pos_label=1, sample_weight=None
+):
+    """Compute empirical positive fractions and mean predicted probabilities
+    over equal-width probability bins.
+
+    ``y_true`` and ``y_prob`` must be non-empty lists of equal length.
+    ``y_true`` must contain values of type exactly ``int`` (booleans are
+    rejected) drawn from exactly two distinct labels, and ``pos_label`` must
+    be an exact ``int`` equal to one of them; the other label is the
+    negative class. ``y_prob`` must contain finite values in the closed
+    interval ``[0, 1]`` of type exactly ``int`` or ``float`` (booleans are
+    rejected). ``n_bins`` must be an exact positive ``int`` (booleans are
+    rejected). ``sample_weight`` must be ``None`` -- every sample then
+    weighs ``1.0`` -- or a list of the same length whose elements are
+    finite non-negative values of type exactly ``int`` or ``float``
+    (booleans are rejected); the total weight must be greater than zero.
+    Any violation raises ValueError.
+
+    Each probability ``p`` falls into the equal-width bin numbered
+    ``min(int(p * n_bins), n_bins - 1)``. Bins are visited in ascending bin
+    order; within a bin the samples are reduced in input order with
+    ``math.fsum`` into the total weight ``W``, the positive-class weight
+    ``T``, and the weighted-probability sum ``P`` (each term is ``w * p``).
+    Bins with ``W == 0`` are omitted; every retained bin appends, in order,
+    ``T / W`` to the fraction-of-positives list and ``P / W`` to the
+    mean-probability list. An exact zero result is normalized to ``0.0``.
+    Overflow, invalid operations, or non-finite results after validation
+    raise FloatingPointError.
+
+    The return value is ``(fraction_of_positives, mean_probability)``, two
+    lists of floats in ascending bin order. The inputs are not modified.
+    Deterministic: same inputs, same result.
+    """
+    if not isinstance(y_true, list) or not isinstance(y_prob, list):
+        raise ValueError("y_true and y_prob must be lists")
+    if len(y_true) == 0 or len(y_prob) == 0:
+        raise ValueError("y_true and y_prob must be non-empty lists")
+    if len(y_true) != len(y_prob):
+        raise ValueError("y_true and y_prob must have the same length")
+    n = len(y_true)
+
+    for value in y_true:
+        if type(value) is not int:
+            raise ValueError("y_true must contain only integers")
+    if type(pos_label) is not int:
+        raise ValueError("pos_label must be an integer")
+    labels = set(y_true)
+    if len(labels) != 2 or pos_label not in labels:
+        raise ValueError(
+            "y_true must contain exactly two distinct labels with "
+            "pos_label among them"
+        )
+
+    for value in y_prob:
+        if type(value) not in (int, float):
+            raise ValueError(
+                "y_prob must contain only finite numbers in [0, 1]"
+            )
+        # math.isfinite raises OverflowError for ints too large to convert
+        # to float; such values fail the finite requirement.
+        try:
+            finite = math.isfinite(value)
+        except OverflowError as exc:
+            raise ValueError(
+                "y_prob must contain only finite numbers in [0, 1]"
+            ) from exc
+        if not finite or value < 0 or value > 1:
+            raise ValueError(
+                "y_prob must contain only finite numbers in [0, 1]"
+            )
+
+    if type(n_bins) is not int:  # exact int also excludes booleans
+        raise ValueError("n_bins must be a positive integer")
+    if n_bins < 1:
+        raise ValueError("n_bins must be a positive integer")
+
+    if sample_weight is None:
+        weights = [1.0] * n
+    else:
+        if not isinstance(sample_weight, list) or len(sample_weight) != n:
+            raise ValueError(
+                "sample_weight must be a list with the same length as "
+                "y_true"
+            )
+        for value in sample_weight:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                ) from exc
+            if not finite or value < 0:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+        weights = [_cal_float(value) for value in sample_weight]
+
+    probs = [_cal_float(value) for value in y_prob]
+
+    try:
+        total_weight = math.fsum(weights)
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during calibration curve "
+            "computation"
+        ) from exc
+    if not math.isfinite(total_weight):
+        raise FloatingPointError(
+            "non-finite value encountered during calibration curve "
+            "computation"
+        )
+    if total_weight <= 0.0:
+        raise ValueError("the total sample weight must be greater than 0")
+
+    # Bin samples into equal-width bins numbered
+    # ``min(int(p * n_bins), n_bins - 1)``. A dict keyed by bin number maps
+    # each occupied bin to (weight, positive-weight, weighted-probability)
+    # term lists accumulated in input order; using a dict (rather than one
+    # empty list per bin) avoids allocating n_bins lists when n_bins is a
+    # huge integer. math.fsum reduces each list in input order.
+    bins = {}
+    for i in range(n):
+        try:
+            scaled = probs[i] * n_bins
+            bin_index = int(scaled)
+            if bin_index > n_bins - 1:
+                bin_index = n_bins - 1
+            term = weights[i] * probs[i]
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during calibration curve "
+                "computation"
+            ) from exc
+        if not math.isfinite(scaled) or not math.isfinite(term):
+            raise FloatingPointError(
+                "non-finite value encountered during calibration curve "
+                "computation"
+            )
+        bin_data = bins.get(bin_index)
+        if bin_data is None:
+            bin_data = ([], [], [])
+            bins[bin_index] = bin_data
+        bin_data[0].append(weights[i])
+        if y_true[i] == pos_label:
+            bin_data[1].append(weights[i])
+        bin_data[2].append(term)
+
+    fraction_of_positives = []
+    mean_probability = []
+    for bin_index in sorted(bins):
+        w_terms, t_terms, p_terms = bins[bin_index]
+        try:
+            w_total = math.fsum(w_terms)
+            t_total = math.fsum(t_terms)
+            p_total = math.fsum(p_terms)
+            fraction = t_total / w_total
+            mean = p_total / w_total
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during calibration curve "
+                "computation"
+            ) from exc
+        if not math.isfinite(fraction) or not math.isfinite(mean):
+            raise FloatingPointError(
+                "non-finite value encountered during calibration curve "
+                "computation"
+            )
+        if fraction == 0:
+            fraction = 0.0
+        if mean == 0:
+            mean = 0.0
+        fraction_of_positives.append(fraction)
+        mean_probability.append(mean)
+
+    return fraction_of_positives, mean_probability
 
 
 _SERIAL_KEYS_KMEANS = (
