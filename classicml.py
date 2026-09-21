@@ -154,6 +154,7 @@ __all__ = [
     "balanced_accuracy_score",
     "top_k_accuracy_score",
     "ndcg_score",
+    "jaccard_score",
     "dumps",
     "loads",
 ]
@@ -5918,6 +5919,148 @@ def ndcg_score(y_true, y_score, k=None) -> float:
         raise FloatingPointError(
             "non-finite value encountered during ndcg score"
         )
+    if result == 0:
+        return 0.0
+    return result
+
+
+_JACCARD_AVERAGES = (None, "micro", "macro", "weighted")
+
+
+def jaccard_score(y_true, y_pred, labels=None, average=None):
+    """Return the Jaccard similarity score of two integer label vectors.
+
+    ``y_true`` and ``y_pred`` must be non-empty lists of equal length
+    whose elements have type exactly ``int`` (booleans are rejected).
+    The inputs are not modified. Deterministic: same inputs, same result.
+
+    When ``labels`` is ``None`` the label set is the sorted union of the
+    labels appearing in either vector. Otherwise ``labels`` must be a
+    non-empty list of distinct exact ``int`` values, kept in the given
+    order, that contains every label appearing in either vector.
+    ``average`` must be one of ``None``, ``"micro"``, ``"macro"``, or
+    ``"weighted"``. Any violation raises ValueError.
+
+    Counts are accumulated in sample order. For each label ``c``:
+    ``tp`` counts true ``c`` predicted ``c``, ``fp`` counts true
+    non-``c`` predicted ``c``, ``fn`` counts true ``c`` predicted
+    non-``c``, and ``support`` counts true ``c``. The label's Jaccard
+    score is ``J = tp / (tp + fp + fn)``; when the denominator is zero
+    the score is ``0.0``.
+
+    With ``average`` ``None`` the return is a list of floats aligned to
+    the labels in label order. ``"micro"`` pools ``tp``, ``fp``, and
+    ``fn`` across the labels in label order and scores the pooled
+    counts. ``"macro"`` is the ``math.fsum`` mean, in label order, of
+    the per-label scores; ``"weighted"`` divides the ``math.fsum``, in
+    label order, of ``J * support`` by the number of samples. The three
+    averaging modes return a float. An exact zero result is normalized
+    to ``0.0``. Overflow, invalid operations, or non-finite values
+    during the divisions or ``math.fsum`` steps raise
+    FloatingPointError.
+    """
+    n = _check_metric_vectors(y_true, y_pred)
+    for value in y_true:
+        if type(value) is not int:
+            raise ValueError("y_true must contain only integers")
+    for value in y_pred:
+        if type(value) is not int:
+            raise ValueError("y_pred must contain only integers")
+    if average not in _JACCARD_AVERAGES:
+        raise ValueError(
+            "average must be one of None, 'micro', 'macro', 'weighted'"
+        )
+
+    if labels is None:
+        label_order = sorted(set(y_true) | set(y_pred))
+    else:
+        if not isinstance(labels, list) or len(labels) == 0:
+            raise ValueError("labels must be a non-empty list")
+        label_order = []
+        seen = set()
+        for value in labels:
+            if type(value) is not int:
+                raise ValueError("labels must contain only integers")
+            if value in seen:
+                raise ValueError("labels must not contain duplicates")
+            seen.add(value)
+            label_order.append(value)
+        present = set(y_true) | set(y_pred)
+        if any(value not in seen for value in present):
+            raise ValueError(
+                "labels must contain every label appearing in the inputs"
+            )
+
+    tp = {label: 0 for label in label_order}
+    fp = {label: 0 for label in label_order}
+    fn = {label: 0 for label in label_order}
+    support = {label: 0 for label in label_order}
+    for i in range(n):
+        true_label = y_true[i]
+        pred_label = y_pred[i]
+        support[true_label] += 1
+        if true_label == pred_label:
+            tp[true_label] += 1
+        else:
+            fn[true_label] += 1
+            fp[pred_label] += 1
+
+    def non_finite(exc):
+        return FloatingPointError(
+            "non-finite value encountered during jaccard score"
+        )
+
+    def jaccard_for(tp_count, fp_count, fn_count):
+        denominator = tp_count + fp_count + fn_count
+        if denominator == 0:
+            return 0.0
+        try:
+            score = tp_count / denominator
+        except (OverflowError, ValueError) as exc:
+            raise non_finite(exc) from exc
+        if not math.isfinite(score):
+            raise non_finite(None)
+        if score == 0:
+            return 0.0
+        return score
+
+    if average == "micro":
+        total_tp = 0
+        total_fp = 0
+        total_fn = 0
+        for label in label_order:
+            total_tp += tp[label]
+            total_fp += fp[label]
+            total_fn += fn[label]
+        return jaccard_for(total_tp, total_fp, total_fn)
+
+    scores = [
+        jaccard_for(tp[label], fp[label], fn[label]) for label in label_order
+    ]
+
+    if average is None:
+        return scores
+
+    if average == "macro":
+        try:
+            result = math.fsum(scores) / len(label_order)
+        except (OverflowError, ValueError) as exc:
+            raise non_finite(exc) from exc
+        if not math.isfinite(result):
+            raise non_finite(None)
+        if result == 0:
+            return 0.0
+        return result
+
+    try:
+        result = math.fsum(
+            scores[k] * support[label_order[k]]
+            for k in range(len(label_order))
+        ) / n
+    except (OverflowError, ValueError) as exc:
+        raise non_finite(exc) from exc
+    if not math.isfinite(result):
+        raise non_finite(None)
     if result == 0:
         return 0.0
     return result
