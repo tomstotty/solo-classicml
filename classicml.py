@@ -44,6 +44,9 @@ Exports:
         binary probability vector.
     log_loss -- weighted logistic (cross-entropy) loss for a binary
         probability vector with clamped probabilities.
+    multiclass_log_loss -- weighted multiclass logistic (cross-entropy)
+        loss with one probability column per class and clamped true-class
+        probabilities.
     silhouette_score -- mean silhouette coefficient of a clustering over
         a finite real matrix and an integer label vector.
     adjusted_rand_score -- exact adjusted Rand index of two integer
@@ -107,6 +110,7 @@ __all__ = [
     "calibration_curve",
     "brier_score_loss",
     "log_loss",
+    "multiclass_log_loss",
     "silhouette_score",
     "adjusted_rand_score",
     "normalized_mutual_info_score",
@@ -2968,6 +2972,173 @@ def log_loss(y_true, y_prob, pos_label=1, sample_weight=None):
     if not math.isfinite(total_loss) or not math.isfinite(loss):
         raise FloatingPointError(
             "non-finite value encountered during log-loss computation"
+        )
+    if loss == 0:
+        loss = 0.0
+    return loss
+
+
+def multiclass_log_loss(y_true, y_prob, sample_weight=None):
+    """Compute the weighted multiclass logistic (cross-entropy) loss.
+
+    ``y_true`` and ``y_prob`` must be non-empty lists of equal length.
+    ``y_true`` must contain values of type exactly ``int`` (booleans are
+    rejected) drawn from at least two distinct classes. ``y_prob`` must be
+    a list of rows, one per sample; each row is a list whose length equals
+    the number of classes and whose elements are finite values in the
+    closed interval ``[0, 1]`` of type exactly ``int`` or ``float``
+    (booleans are rejected). The columns correspond to the classes of
+    ``y_true`` in ascending order. The values of every row, accumulated in
+    column order with ``math.fsum``, must sum to exactly ``1.0``.
+    ``sample_weight`` must be ``None`` -- every sample then weighs
+    ``1.0`` -- or a list of the same length whose elements are finite
+    non-negative values of type exactly ``int`` or ``float`` (booleans are
+    rejected). The total weight must be greater than zero. Any violation
+    (including an ``OverflowError`` raised while checking finiteness)
+    raises ValueError.
+
+    After validation, the probabilities and weights are converted to
+    ``float``. For each sample the probability ``p`` of its true class --
+    the class located among the ascending classes -- is clamped to
+    ``[1e-15, 1 - 1e-15]`` and the per-sample loss is ``-math.log(p)``.
+    The result is the quotient of two ``math.fsum`` sums taken in input
+    order -- one of ``w_i * loss_i``, the other of the ``w_i`` -- with an
+    exact zero normalized to ``0.0``. Overflow, invalid operations during
+    the post-validation conversion or arithmetic, and non-finite
+    intermediate values or results raise FloatingPointError.
+
+    The return value is a float. The inputs are not modified.
+    Deterministic: same inputs, same result.
+    """
+    if not isinstance(y_true, list) or not isinstance(y_prob, list):
+        raise ValueError("y_true and y_prob must be lists")
+    if len(y_true) == 0 or len(y_prob) == 0:
+        raise ValueError("y_true and y_prob must be non-empty lists")
+    if len(y_true) != len(y_prob):
+        raise ValueError("y_true and y_prob must have the same length")
+    n = len(y_true)
+
+    for value in y_true:
+        if type(value) is not int:
+            raise ValueError("y_true must contain only integers")
+    classes = sorted(set(y_true))
+    k = len(classes)
+    if k < 2:
+        raise ValueError(
+            "y_true must contain at least two distinct classes"
+        )
+    index = {label: j for j, label in enumerate(classes)}
+
+    for row in y_prob:
+        if not isinstance(row, list) or len(row) != k:
+            raise ValueError(
+                "each row of y_prob must be a list whose length equals "
+                "the number of classes"
+            )
+        for value in row:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "y_prob must contain only finite numbers in [0, 1]"
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "y_prob must contain only finite numbers in [0, 1]"
+                ) from exc
+            if not finite or value < 0 or value > 1:
+                raise ValueError(
+                    "y_prob must contain only finite numbers in [0, 1]"
+                )
+        try:
+            row_sum = math.fsum(row)
+        except OverflowError as exc:
+            raise ValueError(
+                "each row of y_prob must sum to exactly 1.0"
+            ) from exc
+        if row_sum != 1.0:
+            raise ValueError(
+                "each row of y_prob must sum to exactly 1.0"
+            )
+
+    if sample_weight is None:
+        weights = [1.0] * n
+    else:
+        if not isinstance(sample_weight, list) or len(sample_weight) != n:
+            raise ValueError(
+                "sample_weight must be a list with the same length as "
+                "y_true"
+            )
+        for value in sample_weight:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                ) from exc
+            if not finite or value < 0:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+        weights = [_log_loss_float(value) for value in sample_weight]
+
+    try:
+        total_weight = math.fsum(weights)
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during multiclass log-loss "
+            "computation"
+        ) from exc
+    if not math.isfinite(total_weight):
+        raise FloatingPointError(
+            "non-finite value encountered during multiclass log-loss "
+            "computation"
+        )
+    if total_weight <= 0.0:
+        raise ValueError("the total weight must be greater than 0")
+
+    loss_terms = []
+    for i in range(n):
+        p = _log_loss_float(y_prob[i][index[y_true[i]]])
+        p = min(max(p, 1e-15), 1.0 - 1e-15)
+        try:
+            sample_loss = -math.log(p)
+            term = weights[i] * sample_loss
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during multiclass log-loss "
+                "computation"
+            ) from exc
+        if not math.isfinite(term):
+            raise FloatingPointError(
+                "non-finite value encountered during multiclass log-loss "
+                "computation"
+            )
+        loss_terms.append(term)
+
+    try:
+        total_loss = math.fsum(loss_terms)
+        loss = total_loss / total_weight
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during multiclass log-loss "
+            "computation"
+        ) from exc
+    if not math.isfinite(total_loss) or not math.isfinite(loss):
+        raise FloatingPointError(
+            "non-finite value encountered during multiclass log-loss "
+            "computation"
         )
     if loss == 0:
         loss = 0.0
