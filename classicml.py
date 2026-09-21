@@ -49,6 +49,8 @@ Exports:
         the probability of the true class clamped away from zero.
     silhouette_score -- mean silhouette coefficient of a clustering over
         a finite real matrix and an integer label vector.
+    davies_bouldin_score -- Davies-Bouldin index of a clustering over a
+        finite real matrix and an integer label vector.
     adjusted_rand_score -- exact adjusted Rand index of two integer
         partitions, computed with fractions.Fraction and returned as float.
     normalized_mutual_info_score -- mutual information of two integer
@@ -112,6 +114,7 @@ __all__ = [
     "log_loss",
     "multiclass_log_loss",
     "silhouette_score",
+    "davies_bouldin_score",
     "adjusted_rand_score",
     "normalized_mutual_info_score",
     "matthews_corrcoef",
@@ -3020,12 +3023,16 @@ def multiclass_log_loss(y_true, y_prob, sample_weight=None) -> float:
     ``float``. For each sample, in input order, the true class is located
     by ascending class order, its probability ``p`` is clamped to
     ``[1e-15, 1 - 1e-15]``, and the per-sample loss is ``-math.log(p)``.
-    The result is the quotient of two ``math.fsum`` sums, both accumulated
-    in input order -- one of ``w_i * loss_i``, the other of the ``w_i``
-    -- with an exact zero normalized to ``0.0``. Overflow or invalid
-    operations during the post-validation conversion, multiplication,
-    logarithm, summation, or division, and non-finite intermediate values
-    or results, raise FloatingPointError.
+    The total weight is the ``math.fsum`` of the converted weights,
+    accumulated in input order; an overflow or invalid operation during
+    that summation, a non-finite total, or a total less than or equal to
+    zero raises ValueError. The result is the quotient of two
+    ``math.fsum`` sums, both accumulated in input order -- one of
+    ``w_i * loss_i``, the other of the ``w_i`` -- with an exact zero
+    normalized to ``0.0``. Overflow or invalid operations during the
+    remaining post-validation conversion, multiplication, logarithm,
+    summation, or division, and non-finite intermediate values or
+    results, raise FloatingPointError.
 
     The return value is a float. The inputs are not modified.
     Deterministic: same inputs, same result.
@@ -3116,14 +3123,12 @@ def multiclass_log_loss(y_true, y_prob, sample_weight=None) -> float:
     try:
         total_weight = math.fsum(weights)
     except (OverflowError, ValueError) as exc:
-        raise FloatingPointError(
-            "non-finite value encountered during multiclass-log-loss "
-            "computation"
+        raise ValueError(
+            "the total weight must be a finite value greater than 0"
         ) from exc
     if not math.isfinite(total_weight):
-        raise FloatingPointError(
-            "non-finite value encountered during multiclass-log-loss "
-            "computation"
+        raise ValueError(
+            "the total weight must be a finite value greater than 0"
         )
     if total_weight <= 0.0:
         raise ValueError("the total weight must be greater than 0")
@@ -3357,6 +3362,223 @@ def silhouette_score(X, labels):
     except (OverflowError, ValueError) as exc:
         raise FloatingPointError(
             "non-finite value encountered during silhouette score"
+        ) from exc
+    if not math.isfinite(result):
+        fail()
+    if result == 0:
+        result = 0.0
+    return result
+
+
+def davies_bouldin_score(X, labels):
+    """Compute the Davies-Bouldin index of a clustering.
+
+    ``X`` must be a non-empty rectangular ``list`` of non-empty ``list``
+    rows whose elements are finite values of type exactly ``int`` or
+    ``float`` (booleans and subclasses are rejected). ``labels`` must be
+    a ``list`` of the same length whose elements have type exactly
+    ``int``, and the number of distinct labels must lie in
+    ``[2, len(X) - 1]``. Any violation -- including overflow during the
+    finiteness checks -- raises ValueError.
+
+    Clusters are the label groups in ascending label order, keeping input
+    order within each cluster. The centroid of a cluster has, per column,
+    the ``math.fsum`` of that column over the cluster's samples divided
+    by the cluster size. The distance between two points ``a`` and ``b``
+    is ``sqrt(math.fsum((a_j - b_j) ** 2))`` with terms accumulated in
+    column order. ``S_k`` is the ``math.fsum`` of the distances from the
+    samples of cluster ``k`` to its centroid, taken in input order,
+    divided by the cluster size, and ``M_kl`` is the distance between
+    the centroids of clusters ``k`` and ``l``. If any ``k != l`` has
+    ``M_kl == 0``, ValueError is raised. Otherwise, in ascending cluster
+    order, ``R_k`` is the maximum of ``(S_k + S_l) / M_kl`` over
+    ``l != k`` and the result is ``math.fsum(R_k)`` divided by the
+    number of clusters, with an exact zero normalized to ``0.0``.
+    Overflow, invalid operations, or non-finite intermediate values
+    after validation raise FloatingPointError.
+
+    The return value is a float. The inputs are not modified.
+    Deterministic: same inputs, same result.
+    """
+    if not isinstance(X, list) or len(X) == 0:
+        raise ValueError("X must be a non-empty list of rows")
+    width = None
+    for row in X:
+        if not isinstance(row, list) or len(row) == 0:
+            raise ValueError("X rows must be non-empty lists")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError("X must be rectangular")
+        for value in row:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "X must contain only finite non-boolean numbers"
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "X must contain only finite non-boolean numbers"
+                ) from exc
+            if not finite:
+                raise ValueError(
+                    "X must contain only finite non-boolean numbers"
+                )
+    n = len(X)
+    if not isinstance(labels, list) or len(labels) != n:
+        raise ValueError("labels must be a list with the same length as X")
+    for value in labels:
+        if type(value) is not int:
+            raise ValueError("labels must contain only integers")
+    distinct = sorted(set(labels))
+    if len(distinct) < 2 or len(distinct) > n - 1:
+        raise ValueError(
+            "labels must contain between 2 and len(X) - 1 distinct labels"
+        )
+
+    clusters = {}
+    for i in range(n):
+        clusters.setdefault(labels[i], []).append(i)
+    groups = [clusters[label] for label in distinct]
+    n_clusters = len(groups)
+
+    def fail():
+        raise FloatingPointError(
+            "non-finite value encountered during davies-bouldin score"
+        )
+
+    def distance(a, b):
+        """``sqrt(math.fsum((a_j - b_j) ** 2))`` in column order with
+        overflow, invalid operations, and non-finite values raising
+        FloatingPointError."""
+        terms = []
+        for j in range(width):
+            try:
+                diff = a[j] - b[j]
+            except (OverflowError, ValueError) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during davies-bouldin "
+                    "score"
+                ) from exc
+            if isinstance(diff, float) and not math.isfinite(diff):
+                fail()
+            try:
+                square = diff ** 2
+            except (OverflowError, ValueError) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during davies-bouldin "
+                    "score"
+                ) from exc
+            if isinstance(square, float) and not math.isfinite(square):
+                fail()
+            terms.append(square)
+        try:
+            total = math.fsum(terms)
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during davies-bouldin score"
+            ) from exc
+        if not math.isfinite(total):
+            fail()
+        try:
+            result = math.sqrt(total)
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during davies-bouldin score"
+            ) from exc
+        if not math.isfinite(result):
+            fail()
+        return result
+
+    def checked_mean(total_terms, count):
+        """``math.fsum(total_terms) / count`` with overflow, invalid
+        operations, and non-finite values raising FloatingPointError."""
+        try:
+            total = math.fsum(total_terms)
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during davies-bouldin score"
+            ) from exc
+        if not math.isfinite(total):
+            fail()
+        try:
+            mean = total / count
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during davies-bouldin score"
+            ) from exc
+        if not math.isfinite(mean):
+            fail()
+        return mean
+
+    centroids = []
+    for group in groups:
+        size = len(group)
+        centroid = []
+        for j in range(width):
+            centroid.append(
+                checked_mean([X[i][j] for i in group], size)
+            )
+        centroids.append(centroid)
+
+    scatters = []
+    for k in range(n_clusters):
+        centroid = centroids[k]
+        scatters.append(
+            checked_mean(
+                [distance(X[i], centroid) for i in groups[k]],
+                len(groups[k]),
+            )
+        )
+
+    # Centroid distances; d(k, l) == d(l, k) exactly, so each unordered
+    # pair is computed once with the smaller cluster index first.
+    separations = [[0.0] * n_clusters for _ in range(n_clusters)]
+    for k in range(n_clusters):
+        for l in range(k + 1, n_clusters):
+            m = distance(centroids[k], centroids[l])
+            if m == 0:
+                raise ValueError(
+                    "distinct clusters must not have identical centroids"
+                )
+            separations[k][l] = m
+            separations[l][k] = m
+
+    r_values = []
+    for k in range(n_clusters):
+        best = None
+        for l in range(n_clusters):
+            if l == k:
+                continue
+            try:
+                ratio = (scatters[k] + scatters[l]) / separations[k][l]
+            except (OverflowError, ValueError) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during davies-bouldin "
+                    "score"
+                ) from exc
+            if not math.isfinite(ratio):
+                fail()
+            if best is None or ratio > best:
+                best = ratio
+        r_values.append(best)
+
+    try:
+        total = math.fsum(r_values)
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during davies-bouldin score"
+        ) from exc
+    if not math.isfinite(total):
+        fail()
+    try:
+        result = total / n_clusters
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during davies-bouldin score"
         ) from exc
     if not math.isfinite(result):
         fail()
