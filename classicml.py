@@ -103,6 +103,7 @@ __all__ = [
     "silhouette_score",
     "adjusted_rand_score",
     "normalized_mutual_info_score",
+    "matthews_corrcoef",
     "dumps",
     "loads",
 ]
@@ -3151,6 +3152,87 @@ def normalized_mutual_info_score(labels_true, labels_pred):
     checked(product)
     checked(denominator)
     checked(result)
+    if result == 0:
+        return 0.0
+    return result
+
+
+def matthews_corrcoef(y_true, y_pred):
+    """Return the Matthews correlation coefficient of two integer labels.
+
+    Both arguments must be non-empty lists of equal length whose elements
+    are exactly ``int`` (booleans and int subclasses are rejected). The
+    inputs are not modified. Deterministic: same inputs, same result.
+
+    The labels are the ascending union of the two label sets. An integer
+    contingency table is accumulated by sample index with true labels as
+    rows and predicted labels as columns in that label order. With ``t_k``
+    the row sums, ``p_k`` the column sums, ``c`` the diagonal sum, and
+    ``s`` the number of samples (missing rows or columns contribute
+    zero), ``u = c*s - sum(p_k*t_k)``, ``a = s*s - sum(p_k*p_k)``, and
+    ``b = s*s - sum(t_k*t_k)``; every sum is taken over labels in
+    ascending order using Python integers. When ``a`` or ``b`` is zero
+    the result is ``0.0``; otherwise the denominator is
+    ``math.sqrt(a*b)`` and the result is ``u`` divided by it. An exact
+    zero result is normalized to ``0.0``. Overflow, invalid operations,
+    or non-finite denominator or result in the ``math.sqrt``, integer to
+    float conversion, or division steps raise FloatingPointError.
+    """
+    n = _check_metric_vectors(y_true, y_pred)
+    for value in y_true:
+        if type(value) is not int:
+            raise ValueError("y_true must contain only integers")
+    for value in y_pred:
+        if type(value) is not int:
+            raise ValueError("y_pred must contain only integers")
+
+    labels = sorted(set(y_true) | set(y_pred))
+    index = {label: k for k, label in enumerate(labels)}
+    size = len(labels)
+
+    counts = [[0] * size for _ in labels]
+    for i in range(n):
+        counts[index[y_true[i]]][index[y_pred[i]]] += 1
+
+    t = [0] * size
+    p = [0] * size
+    c = 0
+    for k in range(size):
+        row = counts[k]
+        row_sum = 0
+        for j in range(size):
+            row_sum += row[j]
+            p[j] += row[j]
+        t[k] = row_sum
+        c += row[k]
+
+    s = n
+    sum_pt = 0
+    sum_pp = 0
+    sum_tt = 0
+    for k in range(size):
+        sum_pt += p[k] * t[k]
+        sum_pp += p[k] * p[k]
+        sum_tt += t[k] * t[k]
+
+    u = c * s - sum_pt
+    a = s * s - sum_pp
+    b = s * s - sum_tt
+    if a == 0 or b == 0:
+        return 0.0
+
+    def non_finite():
+        return FloatingPointError(
+            "non-finite value encountered during matthews correlation"
+        )
+
+    try:
+        denominator = math.sqrt(float(a * b))
+        result = float(u) / denominator
+    except (OverflowError, ValueError) as exc:
+        raise non_finite() from exc
+    if not math.isfinite(denominator) or not math.isfinite(result):
+        raise non_finite()
     if result == 0:
         return 0.0
     return result
