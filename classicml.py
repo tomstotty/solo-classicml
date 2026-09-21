@@ -50,6 +50,8 @@ Exports:
         partitions normalized by the geometric mean of their entropies.
     matthews_corrcoef -- Matthews correlation coefficient of two integer
         label vectors, computed from an exact integer contingency table.
+    cohen_kappa_score -- Cohen's kappa of two integer label vectors,
+        unweighted or with linear or quadratic weights.
     dumps -- serialize a fitted KMeans/PCA model to whitespace-free JSON
         text (quantized to 10 decimal places with ROUND_HALF_UP).
     loads -- reconstruct an independent fitted KMeans/PCA model from text
@@ -106,6 +108,7 @@ __all__ = [
     "adjusted_rand_score",
     "normalized_mutual_info_score",
     "matthews_corrcoef",
+    "cohen_kappa_score",
     "dumps",
     "loads",
 ]
@@ -3237,6 +3240,145 @@ def matthews_corrcoef(y_true, y_pred):
         raise non_finite()
     try:
         result = u / denominator
+    except (OverflowError, ValueError) as exc:
+        raise non_finite() from exc
+    if not math.isfinite(result):
+        raise non_finite()
+    if result == 0:
+        return 0.0
+    return result
+
+
+_KAPPA_WEIGHTS = (None, "linear", "quadratic")
+
+
+def cohen_kappa_score(y_true, y_pred, weights=None):
+    """Return Cohen's kappa of two integer label vectors.
+
+    ``y_true`` and ``y_pred`` must be non-empty lists of equal length whose
+    elements have type exactly ``int`` (booleans and subclasses are
+    rejected). ``weights`` must be one of ``None``, ``"linear"``, or
+    ``"quadratic"``. Any violation raises ValueError.
+
+    The label set is the sorted union of the labels appearing in either
+    vector, giving ``K`` classes in ascending order; an integer ``K`` by
+    ``K`` confusion table ``C`` is accumulated in sample order with true
+    labels as rows and predicted labels as columns. In label order ``r_i``
+    is the ``i``-th row sum, ``c_j`` the ``j``-th column sum, and ``n`` the
+    number of samples. When ``K == 1`` the result is ``1.0``.
+
+    The weight matrix is ``d(i, i) = 0.0`` and, off the diagonal,
+    ``d(i, j) = 1.0`` for ``None``, ``abs(i - j) / (K - 1)`` for
+    ``"linear"``, and ``((i - j) / (K - 1)) ** 2`` for ``"quadratic"``.
+    With terms taken in row-then-column order,
+    ``O = fsum(C_ij * d_ij) / n`` and
+    ``E = fsum(r_i * c_j * d_ij) / (n * n)`` use ``math.fsum``. When
+    ``E == 0`` the result is ``1.0``; otherwise it is ``1.0 - O / E``. An
+    exact zero result is normalized to ``0.0``. Overflow, invalid
+    operations, or non-finite values after validation raise
+    FloatingPointError.
+
+    The inputs are not modified. Deterministic: same inputs, same result.
+    """
+    n = _check_metric_vectors(y_true, y_pred)
+    for value in y_true:
+        if type(value) is not int:
+            raise ValueError("y_true must contain only integers")
+    for value in y_pred:
+        if type(value) is not int:
+            raise ValueError("y_pred must contain only integers")
+    if weights not in _KAPPA_WEIGHTS:
+        raise ValueError(
+            "weights must be one of None, 'linear', 'quadratic'"
+        )
+
+    labels = sorted(set(y_true) | set(y_pred))
+    K = len(labels)
+    index = {label: k for k, label in enumerate(labels)}
+
+    C = [[0 for _ in range(K)] for _ in range(K)]
+    for i in range(n):
+        C[index[y_true[i]]][index[y_pred[i]]] += 1
+
+    r = [0 for _ in range(K)]
+    c = [0 for _ in range(K)]
+    for i in range(K):
+        for j in range(K):
+            r[i] += C[i][j]
+            c[j] += C[i][j]
+
+    if K == 1:
+        return 1.0
+
+    def non_finite():
+        return FloatingPointError(
+            "non-finite value encountered during cohen kappa"
+        )
+
+    # Weight matrix d(i, j), built in row-then-column order.
+    d = [[0.0 for _ in range(K)] for _ in range(K)]
+    span = K - 1
+    for i in range(K):
+        for j in range(K):
+            if i == j:
+                continue
+            if weights is None:
+                d[i][j] = 1.0
+            elif weights == "linear":
+                try:
+                    value = abs(i - j) / span
+                except (OverflowError, ValueError) as exc:
+                    raise non_finite() from exc
+                if not math.isfinite(value):
+                    raise non_finite()
+                d[i][j] = value
+            else:  # "quadratic"
+                try:
+                    value = ((i - j) / span) ** 2
+                except (OverflowError, ValueError) as exc:
+                    raise non_finite() from exc
+                if not math.isfinite(value):
+                    raise non_finite()
+                d[i][j] = value
+
+    observed_terms = []
+    expected_terms = []
+    for i in range(K):
+        for j in range(K):
+            try:
+                observed_terms.append(C[i][j] * d[i][j])
+                expected_terms.append(r[i] * c[j] * d[i][j])
+            except (OverflowError, ValueError) as exc:
+                raise non_finite() from exc
+    for term in observed_terms:
+        if not math.isfinite(term):
+            raise non_finite()
+    for term in expected_terms:
+        if not math.isfinite(term):
+            raise non_finite()
+
+    try:
+        observed_sum = math.fsum(observed_terms)
+        expected_sum = math.fsum(expected_terms)
+    except (OverflowError, ValueError) as exc:
+        raise non_finite() from exc
+    if not math.isfinite(observed_sum) or not math.isfinite(expected_sum):
+        raise non_finite()
+
+    try:
+        O = observed_sum / n
+        E = expected_sum / (n * n)
+    except (OverflowError, ValueError) as exc:
+        raise non_finite() from exc
+    if not math.isfinite(O) or not math.isfinite(E):
+        raise non_finite()
+
+    if E == 0:
+        return 1.0
+
+    try:
+        ratio = O / E
+        result = 1.0 - ratio
     except (OverflowError, ValueError) as exc:
         raise non_finite() from exc
     if not math.isfinite(result):
