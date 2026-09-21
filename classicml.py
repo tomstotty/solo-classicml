@@ -77,6 +77,8 @@ Exports:
         integer label vectors, optionally adjusted for chance.
     top_k_accuracy_score -- weighted fraction of samples whose true class
         is among the k highest-scoring columns of a score matrix.
+    ndcg_score -- normalized discounted cumulative gain at k between a
+        non-negative relevance vector and a score vector.
     dumps -- serialize a fitted KMeans/PCA model to whitespace-free JSON
         text (quantized to 10 decimal places with ROUND_HALF_UP).
     loads -- reconstruct an independent fitted KMeans/PCA model from text
@@ -147,6 +149,7 @@ __all__ = [
     "cohen_kappa_score",
     "balanced_accuracy_score",
     "top_k_accuracy_score",
+    "ndcg_score",
     "dumps",
     "loads",
 ]
@@ -5629,6 +5632,144 @@ def top_k_accuracy_score(y_true, y_score, k=2, sample_weight=None) -> float:
         raise non_finite(exc) from exc
     if not math.isfinite(result):
         raise non_finite(None)
+    if result == 0:
+        return 0.0
+    return result
+
+
+def ndcg_score(y_true, y_score, k=None) -> float:
+    """Return the normalized discounted cumulative gain at ``k``.
+
+    ``y_true`` and ``y_score`` must be non-empty lists of equal length.
+    ``y_true`` elements must be finite non-negative values of type
+    exactly ``int`` or ``float`` (booleans are rejected); ``y_score``
+    elements must be finite values of type exactly ``int`` or
+    ``float`` (booleans are rejected). ``k`` must be ``None`` or an
+    exact ``int`` (booleans are rejected); with ``None`` the list
+    length ``m`` is used, otherwise ``1 <= k <= m`` is required. Any
+    container, length, type, sign, range, or finiteness violation
+    (including ``OverflowError`` raised by ``math.isfinite``) raises
+    ValueError.
+
+    The predicted order ``P`` is the first ``k`` indices of
+    ``range(m)`` sorted ascending by ``(-y_score[j], j)``; the ideal
+    order ``I`` is obtained the same way using ``(-y_true[j], j)``, so
+    ties favor the smaller index. For an order the discounted gain is
+    ``D = math.fsum((2.0 ** y_true[j] - 1.0) / math.log2(r + 2) for r,
+    j in enumerate(order))`` with the terms in ascending rank. The
+    result is ``D(P) / D(I)``; when ``D(I)`` is zero the result is
+    ``0.0``. Overflow, invalid operations, and non-finite values in
+    the exponentiation, logarithm, division, the ``math.fsum``
+    summations, or the final ratio raise FloatingPointError. An exact
+    zero result is normalized to ``0.0``.
+
+    The return value is a float. The inputs are not modified.
+    Deterministic: same inputs, same result.
+    """
+    if not isinstance(y_true, list) or not isinstance(y_score, list):
+        raise ValueError("y_true and y_score must be lists")
+    if len(y_true) == 0 or len(y_score) == 0:
+        raise ValueError("y_true and y_score must be non-empty lists")
+    m = len(y_true)
+    if len(y_score) != m:
+        raise ValueError("y_true and y_score must have the same length")
+    for value in y_true:
+        if type(value) not in (int, float):
+            raise ValueError(
+                "y_true must contain only finite non-negative "
+                "non-boolean numbers"
+            )
+        # math.isfinite raises OverflowError for ints too large to
+        # convert to float; such values fail the finite requirement.
+        try:
+            finite = math.isfinite(value)
+        except OverflowError as exc:
+            raise ValueError(
+                "y_true must contain only finite non-negative "
+                "non-boolean numbers"
+            ) from exc
+        if not finite or value < 0:
+            raise ValueError(
+                "y_true must contain only finite non-negative "
+                "non-boolean numbers"
+            )
+    for value in y_score:
+        if type(value) not in (int, float):
+            raise ValueError(
+                "y_score must contain only finite non-boolean numbers"
+            )
+        # math.isfinite raises OverflowError for ints too large to
+        # convert to float; such values fail the finite requirement.
+        try:
+            finite = math.isfinite(value)
+        except OverflowError as exc:
+            raise ValueError(
+                "y_score must contain only finite non-boolean numbers"
+            ) from exc
+        if not finite:
+            raise ValueError(
+                "y_score must contain only finite non-boolean numbers"
+            )
+
+    if k is None:
+        k = m
+    else:
+        if type(k) is not int:
+            raise ValueError("k must be None or an integer")
+        if k < 1 or k > m:
+            raise ValueError(
+                "k must be between 1 and the length of the vectors"
+            )
+
+    predicted = sorted(range(m), key=lambda j: (-y_score[j], j))[:k]
+    ideal = sorted(range(m), key=lambda j: (-y_true[j], j))[:k]
+
+    def dcg(order):
+        terms = []
+        for r, j in enumerate(order):
+            try:
+                gain = 2.0 ** y_true[j] - 1.0
+                discount = math.log2(r + 2)
+                term = gain / discount
+            except (OverflowError, ValueError) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during ndcg score"
+                ) from exc
+            if (
+                not math.isfinite(gain)
+                or not math.isfinite(discount)
+                or not math.isfinite(term)
+            ):
+                raise FloatingPointError(
+                    "non-finite value encountered during ndcg score"
+                )
+            terms.append(term)
+        try:
+            total = math.fsum(terms)
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during ndcg score"
+            ) from exc
+        if not math.isfinite(total):
+            raise FloatingPointError(
+                "non-finite value encountered during ndcg score"
+            )
+        return total
+
+    a = dcg(predicted)
+    b = dcg(ideal)
+    if b == 0:
+        return 0.0
+    try:
+        result = a / b
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during ndcg score"
+        ) from exc
+    if not math.isfinite(result):
+        raise FloatingPointError(
+            "non-finite value encountered during ndcg score"
+        )
     if result == 0:
         return 0.0
     return result
