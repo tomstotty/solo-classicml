@@ -31,6 +31,9 @@ Exports:
         score of two finite real vectors.
     mean_pinball_loss -- weighted mean pinball (quantile) loss of two
         finite real vectors at a quantile level alpha in [0, 1].
+    mean_poisson_deviance -- weighted mean Poisson deviance of a
+        non-negative real vector and a strictly positive prediction
+        vector.
     precision_recall_fscore_support -- per-class or averaged precision,
         recall, F1, and support for two integer label vectors.
     confusion_matrix -- unweighted or weighted, optionally normalized
@@ -137,6 +140,7 @@ __all__ = [
     "explained_variance_score",
     "mean_absolute_percentage_error",
     "mean_pinball_loss",
+    "mean_poisson_deviance",
     "precision_recall_fscore_support",
     "confusion_matrix",
     "precision_score",
@@ -2538,6 +2542,184 @@ def mean_pinball_loss(y_true, y_pred, alpha=0.5, sample_weight=None) -> float:
     if not math.isfinite(result):
         raise FloatingPointError(
             "non-finite value encountered during mean pinball loss"
+        )
+    if result == 0:
+        result = 0.0
+    return result
+
+
+def mean_poisson_deviance(y_true, y_pred, sample_weight=None) -> float:
+    """Return the weighted mean Poisson deviance.
+
+    ``y_true`` and ``y_pred`` must be non-empty lists of equal length
+    whose elements are finite values of type exactly ``int`` or
+    ``float`` (booleans are rejected). Every element of ``y_true`` must
+    be greater than or equal to zero and every element of ``y_pred``
+    must be strictly greater than zero. ``sample_weight`` must be
+    ``None`` -- every sample then weighs ``1.0`` -- or a list of the
+    same length whose elements are finite non-negative values of type
+    exactly ``int`` or ``float`` (booleans are rejected). Any container,
+    length, type, range, or finiteness violation (including
+    ``OverflowError`` raised by ``math.isfinite``) raises ValueError.
+
+    After validation, the values and weights are converted to ``float``
+    in input order. ``math.fsum`` computes the total weight
+    ``W = sum(w_i)``; if that summation overflows or is invalid, is
+    non-finite, or ``W`` is less than or equal to zero, a ValueError is
+    raised. For each index, with ``t = y_true_i`` and ``p = y_pred_i``,
+    the per-sample deviance is ``d = 2.0 * p`` when ``t == 0`` and
+    ``d = 2.0 * (t * log(t / p) - t + p)`` otherwise; the deviance must
+    be finite before the weighted term ``w_i * d`` is formed. In input
+    order, ``math.fsum`` computes ``L = sum(w_i * d_i)`` and the result
+    is ``L / W``. Overflow, invalid operations during the
+    post-validation conversion or arithmetic, and non-finite
+    intermediate values or results raise FloatingPointError. An exact
+    zero result is normalized to ``0.0``.
+
+    The return value is a float. The inputs are not modified.
+    Deterministic: same inputs, same result.
+    """
+    n = _check_metric_vectors(y_true, y_pred)
+    for value in y_true:
+        if type(value) not in (int, float):
+            raise ValueError(
+                "y_true must contain only finite non-boolean numbers "
+                "greater than or equal to 0"
+            )
+        # math.isfinite raises OverflowError for ints too large to
+        # convert to float; such values fail the finite requirement.
+        try:
+            finite = math.isfinite(value)
+        except OverflowError as exc:
+            raise ValueError(
+                "y_true must contain only finite non-boolean numbers "
+                "greater than or equal to 0"
+            ) from exc
+        if not finite or value < 0:
+            raise ValueError(
+                "y_true must contain only finite non-boolean numbers "
+                "greater than or equal to 0"
+            )
+    for value in y_pred:
+        if type(value) not in (int, float):
+            raise ValueError(
+                "y_pred must contain only finite non-boolean numbers "
+                "greater than 0"
+            )
+        # math.isfinite raises OverflowError for ints too large to
+        # convert to float; such values fail the finite requirement.
+        try:
+            finite = math.isfinite(value)
+        except OverflowError as exc:
+            raise ValueError(
+                "y_pred must contain only finite non-boolean numbers "
+                "greater than 0"
+            ) from exc
+        if not finite or value <= 0:
+            raise ValueError(
+                "y_pred must contain only finite non-boolean numbers "
+                "greater than 0"
+            )
+
+    if sample_weight is not None:
+        if not isinstance(sample_weight, list) or len(sample_weight) != n:
+            raise ValueError(
+                "sample_weight must be a list with the same length as "
+                "y_true"
+            )
+        for value in sample_weight:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                ) from exc
+            if not finite or value < 0:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+
+    try:
+        t = [float(value) for value in y_true]
+        p = [float(value) for value in y_pred]
+        if sample_weight is None:
+            w = [1.0] * n
+        else:
+            w = [float(value) for value in sample_weight]
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during mean Poisson deviance"
+        ) from exc
+    for values in (t, p, w):
+        for value in values:
+            if not math.isfinite(value):
+                raise FloatingPointError(
+                    "non-finite value encountered during mean Poisson "
+                    "deviance"
+                )
+
+    try:
+        total_weight = math.fsum(w)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError("the total weight must be greater than 0") from exc
+    if not math.isfinite(total_weight) or total_weight <= 0.0:
+        raise ValueError("the total weight must be greater than 0")
+
+    deviance_terms = []
+    for i in range(n):
+        try:
+            if t[i] == 0:
+                d = 2.0 * p[i]
+            else:
+                d = 2.0 * (t[i] * math.log(t[i] / p[i]) - t[i] + p[i])
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during mean Poisson deviance"
+            ) from exc
+        if not math.isfinite(d):
+            raise FloatingPointError(
+                "non-finite value encountered during mean Poisson deviance"
+            )
+        try:
+            term = w[i] * d
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during mean Poisson deviance"
+            ) from exc
+        if not math.isfinite(term):
+            raise FloatingPointError(
+                "non-finite value encountered during mean Poisson deviance"
+            )
+        deviance_terms.append(term)
+
+    try:
+        total_deviance = math.fsum(deviance_terms)
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during mean Poisson deviance"
+        ) from exc
+    if not math.isfinite(total_deviance):
+        raise FloatingPointError(
+            "non-finite value encountered during mean Poisson deviance"
+        )
+    try:
+        result = total_deviance / total_weight
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during mean Poisson deviance"
+        ) from exc
+    if not math.isfinite(result):
+        raise FloatingPointError(
+            "non-finite value encountered during mean Poisson deviance"
         )
     if result == 0:
         result = 0.0
