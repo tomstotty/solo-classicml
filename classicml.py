@@ -149,6 +149,7 @@ __all__ = [
     "precision_score",
     "recall_score",
     "f1_score",
+    "fbeta_score",
     "roc_curve",
     "roc_auc_score",
     "precision_recall_curve",
@@ -3296,6 +3297,146 @@ def f1_score(
         y_true, y_pred, average=average, pos_label=pos_label,
         zero_division=zero_division
     )[2]
+
+
+def _fbeta_float(value):
+    """Convert a validated number to float; overflow, invalid operations,
+    and non-finite results raise FloatingPointError."""
+    try:
+        result = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during fbeta-score computation"
+        ) from exc
+    if not math.isfinite(result):
+        raise FloatingPointError(
+            "non-finite value encountered during fbeta-score computation"
+        )
+    return result
+
+
+def _fbeta_result(value):
+    """Check an fbeta-score value: non-finite values raise
+    FloatingPointError and an exact zero is normalized to ``0.0``."""
+    if not math.isfinite(value):
+        raise FloatingPointError(
+            "non-finite value encountered during fbeta-score computation"
+        )
+    if value == 0:
+        return 0.0
+    return value
+
+
+def fbeta_score(
+    y_true, y_pred, beta=1.0, average="binary", pos_label=1,
+    zero_division=0
+):
+    """Compute the F-beta score for integer labels.
+
+    ``y_true``, ``y_pred``, ``average``, ``pos_label``, and
+    ``zero_division`` are validated exactly as in
+    :func:`precision_recall_fscore_support`, and the label order,
+    per-class precision/recall, micro pooling, and macro/weighted
+    weighting rules are the same as there; any violation raises
+    ValueError. ``beta`` must be a finite value of type exactly ``int``
+    or ``float`` (booleans are rejected) and greater than zero, otherwise
+    ValueError is raised.
+
+    With ``q = beta * beta`` each class scores
+    ``F = (1 + q) * P * R / (q * P + R)`` from its precision ``P`` and
+    recall ``R``; a zero denominator yields ``float(zero_division)``.
+    With ``average=None`` the return is a list of floats aligned to the
+    sorted labels. ``"binary"`` reports the ``pos_label`` class,
+    ``"micro"`` uses the precision and recall of the pooled counts, and
+    ``"macro"``/``"weighted"`` combine the per-class scores with
+    ``math.fsum`` in sorted-label order, as an arithmetic mean or a
+    support-weighted mean; all of these modes return a float.
+
+    Overflow or invalid operations during the post-validation conversion
+    or computation, and any non-finite intermediate value or result,
+    raise FloatingPointError. An exact zero result is normalized to
+    ``0.0``. The inputs are not modified. Deterministic: same inputs,
+    same result.
+    """
+    if type(beta) not in (int, float):
+        raise ValueError("beta must be an int or float")
+    if type(beta) is float and not math.isfinite(beta):
+        raise ValueError("beta must be finite")
+    if beta <= 0:
+        raise ValueError("beta must be greater than zero")
+    if average not in _PRF_AVERAGES:
+        raise ValueError(
+            "average must be one of None, 'binary', 'micro', 'macro', "
+            "'weighted'"
+        )
+
+    q = _fbeta_float(beta * beta)
+    fill = float(zero_division)
+
+    def fbeta_for(p, r):
+        """F-beta from one class's (or pooled) precision and recall."""
+        try:
+            denominator = q * p + r
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during fbeta-score "
+                "computation"
+            ) from exc
+        if not math.isfinite(denominator):
+            raise FloatingPointError(
+                "non-finite value encountered during fbeta-score "
+                "computation"
+            )
+        if denominator == 0:
+            return fill
+        try:
+            value = (1.0 + q) * p * r / denominator
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during fbeta-score "
+                "computation"
+            ) from exc
+        return _fbeta_result(value)
+
+    if average in (None, "macro", "weighted"):
+        precisions, recalls, _, supports = (
+            precision_recall_fscore_support(
+                y_true, y_pred, average=None, pos_label=pos_label,
+                zero_division=zero_division
+            )
+        )
+        f_values = [
+            fbeta_for(p, r) for p, r in zip(precisions, recalls)
+        ]
+        if average is None:
+            return f_values
+        if average == "macro":
+            try:
+                result = math.fsum(f_values) / len(f_values)
+            except (OverflowError, ValueError) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during fbeta-score "
+                    "computation"
+                ) from exc
+            return _fbeta_result(result)
+        # weighted
+        n = sum(supports)
+        try:
+            result = math.fsum(
+                f_values[k] * supports[k] for k in range(len(f_values))
+            ) / n
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during fbeta-score "
+                "computation"
+            ) from exc
+        return _fbeta_result(result)
+
+    p, r = precision_recall_fscore_support(
+        y_true, y_pred, average=average, pos_label=pos_label,
+        zero_division=zero_division
+    )[:2]
+    return fbeta_for(p, r)
 
 
 def _check_roc_vectors(y_true, y_score):
