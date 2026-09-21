@@ -1440,6 +1440,183 @@ def mean_squared_error(y_true, y_pred):
     return result
 
 
+def r2_score(y_true, y_pred, sample_weight=None, force_finite=True):
+    """Return the coefficient of determination R^2 of the predictions.
+
+    ``y_true`` and ``y_pred`` must be non-empty lists of equal length whose
+    elements are finite values of type exactly ``int`` or ``float``
+    (booleans are rejected). ``sample_weight`` must be ``None`` (every
+    sample then weighs ``1.0``) or a list of the same length whose elements
+    follow the same rules and are additionally non-negative; the weight sum
+    must be positive. ``force_finite`` must be exactly ``bool``. Any
+    violation of these requirements, including an OverflowError raised by
+    the finiteness check itself, raises ValueError. The inputs are not
+    modified. Deterministic: same inputs, same result.
+
+    After validation the values are converted to ``float`` and, in sample
+    order with ``math.fsum``, ``W = sum(w)``, ``m = sum(w*y_true)/W``,
+    ``SSE = sum(w*(y_true-y_pred)**2)``, and
+    ``SST = sum(w*(y_true-m)**2)``. When ``SST`` is non-zero the result is
+    ``1.0 - SSE/SST``. When ``SST`` and ``SSE`` are both zero the result is
+    ``1.0``. When only ``SST`` is zero the result is ``0.0`` if
+    ``force_finite`` is true, otherwise ``float("-inf")``. Overflow,
+    invalid operations, or non-finite values produced by any conversion or
+    arithmetic after validation raise FloatingPointError (the negative
+    infinity result above excepted). An exact zero result is normalized to
+    ``0.0``.
+    """
+    n = _check_metric_vectors(y_true, y_pred)
+    for name, values in (("y_true", y_true), ("y_pred", y_pred)):
+        for value in values:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "%s must contain only finite non-boolean numbers" % name
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "%s must contain only finite non-boolean numbers" % name
+                ) from exc
+            if not finite:
+                raise ValueError(
+                    "%s must contain only finite non-boolean numbers" % name
+                )
+    if sample_weight is None:
+        weights = [1.0] * n
+    else:
+        if not isinstance(sample_weight, list):
+            raise ValueError("sample_weight must be None or a list")
+        if len(sample_weight) != n:
+            raise ValueError(
+                "sample_weight must have the same length as y_true"
+            )
+        for value in sample_weight:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "sample_weight must contain only finite non-boolean"
+                    " numbers"
+                )
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "sample_weight must contain only finite non-boolean"
+                    " numbers"
+                ) from exc
+            if not finite:
+                raise ValueError(
+                    "sample_weight must contain only finite non-boolean"
+                    " numbers"
+                )
+            if value < 0:
+                raise ValueError(
+                    "sample_weight must contain only non-negative numbers"
+                )
+        weights = sample_weight
+    if type(force_finite) is not bool:
+        raise ValueError("force_finite must be a bool")
+
+    def non_finite():
+        return FloatingPointError(
+            "non-finite value encountered during r2 score"
+        )
+
+    try:
+        yt = [float(value) for value in y_true]
+        yp = [float(value) for value in y_pred]
+        w = [float(value) for value in weights]
+    except (OverflowError, ValueError) as exc:
+        raise non_finite() from exc
+
+    try:
+        total_weight = math.fsum(w)
+    except (OverflowError, ValueError) as exc:
+        raise non_finite() from exc
+    if not math.isfinite(total_weight):
+        raise non_finite()
+    if total_weight <= 0:
+        raise ValueError("sample_weight must have a positive sum")
+
+    mean_terms = []
+    for i in range(n):
+        try:
+            term = w[i] * yt[i]
+        except (OverflowError, ValueError) as exc:
+            raise non_finite() from exc
+        if not math.isfinite(term):
+            raise non_finite()
+        mean_terms.append(term)
+    try:
+        mean = math.fsum(mean_terms) / total_weight
+    except (OverflowError, ValueError) as exc:
+        raise non_finite() from exc
+    if not math.isfinite(mean):
+        raise non_finite()
+
+    sse_terms = []
+    for i in range(n):
+        try:
+            diff = yt[i] - yp[i]
+        except (OverflowError, ValueError) as exc:
+            raise non_finite() from exc
+        if not math.isfinite(diff):
+            raise non_finite()
+        try:
+            term = w[i] * diff ** 2
+        except (OverflowError, ValueError) as exc:
+            raise non_finite() from exc
+        if not math.isfinite(term):
+            raise non_finite()
+        sse_terms.append(term)
+    try:
+        sse = math.fsum(sse_terms)
+    except (OverflowError, ValueError) as exc:
+        raise non_finite() from exc
+    if not math.isfinite(sse):
+        raise non_finite()
+
+    sst_terms = []
+    for i in range(n):
+        try:
+            centered = yt[i] - mean
+        except (OverflowError, ValueError) as exc:
+            raise non_finite() from exc
+        if not math.isfinite(centered):
+            raise non_finite()
+        try:
+            term = w[i] * centered ** 2
+        except (OverflowError, ValueError) as exc:
+            raise non_finite() from exc
+        if not math.isfinite(term):
+            raise non_finite()
+        sst_terms.append(term)
+    try:
+        sst = math.fsum(sst_terms)
+    except (OverflowError, ValueError) as exc:
+        raise non_finite() from exc
+    if not math.isfinite(sst):
+        raise non_finite()
+
+    if sst != 0:
+        try:
+            result = 1.0 - sse / sst
+        except (OverflowError, ValueError) as exc:
+            raise non_finite() from exc
+        if not math.isfinite(result):
+            raise non_finite()
+        if result == 0:
+            return 0.0
+        return result
+    if sse == 0:
+        return 1.0
+    if force_finite:
+        return 0.0
+    return float("-inf")
+
+
 _PRF_AVERAGES = (None, "binary", "micro", "macro", "weighted")
 
 
