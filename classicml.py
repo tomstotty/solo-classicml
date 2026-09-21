@@ -48,6 +48,8 @@ Exports:
         partitions, computed with fractions.Fraction and returned as float.
     normalized_mutual_info_score -- mutual information of two integer
         partitions normalized by the geometric mean of their entropies.
+    matthews_corrcoef -- Matthews correlation coefficient of two integer
+        label vectors, computed from an exact integer contingency table.
     dumps -- serialize a fitted KMeans/PCA model to whitespace-free JSON
         text (quantized to 10 decimal places with ROUND_HALF_UP).
     loads -- reconstruct an independent fitted KMeans/PCA model from text
@@ -103,6 +105,7 @@ __all__ = [
     "silhouette_score",
     "adjusted_rand_score",
     "normalized_mutual_info_score",
+    "matthews_corrcoef",
     "dumps",
     "loads",
 ]
@@ -3151,6 +3154,93 @@ def normalized_mutual_info_score(labels_true, labels_pred):
     checked(product)
     checked(denominator)
     checked(result)
+    if result == 0:
+        return 0.0
+    return result
+
+
+def matthews_corrcoef(y_true, y_pred):
+    """Return the Matthews correlation coefficient of two integer label
+    vectors.
+
+    Both arguments must be non-empty lists of equal length whose elements
+    are exactly ``int`` (booleans and subclasses are rejected). The inputs
+    are not modified. Deterministic: same inputs, same result.
+
+    The labels are the sorted union of the labels appearing in either
+    vector, defining the rows (true labels) and columns (predicted labels)
+    of an integer contingency table ``C`` accumulated in sample order. In
+    that label order ``t_k`` is the ``k``-th row sum, ``p_k`` the ``k``-th
+    column sum, ``c`` the sum of the diagonal, and ``s`` the number of
+    samples. With every sum taken as an exact Python integer in label
+    order, ``u = c*s - sum(p_k*t_k)``, ``a = s*s - sum(p_k*p_k)``, and
+    ``b = s*s - sum(t_k*t_k)``. When ``a`` or ``b`` is zero the result is
+    ``0.0``; otherwise it is ``u / math.sqrt(a*b)``. An exact zero result
+    is normalized to ``0.0``. Overflow, invalid operations, or non-finite
+    values during the square root, the integer-to-float conversion, or the
+    division raise FloatingPointError.
+    """
+    s = _check_metric_vectors(y_true, y_pred)
+    for value in y_true:
+        if type(value) is not int:
+            raise ValueError("y_true must contain only integers")
+    for value in y_pred:
+        if type(value) is not int:
+            raise ValueError("y_pred must contain only integers")
+
+    labels = sorted(set(y_true) | set(y_pred))
+    index = {label: k for k, label in enumerate(labels)}
+    size = len(labels)
+
+    counts = [[0 for _ in range(size)] for _ in range(size)]
+    for i in range(s):
+        counts[index[y_true[i]]][index[y_pred[i]]] += 1
+
+    t = [0 for _ in range(size)]
+    p = [0 for _ in range(size)]
+    c = 0
+    for k in range(size):
+        row_sum = 0
+        for col in range(size):
+            row_sum += counts[k][col]
+        t[k] = row_sum
+        col_sum = 0
+        for row in range(size):
+            col_sum += counts[row][k]
+        p[k] = col_sum
+        c += counts[k][k]
+
+    pt = 0
+    pp = 0
+    tt = 0
+    for k in range(size):
+        pt += p[k] * t[k]
+        pp += p[k] * p[k]
+        tt += t[k] * t[k]
+
+    u = c * s - pt
+    a = s * s - pp
+    b = s * s - tt
+    if a == 0 or b == 0:
+        return 0.0
+
+    def non_finite():
+        return FloatingPointError(
+            "non-finite value encountered during matthews corrcoef"
+        )
+
+    try:
+        denominator = math.sqrt(a * b)
+    except (OverflowError, ValueError) as exc:
+        raise non_finite() from exc
+    if not math.isfinite(denominator):
+        raise non_finite()
+    try:
+        result = u / denominator
+    except (OverflowError, ValueError) as exc:
+        raise non_finite() from exc
+    if not math.isfinite(result):
+        raise non_finite()
     if result == 0:
         return 0.0
     return result
