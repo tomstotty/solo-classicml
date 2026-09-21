@@ -106,6 +106,7 @@ __all__ = [
     "adjusted_rand_score",
     "normalized_mutual_info_score",
     "matthews_corrcoef",
+    "cohen_kappa_score",
     "dumps",
     "loads",
 ]
@@ -3241,6 +3242,112 @@ def matthews_corrcoef(y_true, y_pred):
         raise non_finite() from exc
     if not math.isfinite(result):
         raise non_finite()
+    if result == 0:
+        return 0.0
+    return result
+
+
+def cohen_kappa_score(y_true, y_pred, weights=None):
+    """Return Cohen's kappa for two integer label vectors.
+
+    Both ``y_true`` and ``y_pred`` must be non-empty lists of equal
+    length whose elements are exactly ``int`` (booleans and subclasses
+    are rejected). The inputs are not modified. Deterministic: same
+    inputs, same result.
+
+    ``weights`` must be ``None``, ``"linear"``, or ``"quadratic"``. The
+    classes are the sorted union of the values appearing in either
+    vector; counts are accumulated in sample order into a square integer
+    matrix ``C`` with true classes as rows and predicted classes as
+    columns. In class order ``r_i`` is the ``i``-th row sum and ``c_j``
+    the ``j``-th column sum, ``n`` the number of samples, and ``K`` the
+    number of classes. With a single class the result is ``1.0``.
+
+    The weight matrix is ``d(i, i) = 0.0`` and, for ``i != j``,
+    ``1.0`` when unweighted, ``abs(i - j) / (K - 1)`` for linear
+    weights, and ``((i - j) / (K - 1)) ** 2`` for quadratic weights.
+    Iterating rows then columns, ``O = math.fsum(C_ij * d_ij) / n`` and
+    ``E = math.fsum(r_i * c_j * d_ij) / (n * n)``. When ``E`` is zero
+    the result is ``1.0``; otherwise it is ``1.0 - O / E``. An exact
+    zero result is normalized to ``0.0``. Overflow, invalid operations,
+    or non-finite values during the multiplications, divisions, power,
+    or ``math.fsum`` calls raise FloatingPointError.
+    """
+    n = _check_metric_vectors(y_true, y_pred)
+    for value in y_true:
+        if type(value) is not int:
+            raise ValueError("y_true must contain only integers")
+    for value in y_pred:
+        if type(value) is not int:
+            raise ValueError("y_pred must contain only integers")
+    if weights not in (None, "linear", "quadratic"):
+        raise ValueError("weights must be None, 'linear', or 'quadratic'")
+
+    classes = sorted(set(y_true) | set(y_pred))
+    index = {label: k for k, label in enumerate(classes)}
+    k = len(classes)
+    if k == 1:
+        return 1.0
+
+    counts = [[0 for _ in range(k)] for _ in range(k)]
+    for i in range(n):
+        counts[index[y_true[i]]][index[y_pred[i]]] += 1
+
+    row_sums = [0 for _ in range(k)]
+    col_sums = [0 for _ in range(k)]
+    for i in range(k):
+        row_total = 0
+        col_total = 0
+        for j in range(k):
+            row_total += counts[i][j]
+            col_total += counts[j][i]
+        row_sums[i] = row_total
+        col_sums[i] = col_total
+
+    span = k - 1
+
+    def distance(i, j):
+        if i == j:
+            return 0.0
+        delta = i - j
+        if weights is None:
+            return 1.0
+        if weights == "linear":
+            return abs(delta) / span
+        return (delta / span) ** 2
+
+    def non_finite(exc):
+        return FloatingPointError(
+            "non-finite value encountered during cohen kappa"
+        )
+
+    observed_terms = []
+    expected_terms = []
+    try:
+        for i in range(k):
+            for j in range(k):
+                weight = distance(i, j)
+                observed_terms.append(counts[i][j] * weight)
+                expected_terms.append(row_sums[i] * col_sums[j] * weight)
+        observed = math.fsum(observed_terms)
+        expected = math.fsum(expected_terms)
+        if not math.isfinite(observed) or not math.isfinite(expected):
+            raise non_finite(None)
+        o_value = observed / n
+        e_value = expected / (n * n)
+        if not math.isfinite(o_value) or not math.isfinite(e_value):
+            raise non_finite(None)
+    except (OverflowError, ValueError) as exc:
+        raise non_finite(exc) from exc
+
+    if e_value == 0:
+        return 1.0
+    try:
+        result = 1.0 - o_value / e_value
+    except (OverflowError, ValueError) as exc:
+        raise non_finite(exc) from exc
+    if not math.isfinite(result):
+        raise non_finite(None)
     if result == 0:
         return 0.0
     return result
