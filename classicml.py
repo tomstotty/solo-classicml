@@ -132,6 +132,7 @@ __all__ = [
     "brier_score_loss",
     "log_loss",
     "multiclass_log_loss",
+    "multiclass_hinge_loss",
     "silhouette_score",
     "davies_bouldin_score",
     "calinski_harabasz_score",
