@@ -44,6 +44,8 @@ Exports:
         probability vector with clamped probabilities.
     silhouette_score -- mean silhouette coefficient of a clustering over
         a finite real matrix and an integer label vector.
+    adjusted_rand_score -- exact adjusted Rand index of two integer
+        partitions, computed with fractions.Fraction and returned as float.
     dumps -- serialize a fitted KMeans/PCA model to whitespace-free JSON
         text (quantized to 10 decimal places with ROUND_HALF_UP).
     loads -- reconstruct an independent fitted KMeans/PCA model from text
@@ -71,6 +73,7 @@ import random
 import re
 import sys
 from decimal import Decimal, ROUND_HALF_UP, localcontext
+from fractions import Fraction
 
 __all__ = [
     "LinearRegression",
@@ -96,6 +99,7 @@ __all__ = [
     "brier_score_loss",
     "log_loss",
     "silhouette_score",
+    "adjusted_rand_score",
     "dumps",
     "loads",
 ]
@@ -2965,6 +2969,71 @@ def silhouette_score(X, labels):
         fail()
     if result == 0:
         result = 0.0
+    return result
+
+
+def adjusted_rand_score(labels_true, labels_pred):
+    """Return the adjusted Rand index of two integer label partitions.
+
+    Both arguments must be non-empty lists of equal length whose elements
+    are exactly ``int`` (booleans are rejected). The inputs are not
+    modified. Deterministic: same inputs, same result.
+
+    Rows and columns of the contingency table correspond to the distinct
+    labels of ``labels_true`` and ``labels_pred`` respectively, each in
+    ascending label order; contingency counts ``n_ij`` accumulate by
+    sample index. With ``C(x) = x * (x - 1) // 2`` and ``N = C(n)``,
+    ``I = sum C(n_ij)``, ``A = sum C(a_i)`` over row sums, and
+    ``B = sum C(b_j)`` over column sums, the expected index ``E = A*B/N``,
+    the mean index ``M = (A+B)/2``, and the adjusted Rand index is
+    ``(I - E) / (M - E)``. Every step of this computation uses
+    ``fractions.Fraction`` exactly; only the final value is converted to
+    ``float``. When ``N == 0`` (fewer than two samples) or ``M == E``
+    (indeterminate denominator), the result is ``1.0``; an exact zero
+    result is normalized to ``0.0``.
+    """
+    n = _check_metric_vectors(labels_true, labels_pred)
+    for value in labels_true:
+        if type(value) is not int:
+            raise ValueError("labels_true must contain only integers")
+    for value in labels_pred:
+        if type(value) is not int:
+            raise ValueError("labels_pred must contain only integers")
+
+    def comb2(x):
+        return x * (x - 1) // 2
+
+    row_labels = sorted(set(labels_true))
+    col_labels = sorted(set(labels_pred))
+    row_index = {label: i for i, label in enumerate(row_labels)}
+    col_index = {label: j for j, label in enumerate(col_labels)}
+
+    counts = [[0] * len(col_labels) for _ in row_labels]
+    for i in range(n):
+        counts[row_index[labels_true[i]]][col_index[labels_pred[i]]] += 1
+
+    row_sums = [sum(row) for row in counts]
+    col_sums = [
+        sum(counts[i][j] for i in range(len(row_labels)))
+        for j in range(len(col_labels))
+    ]
+
+    total = comb2(n)
+    if total == 0:
+        return 1.0
+
+    index = sum(comb2(value) for row in counts for value in row)
+    row_term = sum(comb2(value) for value in row_sums)
+    col_term = sum(comb2(value) for value in col_sums)
+
+    expected = Fraction(row_term * col_term, total)
+    mean = Fraction(row_term + col_term, 2)
+    denominator = mean - expected
+    if denominator == 0:
+        return 1.0
+    result = float((Fraction(index) - expected) / denominator)
+    if result == 0:
+        return 0.0
     return result
 
 
