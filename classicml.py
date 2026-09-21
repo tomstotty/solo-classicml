@@ -75,6 +75,8 @@ Exports:
         label vectors, computed from an exact integer contingency table.
     balanced_accuracy_score -- weighted mean per-class recall of two
         integer label vectors, optionally adjusted for chance.
+    top_k_accuracy_score -- weighted fraction of samples whose true class
+        is among the k highest-scoring columns of a score matrix.
     dumps -- serialize a fitted KMeans/PCA model to whitespace-free JSON
         text (quantized to 10 decimal places with ROUND_HALF_UP).
     loads -- reconstruct an independent fitted KMeans/PCA model from text
@@ -144,6 +146,7 @@ __all__ = [
     "matthews_corrcoef",
     "cohen_kappa_score",
     "balanced_accuracy_score",
+    "top_k_accuracy_score",
     "dumps",
     "loads",
 ]
@@ -5468,6 +5471,164 @@ def balanced_accuracy_score(y_true, y_pred, sample_weight=None,
         if not math.isfinite(result):
             raise non_finite(None)
 
+    if result == 0:
+        return 0.0
+    return result
+
+
+def top_k_accuracy_score(y_true, y_score, k=2, sample_weight=None) -> float:
+    """Return the weighted fraction of samples whose true class is among
+    the ``k`` highest-scoring columns.
+
+    ``y_true`` must be a non-empty list whose elements are exactly
+    ``int`` (booleans are rejected) and which holds at least two
+    distinct classes. The classes are the distinct values of ``y_true``
+    in ascending order; they correspond to the columns of ``y_score``.
+    ``y_score`` must be a list of the same length whose rows are lists
+    with one entry per class and whose elements are finite values of
+    type exactly ``int`` or ``float`` (booleans are rejected). ``k``
+    must be exactly ``int`` with ``1 <= k <= number of classes``.
+    ``sample_weight`` must be ``None`` -- every sample then weighs
+    ``1.0`` -- or a list of the same length whose elements are finite
+    non-negative values of type exactly ``int`` or ``float`` (booleans
+    are rejected). Any container, length, shape, type, range, or
+    finiteness violation (including ``OverflowError`` raised by
+    ``math.isfinite``) raises ValueError.
+
+    For each sample the column indices are ordered by ascending
+    ``(-score, class)`` -- ties in score therefore favor the smaller
+    class -- and the sample is a hit when the column of its true label
+    is among the first ``k`` entries. After validation the weights are
+    converted to ``float``; in input order, ``math.fsum`` computes the
+    total weight ``W`` and the hit weight ``C``. Overflow, invalid
+    operations, or a non-finite value during the ``W`` summation, and
+    ``W <= 0``, raise ValueError; overflow, invalid operations, and
+    non-finite intermediate values or results during the post-validation
+    conversion, the ``C`` summation, and the division raise
+    FloatingPointError. The result is ``C / W``; an exact zero result is
+    normalized to ``0.0``.
+
+    The return value is a float. The inputs are not modified.
+    Deterministic: same inputs, same result.
+    """
+    if not isinstance(y_true, list) or len(y_true) == 0:
+        raise ValueError("y_true must be a non-empty list")
+    for value in y_true:
+        if type(value) is not int:
+            raise ValueError("y_true must contain only integers")
+    classes = sorted(set(y_true))
+    n_classes = len(classes)
+    if n_classes < 2:
+        raise ValueError("y_true must contain at least two classes")
+    n = len(y_true)
+
+    if not isinstance(y_score, list) or len(y_score) != n:
+        raise ValueError(
+            "y_score must be a list with the same length as y_true"
+        )
+    for row in y_score:
+        if not isinstance(row, list) or len(row) != n_classes:
+            raise ValueError(
+                "y_score rows must be lists with one entry per class"
+            )
+        for value in row:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "y_score must contain only finite non-boolean numbers"
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "y_score must contain only finite non-boolean numbers"
+                ) from exc
+            if not finite:
+                raise ValueError(
+                    "y_score must contain only finite non-boolean numbers"
+                )
+
+    if type(k) is not int:
+        raise ValueError("k must be an integer")
+    if k < 1 or k > n_classes:
+        raise ValueError("k must be between 1 and the number of classes")
+
+    if sample_weight is not None:
+        if not isinstance(sample_weight, list) or len(sample_weight) != n:
+            raise ValueError(
+                "sample_weight must be a list with the same length as "
+                "y_true"
+            )
+        for value in sample_weight:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                ) from exc
+            if not finite or value < 0:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+
+    def non_finite(exc):
+        return FloatingPointError(
+            "non-finite value encountered during top-k accuracy"
+        )
+
+    if sample_weight is None:
+        weights = [1.0] * n
+    else:
+        try:
+            weights = [float(value) for value in sample_weight]
+        except (OverflowError, ValueError) as exc:
+            raise non_finite(exc) from exc
+        for value in weights:
+            if not math.isfinite(value):
+                raise non_finite(None)
+
+    try:
+        total_weight = math.fsum(weights)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError("the total weight must be greater than 0") from exc
+    if not math.isfinite(total_weight) or total_weight <= 0.0:
+        raise ValueError("the total weight must be greater than 0")
+
+    index = {label: j for j, label in enumerate(classes)}
+    hit_terms = []
+    for i in range(n):
+        row = y_score[i]
+        order = sorted(
+            range(n_classes), key=lambda j: (-row[j], classes[j])
+        )
+        position = [0] * n_classes
+        for rank, j in enumerate(order):
+            position[j] = rank
+        if position[index[y_true[i]]] < k:
+            hit_terms.append(weights[i])
+
+    try:
+        hit_weight = math.fsum(hit_terms)
+    except (OverflowError, ValueError) as exc:
+        raise non_finite(exc) from exc
+    if not math.isfinite(hit_weight):
+        raise non_finite(None)
+    try:
+        result = hit_weight / total_weight
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        raise non_finite(exc) from exc
+    if not math.isfinite(result):
+        raise non_finite(None)
     if result == 0:
         return 0.0
     return result
