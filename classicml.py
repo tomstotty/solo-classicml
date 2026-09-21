@@ -106,6 +106,7 @@ __all__ = [
     "accuracy_score",
     "mean_squared_error",
     "r2_score",
+    "explained_variance_score",
     "mean_absolute_percentage_error",
     "precision_recall_fscore_support",
     "confusion_matrix",
@@ -1644,6 +1645,253 @@ def r2_score(y_true, y_pred, sample_weight=None, force_finite=True):
             result = 0.0
         return result
     if sse == 0.0:
+        return 1.0
+    if force_finite:
+        return 0.0
+    return float("-inf")
+
+
+def _ev_float(value):
+    """Convert a validated number to float; overflow, invalid operations,
+    and non-finite results raise FloatingPointError."""
+    try:
+        result = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during explained-variance "
+            "computation"
+        ) from exc
+    if not math.isfinite(result):
+        raise FloatingPointError(
+            "non-finite value encountered during explained-variance "
+            "computation"
+        )
+    return result
+
+
+def explained_variance_score(y_true, y_pred, sample_weight=None,
+                             force_finite=True):
+    """Return the explained variance regression score.
+
+    ``y_true`` and ``y_pred`` must be non-empty lists of equal length whose
+    elements are finite values of type exactly ``int`` or ``float``
+    (booleans are rejected). ``sample_weight`` must be ``None`` -- every
+    sample then weighs ``1.0`` -- or a list of the same length whose
+    elements are finite non-negative values of type exactly ``int`` or
+    ``float`` (booleans are rejected). ``force_finite`` must be exactly
+    ``True`` or ``False``. The total weight must be greater than zero. Any
+    violation (including overflow during the finiteness checks) raises
+    ValueError.
+
+    After validation, the values and weights are converted to ``float``;
+    in input order, ``math.fsum`` computes the total weight
+    ``W = sum(w_i)``, the weighted mean ``m = sum(w_i * y_true_i) / W``,
+    the residuals ``r_i = y_true_i - y_pred_i``, the weighted residual
+    mean ``q = sum(w_i * r_i) / W``, the residual dispersion
+    ``N = sum(w_i * (r_i - q) ** 2)``, and the total dispersion
+    ``D = sum(w_i * (y_true_i - m) ** 2)``. When ``D`` is non-zero the
+    result is ``1.0 - N / D``. When ``D`` and ``N`` are both zero the
+    result is ``1.0``. When only ``D`` is zero the result is ``0.0`` if
+    ``force_finite`` is true and ``float("-inf")`` otherwise. Overflow,
+    invalid operations during the post-validation conversion or
+    arithmetic, and non-finite intermediate values or results raise
+    FloatingPointError (the negative-infinity result above excepted). An
+    exact zero result is normalized to ``0.0``.
+
+    The return value is a float. The inputs are not modified.
+    Deterministic: same inputs, same result.
+    """
+    n = _check_metric_vectors(y_true, y_pred)
+    for name, values in (("y_true", y_true), ("y_pred", y_pred)):
+        for value in values:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "%s must contain only finite non-boolean numbers" % name
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "%s must contain only finite non-boolean numbers" % name
+                ) from exc
+            if not finite:
+                raise ValueError(
+                    "%s must contain only finite non-boolean numbers" % name
+                )
+
+    if sample_weight is None:
+        weights = [1.0] * n
+    else:
+        if not isinstance(sample_weight, list) or len(sample_weight) != n:
+            raise ValueError(
+                "sample_weight must be a list with the same length as "
+                "y_true"
+            )
+        for value in sample_weight:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                ) from exc
+            if not finite or value < 0:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+        weights = [_ev_float(value) for value in sample_weight]
+
+    if type(force_finite) is not bool:
+        raise ValueError("force_finite must be a boolean")
+
+    try:
+        total_weight = math.fsum(weights)
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during explained-variance "
+            "computation"
+        ) from exc
+    if not math.isfinite(total_weight):
+        raise FloatingPointError(
+            "non-finite value encountered during explained-variance "
+            "computation"
+        )
+    if total_weight <= 0.0:
+        raise ValueError("the total weight must be greater than 0")
+
+    yt = [_ev_float(value) for value in y_true]
+    yp = [_ev_float(value) for value in y_pred]
+
+    mean_terms = []
+    for i in range(n):
+        try:
+            term = weights[i] * yt[i]
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during explained-variance "
+                "computation"
+            ) from exc
+        if not math.isfinite(term):
+            raise FloatingPointError(
+                "non-finite value encountered during explained-variance "
+                "computation"
+            )
+        mean_terms.append(term)
+    try:
+        mean = math.fsum(mean_terms) / total_weight
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during explained-variance "
+            "computation"
+        ) from exc
+    if not math.isfinite(mean):
+        raise FloatingPointError(
+            "non-finite value encountered during explained-variance "
+            "computation"
+        )
+
+    residuals = []
+    residual_mean_terms = []
+    for i in range(n):
+        try:
+            residual = yt[i] - yp[i]
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during explained-variance "
+                "computation"
+            ) from exc
+        if not math.isfinite(residual):
+            raise FloatingPointError(
+                "non-finite value encountered during explained-variance "
+                "computation"
+            )
+        try:
+            term = weights[i] * residual
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during explained-variance "
+                "computation"
+            ) from exc
+        if not math.isfinite(term):
+            raise FloatingPointError(
+                "non-finite value encountered during explained-variance "
+                "computation"
+            )
+        residuals.append(residual)
+        residual_mean_terms.append(term)
+    try:
+        residual_mean = math.fsum(residual_mean_terms) / total_weight
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during explained-variance "
+            "computation"
+        ) from exc
+    if not math.isfinite(residual_mean):
+        raise FloatingPointError(
+            "non-finite value encountered during explained-variance "
+            "computation"
+        )
+
+    numerator_terms = []
+    denominator_terms = []
+    for i in range(n):
+        try:
+            numerator_term = weights[i] * (residuals[i] - residual_mean) ** 2
+            denominator_term = weights[i] * (yt[i] - mean) ** 2
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during explained-variance "
+                "computation"
+            ) from exc
+        if (not math.isfinite(numerator_term)
+                or not math.isfinite(denominator_term)):
+            raise FloatingPointError(
+                "non-finite value encountered during explained-variance "
+                "computation"
+            )
+        numerator_terms.append(numerator_term)
+        denominator_terms.append(denominator_term)
+    try:
+        numerator = math.fsum(numerator_terms)
+        denominator = math.fsum(denominator_terms)
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during explained-variance "
+            "computation"
+        ) from exc
+    if not math.isfinite(numerator) or not math.isfinite(denominator):
+        raise FloatingPointError(
+            "non-finite value encountered during explained-variance "
+            "computation"
+        )
+
+    if denominator != 0.0:
+        try:
+            result = 1.0 - numerator / denominator
+        except (OverflowError, ValueError, ZeroDivisionError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during explained-variance "
+                "computation"
+            ) from exc
+        if not math.isfinite(result):
+            raise FloatingPointError(
+                "non-finite value encountered during explained-variance "
+                "computation"
+            )
+        if result == 0:
+            result = 0.0
+        return result
+    if numerator == 0.0:
         return 1.0
     if force_finite:
         return 0.0
