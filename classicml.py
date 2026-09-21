@@ -52,6 +52,8 @@ Exports:
         partitions normalized by the geometric mean of their entropies.
     matthews_corrcoef -- Matthews correlation coefficient of two integer
         label vectors, computed from an exact integer contingency table.
+    balanced_accuracy_score -- weighted mean per-class recall of two
+        integer label vectors, optionally adjusted for chance.
     dumps -- serialize a fitted KMeans/PCA model to whitespace-free JSON
         text (quantized to 10 decimal places with ROUND_HALF_UP).
     loads -- reconstruct an independent fitted KMeans/PCA model from text
@@ -110,6 +112,7 @@ __all__ = [
     "normalized_mutual_info_score",
     "matthews_corrcoef",
     "cohen_kappa_score",
+    "balanced_accuracy_score",
     "dumps",
     "loads",
 ]
@@ -3539,6 +3542,158 @@ def cohen_kappa_score(y_true, y_pred, weights=None):
         raise non_finite(exc) from exc
     if not math.isfinite(result):
         raise non_finite(None)
+    if result == 0:
+        return 0.0
+    return result
+
+
+def _balanced_accuracy_float(value):
+    """Convert a validated number to float; overflow, invalid operations,
+    and non-finite results raise FloatingPointError."""
+    try:
+        result = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during balanced accuracy"
+        ) from exc
+    if not math.isfinite(result):
+        raise FloatingPointError(
+            "non-finite value encountered during balanced accuracy"
+        )
+    return result
+
+
+def balanced_accuracy_score(y_true, y_pred, sample_weight=None,
+                            adjusted=False):
+    """Return the balanced accuracy of two integer label vectors.
+
+    Both ``y_true`` and ``y_pred`` must be non-empty lists of equal
+    length whose elements are exactly ``int`` (booleans are rejected).
+    ``sample_weight`` must be ``None`` -- every sample then weighs
+    ``1.0`` -- or a list of the same length whose elements are finite
+    non-negative values of type exactly ``int`` or ``float`` (booleans
+    are rejected). ``adjusted`` must be exactly ``True`` or ``False``.
+    Any violation (including overflow during the finiteness checks)
+    raises ValueError. The inputs are not modified.
+
+    The classes ``C`` are the sorted distinct values of ``y_true``;
+    labels appearing only in ``y_pred`` merely count as
+    misclassifications. After validation the weights are converted to
+    ``float``; in input order, ``math.fsum`` computes for each class
+    the total weight ``W`` of its samples and the weight ``T`` of its
+    correctly predicted samples. A class with ``W <= 0`` raises
+    ValueError. With ``r = T / W`` per class, the balanced accuracy is
+    ``B = math.fsum(r over C) / len(C)``. When ``adjusted`` is false
+    the result is ``B``; when true and ``len(C) == 1`` the result is
+    ``1.0``; otherwise it is ``(B - 1 / len(C)) / (1 - 1 / len(C))``.
+    Overflow, invalid operations during the post-validation conversion
+    or arithmetic, and non-finite intermediate values or results raise
+    FloatingPointError. An exact zero result is normalized to ``0.0``.
+
+    The return value is a float. Deterministic: same inputs, same
+    result.
+    """
+    n = _check_metric_vectors(y_true, y_pred)
+    for value in y_true:
+        if type(value) is not int:
+            raise ValueError("y_true must contain only integers")
+    for value in y_pred:
+        if type(value) is not int:
+            raise ValueError("y_pred must contain only integers")
+
+    if sample_weight is None:
+        weights = [1.0] * n
+    else:
+        if not isinstance(sample_weight, list) or len(sample_weight) != n:
+            raise ValueError(
+                "sample_weight must be a list with the same length as "
+                "y_true"
+            )
+        for value in sample_weight:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                ) from exc
+            if not finite or value < 0:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+        weights = [
+            _balanced_accuracy_float(value) for value in sample_weight
+        ]
+
+    if type(adjusted) is not bool:
+        raise ValueError("adjusted must be a boolean")
+
+    classes = sorted(set(y_true))
+    index = {label: k for k, label in enumerate(classes)}
+    k = len(classes)
+
+    true_terms = [[] for _ in range(k)]
+    correct_terms = [[] for _ in range(k)]
+    for i in range(n):
+        j = index[y_true[i]]
+        true_terms[j].append(weights[i])
+        if y_pred[i] == y_true[i]:
+            correct_terms[j].append(weights[i])
+
+    def non_finite(exc):
+        return FloatingPointError(
+            "non-finite value encountered during balanced accuracy"
+        )
+
+    recalls = []
+    for j in range(k):
+        try:
+            total = math.fsum(true_terms[j])
+            correct = math.fsum(correct_terms[j])
+        except (OverflowError, ValueError) as exc:
+            raise non_finite(exc) from exc
+        if not math.isfinite(total) or not math.isfinite(correct):
+            raise non_finite(None)
+        if total <= 0.0:
+            raise ValueError(
+                "every class must have a positive total weight"
+            )
+        try:
+            recall = correct / total
+        except (OverflowError, ValueError) as exc:
+            raise non_finite(exc) from exc
+        if not math.isfinite(recall):
+            raise non_finite(None)
+        recalls.append(recall)
+
+    try:
+        score = math.fsum(recalls) / k
+    except (OverflowError, ValueError) as exc:
+        raise non_finite(exc) from exc
+    if not math.isfinite(score):
+        raise non_finite(None)
+
+    if not adjusted:
+        result = score
+    elif k == 1:
+        return 1.0
+    else:
+        try:
+            chance = 1 / k
+            result = (score - chance) / (1 - chance)
+        except (OverflowError, ValueError) as exc:
+            raise non_finite(exc) from exc
+        if not math.isfinite(result):
+            raise non_finite(None)
+
     if result == 0:
         return 0.0
     return result
