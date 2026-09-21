@@ -52,6 +52,9 @@ Exports:
     davies_bouldin_score -- Davies-Bouldin index of a clustering: the mean,
         over clusters in ascending label order, of the largest ratio of
         summed within-cluster mean distances to centroid separation.
+    calinski_harabasz_score -- Calinski-Harabasz index of a clustering:
+        the ratio of between-cluster dispersion to within-cluster
+        dispersion, each divided by its degrees of freedom.
     adjusted_rand_score -- exact adjusted Rand index of two integer
         partitions, computed with fractions.Fraction and returned as float.
     normalized_mutual_info_score -- mutual information of two integer
@@ -117,6 +120,7 @@ __all__ = [
     "multiclass_log_loss",
     "silhouette_score",
     "davies_bouldin_score",
+    "calinski_harabasz_score",
     "adjusted_rand_score",
     "normalized_mutual_info_score",
     "matthews_corrcoef",
@@ -3701,6 +3705,187 @@ def davies_bouldin_score(X, labels) -> float:
     except (OverflowError, ValueError) as exc:
         fail(exc)
     if not math.isfinite(total) or not math.isfinite(result):
+        fail()
+    if result == 0:
+        result = 0.0
+    return result
+
+
+def calinski_harabasz_score(X, labels) -> float:
+    """Compute the Calinski-Harabasz index of a clustering.
+
+    ``X`` must be a non-empty rectangular ``list`` of non-empty ``list``
+    rows whose elements are finite values of type exactly ``int`` or
+    ``float`` (booleans and subclasses are rejected). ``labels`` must be
+    a ``list`` of the same length whose elements have type exactly
+    ``int``; with ``n`` the number of samples and ``k`` the number of
+    distinct labels, ``2 <= k <= n - 1`` must hold. Any violation --
+    including overflow during the finiteness checks -- raises ValueError.
+
+    Clusters are visited in ascending label order, keeping input order
+    within each cluster. Column by column, ``math.fsum`` over all samples
+    in input order gives the global centroid coordinate ``m_j`` (the sum
+    divided by ``n``), and ``math.fsum`` over each cluster's samples in
+    cluster input order gives that cluster's centroid coordinate
+    ``m_cj`` (the sum divided by the cluster size); the centroid sums
+    follow those same sample orders. The between-cluster dispersion is
+    ``B = sum_c sum_j n_c * (m_cj - m_j) ** 2`` with the outer sum over
+    clusters in ascending label order and the inner sum over columns;
+    the within-cluster dispersion is
+    ``W = sum_i sum_j (X[i][j] - m_{labels[i],j}) ** 2`` with the outer
+    sum over samples in input order and the inner sum over columns,
+    each accumulated by ``math.fsum``. When ``W == 0`` the result is
+    ``1.0``; otherwise it is ``(B / (k - 1)) / (W / (n - k))``.
+    Overflow, invalid operations, or non-finite intermediate or final
+    values after validation raise FloatingPointError. An exact zero
+    result is normalized to ``0.0``.
+
+    The return value is a float. The inputs are not modified.
+    Deterministic: same inputs, same result.
+    """
+    if not isinstance(X, list) or len(X) == 0:
+        raise ValueError("X must be a non-empty list of rows")
+    width = None
+    for row in X:
+        if not isinstance(row, list) or len(row) == 0:
+            raise ValueError("X rows must be non-empty lists")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError("X must be rectangular")
+        for value in row:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "X must contain only finite non-boolean numbers"
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "X must contain only finite non-boolean numbers"
+                ) from exc
+            if not finite:
+                raise ValueError(
+                    "X must contain only finite non-boolean numbers"
+                )
+    n = len(X)
+    if not isinstance(labels, list) or len(labels) != n:
+        raise ValueError("labels must be a list with the same length as X")
+    for value in labels:
+        if type(value) is not int:
+            raise ValueError("labels must contain only integers")
+    distinct = sorted(set(labels))
+    k = len(distinct)
+    if k < 2 or k > n - 1:
+        raise ValueError(
+            "labels must contain between 2 and len(X) - 1 distinct labels"
+        )
+
+    def fail(exc=None):
+        error = FloatingPointError(
+            "non-finite value encountered during Calinski-Harabasz score"
+        )
+        if exc is None:
+            raise error
+        raise error from exc
+
+    # Validate once, then convert every entry to float so that all later
+    # arithmetic and math.fsum accumulation operate on a single type.
+    try:
+        data = [[float(value) for value in row] for row in X]
+    except (OverflowError, ValueError) as exc:
+        fail(exc)
+    for row in data:
+        for value in row:
+            if not math.isfinite(value):
+                fail()
+
+    clusters = {}
+    for i in range(n):
+        clusters.setdefault(labels[i], []).append(i)
+    groups = [(label, clusters[label]) for label in distinct]
+
+    # Global centroid: fsum over all samples in input order, per column.
+    global_centroid = []
+    for j in range(width):
+        try:
+            total = math.fsum(data[i][j] for i in range(n))
+            coordinate = total / n
+        except (OverflowError, ValueError) as exc:
+            fail(exc)
+        if not math.isfinite(total) or not math.isfinite(coordinate):
+            fail()
+        global_centroid.append(coordinate)
+
+    # Cluster centroids: fsum over each cluster's samples in cluster
+    # input order, per column.
+    cluster_centroids = []
+    for label, group in groups:
+        size = len(group)
+        coordinates = []
+        for j in range(width):
+            try:
+                total = math.fsum(data[i][j] for i in group)
+                coordinate = total / size
+            except (OverflowError, ValueError) as exc:
+                fail(exc)
+            if not math.isfinite(total) or not math.isfinite(coordinate):
+                fail()
+            coordinates.append(coordinate)
+        cluster_centroids.append(coordinates)
+    centroid_of = {
+        label: cluster_centroids[c] for c, (label, _) in enumerate(groups)
+    }
+
+    # B = fsum over clusters, then columns, of n_c * (m_cj - m_j) ** 2.
+    b_terms = []
+    for c, (label, group) in enumerate(groups):
+        size = len(group)
+        for j in range(width):
+            try:
+                diff = cluster_centroids[c][j] - global_centroid[j]
+                term = size * diff ** 2
+            except (OverflowError, ValueError) as exc:
+                fail(exc)
+            if not math.isfinite(diff) or not math.isfinite(term):
+                fail()
+            b_terms.append(term)
+    try:
+        B = math.fsum(b_terms)
+    except (OverflowError, ValueError) as exc:
+        fail(exc)
+    if not math.isfinite(B):
+        fail()
+
+    # W = fsum over samples, then columns, of (x_ij - m_label,j) ** 2.
+    w_terms = []
+    for i in range(n):
+        centroid = centroid_of[labels[i]]
+        for j in range(width):
+            try:
+                diff = data[i][j] - centroid[j]
+                term = diff ** 2
+            except (OverflowError, ValueError) as exc:
+                fail(exc)
+            if not math.isfinite(diff) or not math.isfinite(term):
+                fail()
+            w_terms.append(term)
+    try:
+        W = math.fsum(w_terms)
+    except (OverflowError, ValueError) as exc:
+        fail(exc)
+    if not math.isfinite(W):
+        fail()
+
+    if W == 0.0:
+        return 1.0
+    try:
+        result = (B / (k - 1)) / (W / (n - k))
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        fail(exc)
+    if not math.isfinite(result):
         fail()
     if result == 0:
         result = 0.0
