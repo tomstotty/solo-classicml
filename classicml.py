@@ -69,6 +69,9 @@ Exports:
         partitions, computed with fractions.Fraction and returned as float.
     normalized_mutual_info_score -- mutual information of two integer
         partitions normalized by the geometric mean of their entropies.
+    adjusted_mutual_info_score -- mutual information of two integer
+        partitions adjusted for chance against the expected mutual
+        information of the hypergeometric model.
     homogeneity_completeness_v_measure -- homogeneity, completeness, and
         V-measure of two integer partitions with a beta weighting.
     matthews_corrcoef -- Matthews correlation coefficient of two integer
@@ -144,6 +147,7 @@ __all__ = [
     "calinski_harabasz_score",
     "adjusted_rand_score",
     "normalized_mutual_info_score",
+    "adjusted_mutual_info_score",
     "homogeneity_completeness_v_measure",
     "matthews_corrcoef",
     "cohen_kappa_score",
@@ -4975,6 +4979,150 @@ def normalized_mutual_info_score(labels_true, labels_pred):
         raise non_finite() from exc
     checked(product)
     checked(denominator)
+    checked(result)
+    if result == 0:
+        return 0.0
+    return result
+
+
+def adjusted_mutual_info_score(labels_true, labels_pred):
+    """Return the adjusted mutual information of two integer partitions.
+
+    Both arguments must be non-empty lists of equal length whose elements
+    are exactly ``int`` (booleans are rejected). The inputs are not
+    modified. Deterministic: same inputs, same result.
+
+    Rows and columns of the contingency table correspond to the distinct
+    labels of ``labels_true`` and ``labels_pred`` respectively, each in
+    ascending label order; contingency counts ``n_ij`` accumulate by
+    sample index, with row sums ``a_i``, column sums ``b_j``, and ``n``
+    the sample count. The mutual information ``MI`` and the entropies
+    ``H_true`` and ``H_pred`` are computed exactly as in
+    ``normalized_mutual_info_score``. The expected mutual information is
+    the ``math.fsum``, over rows ``i``, columns ``j``, and integers ``q``
+    from ``max(1, a_i + b_j - n)`` to ``min(a_i, b_j)`` (each in ascending
+    order), of ``float(P) * (q / n) * math.log((n * q) / (a_i * b_j))``
+    where ``P = Fraction(comb(a_i, q) * comb(n - a_i, b_j - q),
+    comb(n, b_j))``. With ``d = (H_true + H_pred) / 2 - EMI`` the result
+    is ``1.0`` when ``d == 0`` and ``(MI - EMI) / d`` otherwise. The
+    return value is a float; an exact zero result is normalized to
+    ``0.0``. Overflow, invalid operations, or non-finite intermediate
+    values or results in the post-validation ``Fraction``-to-float
+    conversion, multiplication, division, ``math.log``, or ``math.fsum``
+    steps raise FloatingPointError.
+    """
+    n = _check_metric_vectors(labels_true, labels_pred)
+    for value in labels_true:
+        if type(value) is not int:
+            raise ValueError("labels_true must contain only integers")
+    for value in labels_pred:
+        if type(value) is not int:
+            raise ValueError("labels_pred must contain only integers")
+
+    row_labels = sorted(set(labels_true))
+    col_labels = sorted(set(labels_pred))
+    row_index = {label: i for i, label in enumerate(row_labels)}
+    col_index = {label: j for j, label in enumerate(col_labels)}
+
+    counts = [[0] * len(col_labels) for _ in row_labels]
+    for i in range(n):
+        counts[row_index[labels_true[i]]][col_index[labels_pred[i]]] += 1
+
+    row_sums = [sum(row) for row in counts]
+    col_sums = [
+        sum(counts[i][j] for i in range(len(row_labels)))
+        for j in range(len(col_labels))
+    ]
+
+    def non_finite():
+        return FloatingPointError(
+            "non-finite value encountered during adjusted mutual "
+            "information"
+        )
+
+    def checked(value):
+        if not math.isfinite(value):
+            raise non_finite()
+        return value
+
+    mi_terms = []
+    for i in range(len(row_labels)):
+        for j in range(len(col_labels)):
+            n_ij = counts[i][j]
+            if n_ij <= 0:
+                continue
+            try:
+                ratio = (n_ij * n) / (row_sums[i] * col_sums[j])
+                log_value = math.log(ratio)
+                term = (n_ij / n) * log_value
+            except (OverflowError, ValueError) as exc:
+                raise non_finite() from exc
+            checked(ratio)
+            checked(log_value)
+            mi_terms.append(checked(term))
+    try:
+        mi = math.fsum(mi_terms)
+    except (OverflowError, ValueError) as exc:
+        raise non_finite() from exc
+    checked(mi)
+
+    def entropy(sums):
+        """``-math.fsum((s / n) * math.log(s / n))`` over ``sums``."""
+        terms = []
+        for s in sums:
+            try:
+                p = s / n
+                term = p * math.log(p)
+            except (OverflowError, ValueError) as exc:
+                raise non_finite() from exc
+            terms.append(checked(term))
+        try:
+            total = math.fsum(terms)
+        except (OverflowError, ValueError) as exc:
+            raise non_finite() from exc
+        return checked(-total)
+
+    h_true = entropy(row_sums)
+    h_pred = entropy(col_sums)
+
+    emi_terms = []
+    for i in range(len(row_labels)):
+        a_i = row_sums[i]
+        for j in range(len(col_labels)):
+            b_j = col_sums[j]
+            for q in range(max(1, a_i + b_j - n), min(a_i, b_j) + 1):
+                try:
+                    probability = Fraction(
+                        math.comb(a_i, q) * math.comb(n - a_i, b_j - q),
+                        math.comb(n, b_j),
+                    )
+                    p_float = float(probability)
+                    log_value = math.log((n * q) / (a_i * b_j))
+                    term = p_float * (q / n) * log_value
+                except (OverflowError, ValueError) as exc:
+                    raise non_finite() from exc
+                checked(p_float)
+                checked(log_value)
+                emi_terms.append(checked(term))
+    try:
+        emi = math.fsum(emi_terms)
+    except (OverflowError, ValueError) as exc:
+        raise non_finite() from exc
+    checked(emi)
+
+    try:
+        d = (h_true + h_pred) / 2 - emi
+    except (OverflowError, ValueError) as exc:
+        raise non_finite() from exc
+    checked(d)
+    if d == 0:
+        return 1.0
+    try:
+        numerator = mi - emi
+        result = numerator / d
+    except (OverflowError, ValueError) as exc:
+        raise non_finite() from exc
+    checked(numerator)
     checked(result)
     if result == 0:
         return 0.0
