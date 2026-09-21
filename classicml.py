@@ -149,6 +149,7 @@ __all__ = [
     "precision_score",
     "recall_score",
     "f1_score",
+    "fbeta_score",
     "roc_curve",
     "roc_auc_score",
     "precision_recall_curve",
@@ -3296,6 +3297,207 @@ def f1_score(
         y_true, y_pred, average=average, pos_label=pos_label,
         zero_division=zero_division
     )[2]
+
+
+def fbeta_score(
+    y_true, y_pred, beta=1.0, average="binary", pos_label=1, zero_division=0
+):
+    """Compute the F-beta score for integer labels.
+
+    ``y_true`` and ``y_pred`` must be non-empty lists of equal length whose
+    elements have type exactly ``int`` (booleans are rejected). The label
+    set is the sorted union of the labels appearing in either vector.
+
+    Validation of ``y_true``, ``y_pred``, ``average``, ``pos_label``, and
+    ``zero_division`` (including the label order, the binary requirements,
+    and the per-class precision/recall counts) is exactly the same as in
+    :func:`precision_recall_fscore_support`; any violation raises
+    ValueError. ``beta`` must be a value of type exactly ``int`` or
+    ``float`` (booleans rejected) that is finite and strictly greater than
+    zero; otherwise ValueError.
+
+    Letting ``q = beta * beta`` and using the same per-class precision
+    ``P`` and recall ``R`` as :func:`precision_recall_fscore_support`, the
+    score is ``F = (1 + q) * P * R / (q * P + R)``; a zero denominator
+    yields ``float(zero_division)``. With ``average=None`` the return is a
+    list of floats aligned to the sorted labels. ``"binary"`` reports the
+    ``pos_label`` class, ``"micro"`` pools the counts first, ``"macro"``
+    averages the per-class F values with ``math.fsum`` in sorted-label
+    order, and ``"weighted"`` weights them by support and divides by the
+    sample count; each of these modes returns a float.
+
+    If any conversion or computation after validation raises
+    OverflowError or ValueError, or any intermediate value or result is
+    non-finite, FloatingPointError is raised. An exact zero is returned as
+    ``0.0``. The inputs are not modified. Deterministic: same inputs, same
+    result.
+    """
+    n = _check_metric_vectors(y_true, y_pred)
+    for value in y_true:
+        if type(value) is not int:
+            raise ValueError("y_true must contain only integers")
+    for value in y_pred:
+        if type(value) is not int:
+            raise ValueError("y_pred must contain only integers")
+
+    if average not in _PRF_AVERAGES:
+        raise ValueError(
+            "average must be one of None, 'binary', 'micro', 'macro', "
+            "'weighted'"
+        )
+    if type(pos_label) is not int:
+        raise ValueError("pos_label must be an integer")
+    if type(zero_division) is not int or zero_division not in (0, 1):
+        raise ValueError("zero_division must be the integer 0 or 1")
+    if type(beta) not in (int, float):
+        raise ValueError(
+            "beta must be a finite non-boolean number greater than 0"
+        )
+    # math.isfinite raises OverflowError for ints too large to convert to
+    # float; such values fail the finite requirement.
+    try:
+        beta_finite = math.isfinite(beta)
+    except OverflowError as exc:
+        raise ValueError(
+            "beta must be a finite non-boolean number greater than 0"
+        ) from exc
+    if not beta_finite or beta <= 0:
+        raise ValueError(
+            "beta must be a finite non-boolean number greater than 0"
+        )
+
+    labels = sorted(set(y_true) | set(y_pred))
+
+    if average == "binary":
+        if len(labels) != 2 or pos_label not in labels:
+            raise ValueError(
+                "binary average requires exactly two labels with pos_label "
+                "among them"
+            )
+    elif pos_label != 1:
+        raise ValueError(
+            "pos_label must be 1 unless average is 'binary'"
+        )
+
+    # Confusion counts with true labels as rows and predicted as columns.
+    tp = {label: 0 for label in labels}
+    fp = {label: 0 for label in labels}
+    support = {label: 0 for label in labels}
+    for i in range(n):
+        true_label = y_true[i]
+        pred_label = y_pred[i]
+        support[true_label] += 1
+        if true_label == pred_label:
+            tp[true_label] += 1
+        else:
+            fp[pred_label] += 1
+
+    fill = float(zero_division)
+
+    try:
+        q = float(beta) * float(beta)
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during fbeta_score"
+        ) from exc
+    if not math.isfinite(q):
+        raise FloatingPointError(
+            "non-finite value encountered during fbeta_score"
+        )
+
+    def pr_for(tp_count, fp_count, support_count):
+        """Precision and recall from one class's (or pooled) counts."""
+        precision_denominator = tp_count + fp_count
+        if precision_denominator == 0:
+            p = fill
+        else:
+            p = tp_count / precision_denominator
+        if support_count == 0:
+            r = fill
+        else:
+            r = tp_count / support_count
+        return p, r
+
+    def fbeta_for(p, r):
+        """F-beta from precision and recall:
+        ``(1 + q) * P * R / (q * P + R)``."""
+        try:
+            numerator = (1.0 + q) * p * r
+            denominator = q * p + r
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during fbeta_score"
+            ) from exc
+        if not math.isfinite(numerator) or not math.isfinite(denominator):
+            raise FloatingPointError(
+                "non-finite value encountered during fbeta_score"
+            )
+        if denominator == 0:
+            return fill
+        try:
+            f = numerator / denominator
+        except (OverflowError, ValueError, ZeroDivisionError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during fbeta_score"
+            ) from exc
+        if not math.isfinite(f):
+            raise FloatingPointError(
+                "non-finite value encountered during fbeta_score"
+            )
+        if f == 0:
+            f = 0.0
+        return f
+
+    if average is None:
+        return [
+            fbeta_for(*pr_for(tp[label], fp[label], support[label]))
+            for label in labels
+        ]
+
+    if average == "binary":
+        return fbeta_for(
+            *pr_for(tp[pos_label], fp[pos_label], support[pos_label])
+        )
+
+    if average == "micro":
+        return fbeta_for(*pr_for(sum(tp.values()), sum(fp.values()), n))
+
+    fscores = [
+        fbeta_for(*pr_for(tp[label], fp[label], support[label]))
+        for label in labels
+    ]
+
+    if average == "macro":
+        try:
+            result = math.fsum(fscores) / len(labels)
+        except (OverflowError, ValueError, ZeroDivisionError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during fbeta_score"
+            ) from exc
+        if not math.isfinite(result):
+            raise FloatingPointError(
+                "non-finite value encountered during fbeta_score"
+            )
+        if result == 0:
+            result = 0.0
+        return result
+
+    # weighted
+    try:
+        result = math.fsum(
+            fscores[k] * support[labels[k]] for k in range(len(labels))
+        ) / n
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during fbeta_score"
+        ) from exc
+    if not math.isfinite(result):
+        raise FloatingPointError(
+            "non-finite value encountered during fbeta_score"
+        )
+    if result == 0:
+        result = 0.0
+    return result
 
 
 def _check_roc_vectors(y_true, y_score):
