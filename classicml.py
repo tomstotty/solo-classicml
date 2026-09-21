@@ -46,6 +46,9 @@ Exports:
         a finite real matrix and an integer label vector.
     adjusted_rand_score -- exact adjusted Rand index of two integer
         partitions, computed with fractions.Fraction and returned as float.
+    normalized_mutual_info_score -- normalized mutual information of two
+        integer label partitions (geometric-mean normalization), summed
+        with math.fsum and returned as float.
     dumps -- serialize a fitted KMeans/PCA model to whitespace-free JSON
         text (quantized to 10 decimal places with ROUND_HALF_UP).
     loads -- reconstruct an independent fitted KMeans/PCA model from text
@@ -100,6 +103,7 @@ __all__ = [
     "log_loss",
     "silhouette_score",
     "adjusted_rand_score",
+    "normalized_mutual_info_score",
     "dumps",
     "loads",
 ]
@@ -3033,6 +3037,114 @@ def adjusted_rand_score(labels_true, labels_pred):
         return 1.0
     result = float((Fraction(index) - expected) / denominator)
     if result == 0:
+        return 0.0
+    return result
+
+
+def normalized_mutual_info_score(labels_true, labels_pred):
+    """Return the normalized mutual information of two integer partitions.
+
+    Both arguments must be non-empty lists of equal length whose elements
+    are exactly ``int`` (booleans and int subclasses are rejected). The
+    inputs are not modified. Deterministic: same inputs, same result.
+
+    Rows and columns of the contingency table correspond to the distinct
+    labels of ``labels_true`` and ``labels_pred`` respectively, each in
+    ascending label order; contingency counts ``n_ij`` accumulate by
+    sample index, with row sums ``a_i``, column sums ``b_j`` and sample
+    count ``n``. Row-major, only cells with ``n_ij > 0`` contribute to
+    the mutual information::
+
+        MI = fsum((n_ij/n) * log((n_ij*n) / (a_i*b_j)))
+
+    The label entropies ``H_true`` (from ``a_i``) and ``H_pred`` (from
+    ``b_j``) are computed the same way. When both entropies are exactly
+    zero the score is ``1.0``; when exactly one is zero it is ``0.0``;
+    otherwise the score is ``MI / sqrt(H_true * H_pred)``. Any exact zero
+    is normalized to positive ``0.0``. Any post-validation
+    multiplication, division, ``log``, ``sqrt`` or ``fsum`` that raises
+    OverflowError/ValueError or yields a non-finite intermediate or result
+    raises FloatingPointError.
+    """
+    n = _check_metric_vectors(labels_true, labels_pred)
+    for value in labels_true:
+        if type(value) is not int:
+            raise ValueError("labels_true must contain only integers")
+    for value in labels_pred:
+        if type(value) is not int:
+            raise ValueError("labels_pred must contain only integers")
+
+    def guard(value):
+        if isinstance(value, bool) or not math.isfinite(value):
+            raise FloatingPointError(
+                "non-finite value in normalized mutual information"
+            )
+        return value
+
+    def ratio(numerator, denominator):
+        try:
+            return guard(numerator / denominator)
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "overflow in normalized mutual information"
+            ) from exc
+
+    row_labels = sorted(set(labels_true))
+    col_labels = sorted(set(labels_pred))
+    row_index = {label: i for i, label in enumerate(row_labels)}
+    col_index = {label: j for j, label in enumerate(col_labels)}
+
+    counts = [[0] * len(col_labels) for _ in row_labels]
+    for i in range(n):
+        counts[row_index[labels_true[i]]][col_index[labels_pred[i]]] += 1
+
+    row_sums = [sum(row) for row in counts]
+    col_sums = [
+        sum(counts[i][j] for i in range(len(row_labels)))
+        for j in range(len(col_labels))
+    ]
+
+    try:
+        mi_terms = []
+        for i in range(len(row_labels)):
+            for j in range(len(col_labels)):
+                n_ij = counts[i][j]
+                if n_ij > 0:
+                    p_ij = ratio(n_ij, n)
+                    quotient = ratio(n_ij * n, row_sums[i] * col_sums[j])
+                    mi_terms.append(guard(p_ij * guard(math.log(quotient))))
+        mi = guard(math.fsum(mi_terms))
+
+        h_true_terms = []
+        for a_i in row_sums:
+            p = ratio(a_i, n)
+            h_true_terms.append(guard(p * guard(math.log(p))))
+        h_true = -guard(math.fsum(h_true_terms))
+
+        h_pred_terms = []
+        for b_j in col_sums:
+            p = ratio(b_j, n)
+            h_pred_terms.append(guard(p * guard(math.log(p))))
+        h_pred = -guard(math.fsum(h_pred_terms))
+    except FloatingPointError:
+        raise
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "floating point failure in normalized mutual information"
+        ) from exc
+
+    if h_true == 0.0 and h_pred == 0.0:
+        return 1.0
+    if h_true == 0.0 or h_pred == 0.0:
+        return 0.0
+
+    try:
+        result = guard(mi / guard(math.sqrt(guard(h_true * h_pred))))
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        raise FloatingPointError(
+            "floating point failure in normalized mutual information"
+        ) from exc
+    if result == 0.0:
         return 0.0
     return result
 
