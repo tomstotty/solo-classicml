@@ -55,6 +55,8 @@ Exports:
     multiclass_log_loss -- weighted multiclass logistic (cross-entropy)
         loss over a probability matrix with one column per class, using
         the probability of the true class clamped away from zero.
+    multiclass_hinge_loss -- weighted multiclass Crammer-Singer hinge
+        loss over a score matrix with one column per class.
     silhouette_score -- mean silhouette coefficient of a clustering over
         a finite real matrix and an integer label vector.
     davies_bouldin_score -- Davies-Bouldin index of a clustering: the mean,
@@ -132,6 +134,7 @@ __all__ = [
     "brier_score_loss",
     "log_loss",
     "multiclass_log_loss",
+    "multiclass_hinge_loss",
     "silhouette_score",
     "davies_bouldin_score",
     "calinski_harabasz_score",
@@ -4037,6 +4040,193 @@ def multiclass_log_loss(y_true, y_prob, sample_weight=None) -> float:
     if not math.isfinite(total_loss) or not math.isfinite(loss):
         raise FloatingPointError(
             "non-finite value encountered during multiclass-log-loss "
+            "computation"
+        )
+    if loss == 0:
+        loss = 0.0
+    return loss
+
+
+def _multiclass_hinge_loss_float(value):
+    """Convert a validated score/weight to float; overflow, invalid
+    operations, and non-finite results raise FloatingPointError."""
+    try:
+        result = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during multiclass-hinge-loss "
+            "computation"
+        ) from exc
+    if not math.isfinite(result):
+        raise FloatingPointError(
+            "non-finite value encountered during multiclass-hinge-loss "
+            "computation"
+        )
+    return result
+
+
+def multiclass_hinge_loss(y_true, y_score, sample_weight=None) -> float:
+    """Compute the weighted multiclass Crammer-Singer hinge loss.
+
+    ``y_true`` and ``y_score`` must be non-empty lists of equal length.
+    ``y_true`` must contain values of type exactly ``int`` (booleans are
+    rejected) drawn from at least two distinct labels; the classes are the
+    sorted distinct labels, in ascending order, and each column of
+    ``y_score`` corresponds to one class in that order. Every ``y_score``
+    row must be a list whose length equals the number of classes and whose
+    elements are finite values with type exactly ``int`` or ``float``
+    (booleans are rejected). ``sample_weight`` must be ``None`` -- every
+    sample then weighs ``1.0`` -- or a list of the same length whose
+    elements are finite non-negative values of type exactly ``int`` or
+    ``float`` (booleans are rejected). The total weight must be greater
+    than zero. Any violation -- container, length, shape, type, range,
+    total-weight, or finiteness checks, including overflow during those
+    checks -- raises ValueError.
+
+    After validation, the scores and weights are converted to ``float``
+    and the converted weights are summed with ``math.fsum`` in input
+    order; overflow or an invalid operation during that summation, a
+    non-finite total, or a total that is not greater than zero raises
+    ValueError. For each sample, in input order, ``c`` is the score in
+    the true-class column, ``r`` is the largest score among the other
+    columns taken in ascending class order, and the per-sample loss is
+    ``max(0.0, 1.0 + r - c)``. The result is the quotient of two
+    ``math.fsum`` sums, both accumulated in input order -- one of
+    ``w_i * loss_i``, the other of the ``w_i`` -- with an exact zero
+    normalized to ``0.0``. Overflow or invalid operations during the
+    subsequent conversion, addition, subtraction, multiplication,
+    summation, or division, and non-finite intermediate values or
+    results, raise FloatingPointError.
+
+    The return value is a float. The inputs are not modified.
+    Deterministic: same inputs, same result.
+    """
+    if not isinstance(y_true, list) or not isinstance(y_score, list):
+        raise ValueError("y_true and y_score must be lists")
+    if len(y_true) == 0 or len(y_score) == 0:
+        raise ValueError("y_true and y_score must be non-empty lists")
+    if len(y_true) != len(y_score):
+        raise ValueError("y_true and y_score must have the same length")
+    n = len(y_true)
+
+    for value in y_true:
+        if type(value) is not int:
+            raise ValueError("y_true must contain only integers")
+    classes = sorted(set(y_true))
+    if len(classes) < 2:
+        raise ValueError("y_true must contain at least two distinct classes")
+    n_classes = len(classes)
+    class_index = {label: j for j, label in enumerate(classes)}
+
+    for row in y_score:
+        if not isinstance(row, list):
+            raise ValueError("y_score rows must be lists")
+        if len(row) != n_classes:
+            raise ValueError(
+                "each y_score row must have one entry per class"
+            )
+        for value in row:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "y_score must contain only finite non-boolean numbers"
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "y_score must contain only finite non-boolean numbers"
+                ) from exc
+            if not finite:
+                raise ValueError(
+                    "y_score must contain only finite non-boolean numbers"
+                )
+
+    if sample_weight is None:
+        weights = [1.0] * n
+    else:
+        if not isinstance(sample_weight, list) or len(sample_weight) != n:
+            raise ValueError(
+                "sample_weight must be a list with the same length as "
+                "y_true"
+            )
+        for value in sample_weight:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                ) from exc
+            if not finite or value < 0:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+        weights = [_multiclass_hinge_loss_float(value) for value in sample_weight]
+
+    # The weights have just been converted to float, so summing them is
+    # still part of the input checks: overflow, invalid operations, a
+    # non-finite total, and a non-positive total all raise ValueError.
+    try:
+        total_weight = math.fsum(weights)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError("the total weight must be greater than 0") from exc
+    if not math.isfinite(total_weight) or total_weight <= 0.0:
+        raise ValueError("the total weight must be greater than 0")
+
+    loss_terms = []
+    for i in range(n):
+        true_j = class_index[y_true[i]]
+        c = _multiclass_hinge_loss_float(y_score[i][true_j])
+        r = None
+        for j in range(n_classes):
+            if j == true_j:
+                continue
+            value = _multiclass_hinge_loss_float(y_score[i][j])
+            if r is None or value > r:
+                r = value
+        try:
+            margin = 1.0 + r - c
+            sample_loss = margin if margin > 0.0 else 0.0
+            term = weights[i] * sample_loss
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during multiclass-hinge-loss "
+                "computation"
+            ) from exc
+        if (
+            not math.isfinite(r)
+            or not math.isfinite(c)
+            or not math.isfinite(margin)
+            or not math.isfinite(sample_loss)
+            or not math.isfinite(term)
+        ):
+            raise FloatingPointError(
+                "non-finite value encountered during multiclass-hinge-loss "
+                "computation"
+            )
+        loss_terms.append(term)
+
+    try:
+        total_loss = math.fsum(loss_terms)
+        loss = total_loss / total_weight
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during multiclass-hinge-loss "
+            "computation"
+        ) from exc
+    if not math.isfinite(total_loss) or not math.isfinite(loss):
+        raise FloatingPointError(
+            "non-finite value encountered during multiclass-hinge-loss "
             "computation"
         )
     if loss == 0:
