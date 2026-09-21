@@ -44,6 +44,8 @@ Exports:
         probability vector with clamped probabilities.
     silhouette_score -- mean silhouette coefficient of a clustering over
         a finite real matrix and an integer label vector.
+    adjusted_rand_score -- chance-adjusted agreement of two integer
+        clusterings, computed exactly with Fraction and returned as float.
     dumps -- serialize a fitted KMeans/PCA model to whitespace-free JSON
         text (quantized to 10 decimal places with ROUND_HALF_UP).
     loads -- reconstruct an independent fitted KMeans/PCA model from text
@@ -71,6 +73,7 @@ import random
 import re
 import sys
 from decimal import Decimal, ROUND_HALF_UP, localcontext
+from fractions import Fraction
 
 __all__ = [
     "LinearRegression",
@@ -96,6 +99,7 @@ __all__ = [
     "brier_score_loss",
     "log_loss",
     "silhouette_score",
+    "adjusted_rand_score",
     "dumps",
     "loads",
 ]
@@ -2966,6 +2970,68 @@ def silhouette_score(X, labels):
     if result == 0:
         result = 0.0
     return result
+
+
+def adjusted_rand_score(labels_true, labels_pred):
+    """Return the adjusted Rand index between two integer clusterings.
+
+    Both arguments must be non-empty lists of equal length whose elements
+    are exactly ``int`` (booleans are rejected). The inputs are not
+    modified. The contingency table is accumulated by sample index with
+    rows ordered by ascending true label and columns by ascending
+    predicted label. All intermediate arithmetic is exact via
+    ``fractions.Fraction``; the result is returned as ``float``. Returns
+    ``1.0`` when the expected or maximum agreement is undefined (a single
+    cluster on either side), and an exact zero is normalized to ``0.0``.
+    Deterministic: same inputs, same result.
+    """
+    if not isinstance(labels_true, list) or not isinstance(labels_pred, list):
+        raise ValueError("labels_true and labels_pred must be lists")
+    if len(labels_true) == 0 or len(labels_pred) == 0:
+        raise ValueError("labels_true and labels_pred must be non-empty lists")
+    if len(labels_true) != len(labels_pred):
+        raise ValueError("labels_true and labels_pred must have the same length")
+    for value in labels_true:
+        if type(value) is not int:
+            raise ValueError("labels_true must contain only integers")
+    for value in labels_pred:
+        if type(value) is not int:
+            raise ValueError("labels_pred must contain only integers")
+
+    rows = sorted(set(labels_true))
+    cols = sorted(set(labels_pred))
+    row_index = {label: i for i, label in enumerate(rows)}
+    col_index = {label: j for j, label in enumerate(cols)}
+    counts = [[0] * len(cols) for _ in rows]
+    for true_label, pred_label in zip(labels_true, labels_pred):
+        counts[row_index[true_label]][col_index[pred_label]] += 1
+
+    def comb2(x):
+        return x * (x - 1) // 2
+
+    n = len(labels_true)
+    n_total = comb2(n)
+    index = 0
+    for row in counts:
+        for cell in row:
+            index += comb2(cell)
+    row_sum = 0
+    for row in counts:
+        row_sum += comb2(sum(row))
+    col_sum = 0
+    for j in range(len(cols)):
+        col_sum += comb2(sum(counts[i][j] for i in range(len(rows))))
+
+    if n_total == 0:
+        return 1.0
+    expected = Fraction(row_sum * col_sum, n_total)
+    maximum = Fraction(row_sum + col_sum, 2)
+    if maximum == expected:
+        return 1.0
+    score = float((Fraction(index) - expected) / (maximum - expected))
+    if score == 0:
+        score = 0.0
+    return score
 
 
 _SERIAL_KEYS_KMEANS = (
