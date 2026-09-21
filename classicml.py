@@ -59,6 +59,8 @@ Exports:
         partitions, computed with fractions.Fraction and returned as float.
     normalized_mutual_info_score -- mutual information of two integer
         partitions normalized by the geometric mean of their entropies.
+    homogeneity_completeness_v_measure -- homogeneity, completeness, and
+        V-measure of two integer partitions with a beta weighting.
     matthews_corrcoef -- Matthews correlation coefficient of two integer
         label vectors, computed from an exact integer contingency table.
     balanced_accuracy_score -- weighted mean per-class recall of two
@@ -123,6 +125,7 @@ __all__ = [
     "calinski_harabasz_score",
     "adjusted_rand_score",
     "normalized_mutual_info_score",
+    "homogeneity_completeness_v_measure",
     "matthews_corrcoef",
     "cohen_kappa_score",
     "balanced_accuracy_score",
@@ -4071,6 +4074,159 @@ def normalized_mutual_info_score(labels_true, labels_pred):
     if result == 0:
         return 0.0
     return result
+
+
+def homogeneity_completeness_v_measure(labels_true, labels_pred, beta=1.0):
+    """Return the homogeneity, completeness, and V-measure of two partitions.
+
+    Both label arguments must be non-empty lists of equal length whose
+    elements are exactly ``int`` (booleans are rejected). ``beta`` must be
+    a finite, positive, non-boolean number of type exactly ``int`` or
+    ``float``. The inputs are not modified. Deterministic: same inputs,
+    same result.
+
+    Rows and columns of the contingency table correspond to the distinct
+    labels of ``labels_true`` and ``labels_pred`` respectively, each in
+    ascending label order; contingency counts ``n_ij`` accumulate by
+    sample index, with row sums ``a_i``, column sums ``b_j``, and ``n``
+    the sample count. The entropies are
+    ``H_t = -math.fsum((a_i / n) * math.log(a_i / n))`` and
+    ``H_p = -math.fsum((b_j / n) * math.log(b_j / n))``; the mutual
+    information is the ``math.fsum``, row by row then column by column,
+    of ``(n_ij / n) * math.log((n_ij * n) / (a_i * b_j))`` over the cells
+    with ``n_ij > 0``. Homogeneity is ``1.0`` when ``H_t == 0`` and
+    ``MI / H_t`` otherwise; completeness is ``1.0`` when ``H_p == 0`` and
+    ``MI / H_p`` otherwise. With ``d = beta * h + c`` the V-measure is
+    ``0.0`` when ``d == 0`` and ``(1 + beta) * h * c / d`` otherwise. All
+    three results are floats; exact zeros are normalized to ``0.0``.
+    Overflow, invalid operations, or non-finite values during the
+    post-validation float conversion, multiplication, division,
+    ``math.log``, or ``math.fsum`` steps raise FloatingPointError.
+    """
+    n = _check_metric_vectors(labels_true, labels_pred)
+    for value in labels_true:
+        if type(value) is not int:
+            raise ValueError("labels_true must contain only integers")
+    for value in labels_pred:
+        if type(value) is not int:
+            raise ValueError("labels_pred must contain only integers")
+    if type(beta) not in (int, float) or isinstance(beta, bool):
+        raise ValueError("beta must be a non-boolean int or float")
+    try:
+        if not math.isfinite(beta) or beta <= 0:
+            raise ValueError("beta must be a finite positive number")
+    except OverflowError as exc:
+        raise ValueError("beta must be a finite positive number") from exc
+
+    row_labels = sorted(set(labels_true))
+    col_labels = sorted(set(labels_pred))
+    row_index = {label: i for i, label in enumerate(row_labels)}
+    col_index = {label: j for j, label in enumerate(col_labels)}
+
+    counts = [[0] * len(col_labels) for _ in row_labels]
+    for i in range(n):
+        counts[row_index[labels_true[i]]][col_index[labels_pred[i]]] += 1
+
+    row_sums = [sum(row) for row in counts]
+    col_sums = [
+        sum(counts[i][j] for i in range(len(row_labels)))
+        for j in range(len(col_labels))
+    ]
+
+    def fp_error(exc=None):
+        error = FloatingPointError(
+            "non-finite value encountered during "
+            "homogeneity/completeness/V-measure"
+        )
+        if exc is not None:
+            raise error from exc
+        raise error
+
+    def checked(value):
+        if not math.isfinite(value):
+            fp_error()
+        return value
+
+    mi_terms = []
+    for i in range(len(row_labels)):
+        for j in range(len(col_labels)):
+            n_ij = counts[i][j]
+            if n_ij <= 0:
+                continue
+            try:
+                ratio = (n_ij * n) / (row_sums[i] * col_sums[j])
+                log_value = math.log(ratio)
+                term = (n_ij / n) * log_value
+            except (OverflowError, ValueError) as exc:
+                fp_error(exc)
+            checked(ratio)
+            checked(log_value)
+            mi_terms.append(checked(term))
+    try:
+        mi = math.fsum(mi_terms)
+    except (OverflowError, ValueError) as exc:
+        fp_error(exc)
+    checked(mi)
+
+    def entropy(sums):
+        """``-math.fsum((s / n) * math.log(s / n))`` over ``sums``."""
+        terms = []
+        for s in sums:
+            try:
+                p = s / n
+                term = p * math.log(p)
+            except (OverflowError, ValueError) as exc:
+                fp_error(exc)
+            terms.append(checked(term))
+        try:
+            total = math.fsum(terms)
+        except (OverflowError, ValueError) as exc:
+            fp_error(exc)
+        return checked(-total)
+
+    h_t = entropy(row_sums)
+    h_p = entropy(col_sums)
+
+    if h_t == 0.0:
+        h = 1.0
+    else:
+        try:
+            h = mi / h_t
+        except (OverflowError, ValueError, ZeroDivisionError) as exc:
+            fp_error(exc)
+        checked(h)
+    if h_p == 0.0:
+        c = 1.0
+    else:
+        try:
+            c = mi / h_p
+        except (OverflowError, ValueError, ZeroDivisionError) as exc:
+            fp_error(exc)
+        checked(c)
+
+    try:
+        beta_f = float(beta)
+        d = beta_f * h + c
+    except (OverflowError, ValueError) as exc:
+        fp_error(exc)
+    checked(beta_f)
+    checked(d)
+    if d == 0.0:
+        v = 0.0
+    else:
+        try:
+            v = ((1.0 + beta_f) * h * c) / d
+        except (OverflowError, ValueError, ZeroDivisionError) as exc:
+            fp_error(exc)
+        checked(v)
+
+    if h == 0.0:
+        h = 0.0
+    if c == 0.0:
+        c = 0.0
+    if v == 0.0:
+        v = 0.0
+    return (h, c, v)
 
 
 def matthews_corrcoef(y_true, y_pred):
