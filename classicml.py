@@ -1303,6 +1303,46 @@ class KMeans:
 
         return [self._assign(row, self.cluster_centers_) for row in X]
 
+    def transform(self, X):
+        """Return, per row of ``X``, the squared Euclidean distances to
+        every centroid in ascending centroid-index order.
+
+        Each distance is ``math.fsum((x_j - c_kj) ** 2)`` with terms
+        accumulated in column order; an exact zero is returned as ``0.0``.
+        The model must be fitted first, and ``X`` must pass the same
+        validation as in ``fit``/``predict`` and have the same number of
+        columns as the training data. The input is not modified, and the
+        result is a fresh list of fresh row lists.
+        """
+        if self.cluster_centers_ is None:
+            raise ValueError("model must be fitted before transform is called")
+        width = _check_exact_matrix(X)
+        if width != self._n_features:
+            raise ValueError(
+                "X must have the same number of features as the training data"
+            )
+
+        centroids = self.cluster_centers_
+        result = []
+        for row in X:
+            distances = []
+            for k in range(self.n_clusters):
+                distance = _squared_distance(row, centroids[k])
+                if distance == 0:
+                    distance = 0.0
+                distances.append(distance)
+            result.append(distances)
+        return result
+
+    def fit_predict(self, X):
+        """Fit the model on ``X`` and return the predicted labels for it.
+
+        Equivalent to ``fit(X)`` followed by ``predict(X)``; any exception
+        raised by ``fit`` propagates unchanged.
+        """
+        self.fit(X)
+        return self.predict(X)
+
 
 class PCA:
     """Deterministic first-principal-component projection for 2-D data.
