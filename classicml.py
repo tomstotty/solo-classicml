@@ -23,6 +23,8 @@ Exports:
         finite real vectors.
     mean_absolute_error -- weighted mean of element-wise absolute
         differences of two finite real vectors.
+    median_absolute_error -- weighted median of element-wise absolute
+        differences of two finite real vectors.
     mean_squared_log_error -- weighted mean squared logarithmic error of
         two finite non-negative real vectors.
     r2_score -- coefficient of determination of two finite real vectors,
@@ -139,6 +141,7 @@ __all__ = [
     "accuracy_score",
     "mean_squared_error",
     "mean_absolute_error",
+    "median_absolute_error",
     "mean_squared_log_error",
     "r2_score",
     "explained_variance_score",
@@ -1647,6 +1650,164 @@ def mean_absolute_error(y_true, y_pred, sample_weight=None) -> float:
         raise FloatingPointError(
             "non-finite value encountered during mean absolute error"
         )
+    if result == 0:
+        result = 0.0
+    return result
+
+
+def median_absolute_error(y_true, y_pred, sample_weight=None) -> float:
+    """Return the weighted median of the element-wise absolute differences.
+
+    ``y_true`` and ``y_pred`` must be non-empty lists of equal length
+    whose elements are finite values of type exactly ``int`` or
+    ``float`` (booleans are rejected). ``sample_weight`` must be
+    ``None`` -- every sample then weighs ``1.0`` -- or a list of the
+    same length whose elements are finite non-negative values of type
+    exactly ``int`` or ``float`` (booleans are rejected). Any
+    container, length, type, range, or finiteness violation (including
+    ``OverflowError`` raised by ``math.isfinite``) raises ValueError.
+
+    After validation, the values and weights are converted to
+    ``float`` in input order. ``math.fsum`` computes the total weight
+    ``W = sum(w_i)``; if that summation overflows or is invalid, is
+    non-finite, or ``W`` is less than or equal to zero, a ValueError is
+    raised. For each index, ``r_i = abs(y_true_i - y_pred_i)`` and the
+    items are sorted by ``(r_i, i)`` ascending. Starting from an empty
+    prefix, the weight prefix is recomputed with ``math.fsum`` after
+    each included item (zero-weight items are retained); the result is
+    the first ``r_i`` whose prefix is greater than or equal to
+    ``W / 2``. A prefix exactly equal to ``W / 2`` still takes the
+    current ``r_i`` -- adjacent values are never averaged. Overflow,
+    invalid operations during the post-validation conversion,
+    subtraction, absolute value, sorting, the division, or a prefix
+    summation, and non-finite intermediate values raise
+    FloatingPointError. An exact zero result is normalized to ``0.0``.
+
+    The return value is a float. The inputs are not modified.
+    Deterministic: same inputs, same result.
+    """
+    n = _check_metric_vectors(y_true, y_pred)
+    for name, values in (("y_true", y_true), ("y_pred", y_pred)):
+        for value in values:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "%s must contain only finite non-boolean numbers" % name
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "%s must contain only finite non-boolean numbers" % name
+                ) from exc
+            if not finite:
+                raise ValueError(
+                    "%s must contain only finite non-boolean numbers" % name
+                )
+
+    if sample_weight is not None:
+        if not isinstance(sample_weight, list) or len(sample_weight) != n:
+            raise ValueError(
+                "sample_weight must be a list with the same length as "
+                "y_true"
+            )
+        for value in sample_weight:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                ) from exc
+            if not finite or value < 0:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+
+    try:
+        t = [float(value) for value in y_true]
+        p = [float(value) for value in y_pred]
+        if sample_weight is None:
+            w = [1.0] * n
+        else:
+            w = [float(value) for value in sample_weight]
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during median absolute error"
+        ) from exc
+    for values in (t, p, w):
+        for value in values:
+            if not math.isfinite(value):
+                raise FloatingPointError(
+                    "non-finite value encountered during median absolute error"
+                )
+
+    try:
+        total_weight = math.fsum(w)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError("the total weight must be greater than 0") from exc
+    if not math.isfinite(total_weight) or total_weight <= 0.0:
+        raise ValueError("the total weight must be greater than 0")
+
+    items = []
+    for i in range(n):
+        try:
+            r = abs(t[i] - p[i])
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during median absolute error"
+            ) from exc
+        if not math.isfinite(r):
+            raise FloatingPointError(
+                "non-finite value encountered during median absolute error"
+            )
+        items.append((r, i))
+
+    try:
+        items.sort()
+    except (OverflowError, ValueError, TypeError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during median absolute error"
+        ) from exc
+
+    try:
+        half_weight = total_weight / 2.0
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during median absolute error"
+        ) from exc
+    if not math.isfinite(half_weight):
+        raise FloatingPointError(
+            "non-finite value encountered during median absolute error"
+        )
+
+    included = []
+    result = None
+    for r, i in items:
+        included.append(w[i])
+        try:
+            prefix = math.fsum(included)
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during median absolute error"
+            ) from exc
+        if not math.isfinite(prefix):
+            raise FloatingPointError(
+                "non-finite value encountered during median absolute error"
+            )
+        if prefix >= half_weight:
+            result = r
+            break
+
     if result == 0:
         result = 0.0
     return result
