@@ -113,6 +113,8 @@ Exports:
     label_ranking_loss -- weighted mean, over samples, of the fraction
         of positive-negative label pairs whose ordering is wrong (ties
         count half) under a score ranking.
+    hamming_loss -- weighted fraction of mismatched labels between two
+        binary label matrices.
     dumps -- serialize a fitted KMeans/PCA model to whitespace-free JSON
         text (quantized to 10 decimal places with ROUND_HALF_UP).
     loads -- reconstruct an independent fitted KMeans/PCA model from text
@@ -204,6 +206,7 @@ __all__ = [
     "label_ranking_average_precision_score",
     "coverage_error",
     "label_ranking_loss",
+    "hamming_loss",
     "dumps",
     "loads",
 ]
@@ -8990,6 +8993,156 @@ def label_ranking_loss(y_true, y_score, sample_weight=None) -> float:
         except (OverflowError, ValueError) as exc:
             raise non_finite(exc) from exc
         if not math.isfinite(summed) or not math.isfinite(row_score):
+            raise non_finite(None)
+        row_scores.append(row_score)
+
+    weighted_terms = []
+    for i in range(n):
+        try:
+            term = weights[i] * row_scores[i]
+        except (OverflowError, ValueError) as exc:
+            raise non_finite(exc) from exc
+        if not math.isfinite(term):
+            raise non_finite(None)
+        weighted_terms.append(term)
+    try:
+        weighted_total = math.fsum(weighted_terms)
+    except (OverflowError, ValueError) as exc:
+        raise non_finite(exc) from exc
+    if not math.isfinite(weighted_total):
+        raise non_finite(None)
+    try:
+        result = weighted_total / total_weight
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        raise non_finite(exc) from exc
+    if not math.isfinite(result):
+        raise non_finite(None)
+    if result == 0:
+        return 0.0
+    return result
+
+
+def hamming_loss(y_true, y_pred, sample_weight=None) -> float:
+    """Return the weighted fraction of mismatched binary labels.
+
+    ``y_true`` and ``y_pred`` must be non-empty rectangular lists of
+    rows with at least one column and identical shapes whose elements
+    are exactly the integers ``0`` and ``1`` (booleans and subclasses
+    are rejected). ``sample_weight`` must be ``None`` -- every sample
+    then weighs ``1.0`` -- or a list with the same length as the number
+    of rows whose elements are finite non-negative values of type
+    exactly ``int`` or ``float`` (booleans are rejected). Any
+    container, shape, length, type, value, or finiteness violation
+    (including ``OverflowError`` raised by ``math.isfinite``) raises
+    ValueError.
+
+    For row ``i`` the row score ``q_i`` is the number of columns, in
+    ascending column order, where the two matrices disagree, divided by
+    the column count. After validation the weights are converted to
+    ``float`` in row order; ``math.fsum`` computes the total weight
+    ``W = sum(w_i)`` and the weighted score ``L = sum(w_i * q_i)``, and
+    the result is ``L / W``. Overflow or invalid operations during the
+    ``W`` summation, a non-finite ``W``, or ``W <= 0`` raise ValueError;
+    overflow, invalid operations, and non-finite values during the
+    post-validation conversion, the row-score division, the weighted
+    multiplication, the ``L`` summation, or the final division raise
+    FloatingPointError. An exact zero result is normalized to ``0.0``.
+
+    The return value is a float. The inputs are not modified.
+    Deterministic: same inputs, same result.
+    """
+
+    def check_binary_matrix(matrix, name):
+        if not isinstance(matrix, list) or len(matrix) == 0:
+            raise ValueError("%s must be a non-empty list of rows" % name)
+        width = None
+        for row in matrix:
+            if not isinstance(row, list) or len(row) == 0:
+                raise ValueError("%s rows must be non-empty lists" % name)
+            if width is None:
+                width = len(row)
+            elif len(row) != width:
+                raise ValueError("%s must be rectangular" % name)
+            for value in row:
+                if type(value) is not int or value not in (0, 1):
+                    raise ValueError(
+                        "%s must contain only the integers 0 and 1" % name
+                    )
+        return width
+
+    width = check_binary_matrix(y_true, "y_true")
+    n = len(y_true)
+    if not isinstance(y_pred, list) or len(y_pred) != n:
+        raise ValueError(
+            "y_pred must be a list with the same length as y_true"
+        )
+    pred_width = check_binary_matrix(y_pred, "y_pred")
+    if pred_width != width:
+        raise ValueError("y_pred must have the same shape as y_true")
+
+    if sample_weight is not None:
+        if not isinstance(sample_weight, list) or len(sample_weight) != n:
+            raise ValueError(
+                "sample_weight must be a list with the same length as "
+                "y_true"
+            )
+        for value in sample_weight:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                ) from exc
+            if not finite or value < 0:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+
+    def non_finite(exc):
+        return FloatingPointError(
+            "non-finite value encountered during hamming loss"
+        )
+
+    if sample_weight is None:
+        weights = [1.0] * n
+    else:
+        try:
+            weights = [float(value) for value in sample_weight]
+        except (OverflowError, ValueError) as exc:
+            raise non_finite(exc) from exc
+        for value in weights:
+            if not math.isfinite(value):
+                raise non_finite(None)
+
+    try:
+        total_weight = math.fsum(weights)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError("the total weight must be greater than 0") from exc
+    if not math.isfinite(total_weight) or total_weight <= 0.0:
+        raise ValueError("the total weight must be greater than 0")
+
+    row_scores = []
+    for i in range(n):
+        true_row = y_true[i]
+        pred_row = y_pred[i]
+        mismatches = 0
+        for j in range(width):
+            if true_row[j] != pred_row[j]:
+                mismatches += 1
+        try:
+            row_score = mismatches / width
+        except (OverflowError, ValueError) as exc:
+            raise non_finite(exc) from exc
+        if not math.isfinite(row_score):
             raise non_finite(None)
         row_scores.append(row_score)
 
