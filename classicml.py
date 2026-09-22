@@ -31,6 +31,8 @@ Exports:
         score of two finite real vectors.
     mean_pinball_loss -- weighted mean pinball (quantile) loss of two
         finite real vectors at a quantile level alpha in [0, 1].
+    d2_pinball_score -- fraction by which pinball loss improves over the
+        weighted alpha-quantile constant baseline of the true vector.
     mean_poisson_deviance -- weighted mean Poisson deviance of a
         non-negative real vector and a strictly positive prediction
         vector.
@@ -142,6 +144,7 @@ __all__ = [
     "explained_variance_score",
     "mean_absolute_percentage_error",
     "mean_pinball_loss",
+    "d2_pinball_score",
     "mean_huber_loss",
     "mean_poisson_deviance",
     "mean_gamma_deviance",
@@ -2549,6 +2552,231 @@ def mean_pinball_loss(y_true, y_pred, alpha=0.5, sample_weight=None) -> float:
         raise FloatingPointError(
             "non-finite value encountered during mean pinball loss"
         )
+    if result == 0:
+        result = 0.0
+    return result
+
+
+def d2_pinball_score(y_true, y_pred, alpha=0.5, sample_weight=None) -> float:
+    """Return the D^2 pinball score: relative improvement over a constant.
+
+    The score is ``1 - L / L0`` where ``L`` is the weighted pinball loss
+    of ``y_pred`` and ``L0`` is the weighted pinball loss of the constant
+    baseline ``q``, the weighted ``alpha``-quantile of ``y_true``. It
+    measures how much the quantile predictions improve on always
+    predicting that constant.
+
+    ``y_true`` and ``y_pred`` must be non-empty lists of equal length
+    whose elements are finite values of type exactly ``int`` or
+    ``float`` (booleans are rejected). ``alpha`` must be a finite value
+    of type exactly ``int`` or ``float`` (booleans are rejected) in the
+    closed interval ``[0, 1]``. ``sample_weight`` must be ``None`` --
+    every sample then weighs ``1.0`` -- or a list of the same length
+    whose elements are finite non-negative values of type exactly
+    ``int`` or ``float`` (booleans are rejected). Any container, length,
+    type, range, or finiteness violation (including ``OverflowError``
+    raised by ``math.isfinite``) raises ValueError.
+
+    After validation, the values, alpha, and weights are converted to
+    ``float`` in input order. ``math.fsum`` computes the total weight
+    ``W = sum(w_i)``; if that summation overflows or is invalid, is
+    non-finite, or ``W`` is less than or equal to zero, a ValueError is
+    raised. The triples ``(t_i, i, w_i)`` are sorted ascending by
+    ``(t_i, i)`` and ``q`` is the first ``t_i`` whose running prefix
+    weight (computed with ``math.fsum``) reaches or exceeds
+    ``alpha * W``. With ``rho(d) = alpha * d`` for ``d >= 0`` and
+    ``rho(d) = (alpha - 1.0) * d`` otherwise, ``math.fsum`` in original
+    sample order computes ``L = sum(w_i * rho(t_i - p_i))`` and
+    ``L0 = sum(w_i * rho(t_i - q))``. When ``L0`` is non-zero the result
+    is ``1.0 - L / L0``; when ``L0`` and ``L`` are both zero the result
+    is ``1.0``; when only ``L0`` is zero the result is ``0.0``.
+
+    Overflow, invalid operations, or division by zero during the
+    post-validation conversion, sorting, prefix summation, loss
+    arithmetic, or final division, and any non-finite intermediate value
+    or result raise FloatingPointError. An exact zero result is
+    normalized to ``0.0``.
+
+    The return value is a float. The inputs are not modified.
+    Deterministic: same inputs, same result.
+    """
+    n = _check_metric_vectors(y_true, y_pred)
+    for name, values in (("y_true", y_true), ("y_pred", y_pred)):
+        for value in values:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "%s must contain only finite non-boolean numbers" % name
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "%s must contain only finite non-boolean numbers" % name
+                ) from exc
+            if not finite:
+                raise ValueError(
+                    "%s must contain only finite non-boolean numbers" % name
+                )
+
+    if type(alpha) not in (int, float):
+        raise ValueError(
+            "alpha must be a finite non-boolean number in [0, 1]"
+        )
+    try:
+        alpha_finite = math.isfinite(alpha)
+    except OverflowError as exc:
+        raise ValueError(
+            "alpha must be a finite non-boolean number in [0, 1]"
+        ) from exc
+    if not alpha_finite or alpha < 0 or alpha > 1:
+        raise ValueError(
+            "alpha must be a finite non-boolean number in [0, 1]"
+        )
+
+    if sample_weight is not None:
+        if not isinstance(sample_weight, list) or len(sample_weight) != n:
+            raise ValueError(
+                "sample_weight must be a list with the same length as "
+                "y_true"
+            )
+        for value in sample_weight:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                ) from exc
+            if not finite or value < 0:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+
+    try:
+        t = [float(value) for value in y_true]
+        p = [float(value) for value in y_pred]
+        a = float(alpha)
+        if sample_weight is None:
+            w = [1.0] * n
+        else:
+            w = [float(value) for value in sample_weight]
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during d2 pinball score"
+        ) from exc
+    for values in (t, p, w):
+        for value in values:
+            if not math.isfinite(value):
+                raise FloatingPointError(
+                    "non-finite value encountered during d2 pinball score"
+                )
+    if not math.isfinite(a):
+        raise FloatingPointError(
+            "non-finite value encountered during d2 pinball score"
+        )
+
+    try:
+        total_weight = math.fsum(w)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError("the total weight must be greater than 0") from exc
+    if not math.isfinite(total_weight) or total_weight <= 0.0:
+        raise ValueError("the total weight must be greater than 0")
+
+    try:
+        target = a * total_weight
+        if not math.isfinite(target):
+            raise FloatingPointError(
+                "non-finite value encountered during d2 pinball score"
+            )
+
+        # Sort (t_i, i, w_i) ascending by (t_i, i); the unique index
+        # makes ties deterministic. q is the first t_i whose running
+        # prefix weight, accumulated with math.fsum, reaches alpha * W.
+        triples = sorted((t[i], i, w[i]) for i in range(n))
+        prefix_weights = []
+        q = None
+        for t_i, _, w_i in triples:
+            prefix_weights.append(w_i)
+            prefix_weight = math.fsum(prefix_weights)
+            if not math.isfinite(prefix_weight):
+                raise FloatingPointError(
+                    "non-finite value encountered during d2 pinball score"
+                )
+            if prefix_weight >= target:
+                q = t_i
+                break
+        if q is None or not math.isfinite(q):
+            raise FloatingPointError(
+                "non-finite value encountered during d2 pinball score"
+            )
+
+        model_terms = []
+        baseline_terms = []
+        for i in range(n):
+            d = t[i] - p[i]
+            if d >= 0:
+                rho = a * d
+            else:
+                rho = (a - 1.0) * d
+            if not math.isfinite(rho):
+                raise FloatingPointError(
+                    "non-finite value encountered during d2 pinball score"
+                )
+            term = w[i] * rho
+            if not math.isfinite(term):
+                raise FloatingPointError(
+                    "non-finite value encountered during d2 pinball score"
+                )
+            model_terms.append(term)
+
+            d0 = t[i] - q
+            if d0 >= 0:
+                rho0 = a * d0
+            else:
+                rho0 = (a - 1.0) * d0
+            if not math.isfinite(rho0):
+                raise FloatingPointError(
+                    "non-finite value encountered during d2 pinball score"
+                )
+            term0 = w[i] * rho0
+            if not math.isfinite(term0):
+                raise FloatingPointError(
+                    "non-finite value encountered during d2 pinball score"
+                )
+            baseline_terms.append(term0)
+
+        model_loss = math.fsum(model_terms)
+        baseline_loss = math.fsum(baseline_terms)
+        if not math.isfinite(model_loss) or not math.isfinite(baseline_loss):
+            raise FloatingPointError(
+                "non-finite value encountered during d2 pinball score"
+            )
+
+        if baseline_loss != 0.0:
+            result = 1.0 - model_loss / baseline_loss
+        elif model_loss == 0.0:
+            result = 1.0
+        else:
+            result = 0.0
+        if not math.isfinite(result):
+            raise FloatingPointError(
+                "non-finite value encountered during d2 pinball score"
+            )
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during d2 pinball score"
+        ) from exc
+
     if result == 0:
         result = 0.0
     return result
