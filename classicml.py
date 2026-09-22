@@ -549,6 +549,60 @@ class LogisticRegression:
             results.append(1 if z >= 0 else 0)
         return results
 
+    def predict_proba(self, X):
+        """Return the predicted probability of the positive class (1)
+        for each row of X.
+
+        X must satisfy the same validation as in fit/predict: a
+        non-empty rectangular matrix of finite non-boolean numbers with
+        the same number of columns as the training data. Each row's
+        score is ``z = math.fsum(w_j * x_j) + b`` computed in feature
+        order, mapped through the numerically stable sigmoid (the
+        ``z >= 0`` branch uses ``1 / (1 + exp(-z))``, otherwise
+        ``e = exp(z); e / (1 + e)``). An OverflowError or ValueError
+        from the conversion, multiply-add, exp, or fsum steps, or any
+        non-finite intermediate or result, raises FloatingPointError.
+        An exact zero result is returned as positive 0.0. The input is
+        not modified and repeated calls return identical values.
+        """
+        if self.w is None or self.b is None:
+            raise ValueError(
+                "model must be fitted before predict_proba is called"
+            )
+        width = _check_matrix(X)
+        if width != len(self.w):
+            raise ValueError(
+                "X must have the same number of features as the training data"
+            )
+
+        results = []
+        for row in X:
+            try:
+                z = math.fsum(self.w[j] * row[j] for j in range(width))
+            except (OverflowError, ValueError) as exc:
+                raise FloatingPointError(
+                    "non-finite prediction encountered"
+                ) from exc
+            z += self.b
+            if not math.isfinite(z):
+                raise FloatingPointError("non-finite prediction encountered")
+            try:
+                if z >= 0:
+                    p = 1.0 / (1.0 + math.exp(-z))
+                else:
+                    e = math.exp(z)
+                    p = e / (1.0 + e)
+            except (OverflowError, ValueError) as exc:
+                raise FloatingPointError(
+                    "non-finite prediction encountered"
+                ) from exc
+            if not math.isfinite(p):
+                raise FloatingPointError("non-finite prediction encountered")
+            if p == 0:
+                p = 0.0
+            results.append(p)
+        return results
+
 
 def _check_label_vector(y, n):
     """Validate an integer class-label vector with the same length as X."""
@@ -10657,15 +10711,16 @@ def loads(text):
     ``str`` holding compact JSON with no whitespace, no duplicate keys,
     the exact key sets in order, JSON integers for integer parameters,
     10-decimal fixed-point numbers for floats, and consistent array
-    shapes. Anything else -- including non-str input, empty strings,
-    parse failures, booleans, exponent notation, non-finite values, or
-    illegal parameters -- raises ValueError. The returned model is
-    independent of the input and fitted; KMeans recovers its column count
-    from centroid width, the linear models from the length of ``w``, and
-    StandardScaler and DecisionTreeClassifier from ``n_features_in``.
+    shapes. Anything else -- including non-str input (str subclasses
+    included), empty strings, parse failures, booleans, exponent
+    notation, non-finite values, or illegal parameters -- raises
+    ValueError. The returned model is independent of the input and
+    fitted; KMeans recovers its column count from centroid width, the
+    linear models from the length of ``w``, and StandardScaler and
+    DecisionTreeClassifier from ``n_features_in``.
     The argument is not modified.
     """
-    if not isinstance(text, str) or len(text) == 0:
+    if type(text) is not str or len(text) == 0:
         raise ValueError("loads requires a non-empty str")
     if _JSON_WS_RE.search(text):
         raise ValueError("serialized model must contain no whitespace")
