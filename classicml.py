@@ -159,6 +159,7 @@ __all__ = [
     "r2_score",
     "explained_variance_score",
     "mean_absolute_percentage_error",
+    "mean_squared_percentage_error",
     "mean_pinball_loss",
     "d2_pinball_score",
     "mean_huber_loss",
@@ -2837,6 +2838,179 @@ def mean_absolute_percentage_error(y_true, y_pred, sample_weight=None) -> float:
     if not math.isfinite(result):
         raise FloatingPointError(
             "non-finite value encountered during mean absolute "
+            "percentage error"
+        )
+    if result == 0:
+        result = 0.0
+    return result
+
+
+def mean_squared_percentage_error(y_true, y_pred, sample_weight=None) -> float:
+    """Return the weighted mean squared percentage error (MSPE).
+
+    ``y_true`` and ``y_pred`` must be non-empty lists of equal length
+    whose elements are finite values of type exactly ``int`` or
+    ``float`` (booleans are rejected). ``sample_weight`` must be
+    ``None`` -- every sample then weighs ``1.0`` -- or a list of the
+    same length whose elements are finite non-negative values of type
+    exactly ``int`` or ``float`` (booleans are rejected). Any
+    container, length, type, range, or finiteness violation (including
+    ``OverflowError`` raised by ``math.isfinite``) raises ValueError.
+
+    After validation, the values and weights are converted to
+    ``float`` in input order. For each index, with ``t`` the true
+    value, ``p`` the prediction, and ``w`` the weight, the squared
+    percentage error is
+    ``e = (t - p) / max(abs(t), sys.float_info.epsilon)`` -- when
+    ``t`` is zero, ``sys.float_info.epsilon`` serves as the
+    denominator -- and ``math.fsum`` computes both ``W = sum(w)`` and
+    ``L = sum(w * e ** 2)``. When ``math.fsum`` overflows or fails
+    while computing ``W``, or ``W`` is not finite or ``W <= 0``, a
+    ValueError is raised. The result is ``L / W``. Apart from the
+    validation and the total-weight checks above, overflow, invalid
+    operations, or division by zero during the post-validation
+    conversion or arithmetic, and non-finite intermediate values or
+    results, raise FloatingPointError. An exact zero result is
+    normalized to ``0.0``.
+
+    The return value is a float. The inputs are not modified.
+    Deterministic: same inputs, same result.
+    """
+    n = _check_metric_vectors(y_true, y_pred)
+    for name, values in (("y_true", y_true), ("y_pred", y_pred)):
+        for value in values:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "%s must contain only finite non-boolean numbers" % name
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "%s must contain only finite non-boolean numbers" % name
+                ) from exc
+            if not finite:
+                raise ValueError(
+                    "%s must contain only finite non-boolean numbers" % name
+                )
+
+    if sample_weight is not None:
+        if not isinstance(sample_weight, list) or len(sample_weight) != n:
+            raise ValueError(
+                "sample_weight must be a list with the same length as "
+                "y_true"
+            )
+        for value in sample_weight:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                ) from exc
+            if not finite or value < 0:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+
+    try:
+        t = [float(value) for value in y_true]
+        p = [float(value) for value in y_pred]
+        if sample_weight is None:
+            w = [1.0] * n
+        else:
+            w = [float(value) for value in sample_weight]
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during mean squared "
+            "percentage error"
+        ) from exc
+    for values in (t, p, w):
+        for value in values:
+            if not math.isfinite(value):
+                raise FloatingPointError(
+                    "non-finite value encountered during mean squared "
+                    "percentage error"
+                )
+
+    weight_terms = []
+    loss_terms = []
+    for i in range(n):
+        try:
+            abs_true = abs(t[i])
+            diff = t[i] - p[i]
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during mean squared "
+                "percentage error"
+            ) from exc
+        if not math.isfinite(abs_true) or not math.isfinite(diff):
+            raise FloatingPointError(
+                "non-finite value encountered during mean squared "
+                "percentage error"
+            )
+        denom = max(abs_true, sys.float_info.epsilon)
+        try:
+            error = diff / denom
+            squared = error ** 2
+            term = w[i] * squared
+        except (OverflowError, ValueError, ZeroDivisionError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during mean squared "
+                "percentage error"
+            ) from exc
+        if (
+            not math.isfinite(error)
+            or not math.isfinite(squared)
+            or not math.isfinite(term)
+        ):
+            raise FloatingPointError(
+                "non-finite value encountered during mean squared "
+                "percentage error"
+            )
+        weight_terms.append(w[i])
+        loss_terms.append(term)
+
+    try:
+        total_weight = math.fsum(weight_terms)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError("the total weight must be a finite number") from exc
+    if not math.isfinite(total_weight):
+        raise ValueError("the total weight must be a finite number")
+    if total_weight <= 0.0:
+        raise ValueError("the total weight must be greater than 0")
+    try:
+        total_loss = math.fsum(loss_terms)
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during mean squared "
+            "percentage error"
+        ) from exc
+    if not math.isfinite(total_loss):
+        raise FloatingPointError(
+            "non-finite value encountered during mean squared "
+            "percentage error"
+        )
+    try:
+        result = total_loss / total_weight
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during mean squared "
+            "percentage error"
+        ) from exc
+    if not math.isfinite(result):
+        raise FloatingPointError(
+            "non-finite value encountered during mean squared "
             "percentage error"
         )
     if result == 0:
