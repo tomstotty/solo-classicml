@@ -86,6 +86,9 @@ Exports:
         dispersion, each divided by its degrees of freedom.
     adjusted_rand_score -- exact adjusted Rand index of two integer
         partitions, computed with fractions.Fraction and returned as float.
+    fowlkes_mallows_score -- Fowlkes-Mallows index of two integer
+        partitions: TP / sqrt(P * Q) from the exact integer contingency
+        table.
     normalized_mutual_info_score -- mutual information of two integer
         partitions normalized by the geometric mean of their entropies.
     adjusted_mutual_info_score -- mutual information of two integer
@@ -188,6 +191,7 @@ __all__ = [
     "davies_bouldin_score",
     "calinski_harabasz_score",
     "adjusted_rand_score",
+    "fowlkes_mallows_score",
     "normalized_mutual_info_score",
     "adjusted_mutual_info_score",
     "homogeneity_completeness_v_measure",
@@ -7173,6 +7177,74 @@ def adjusted_rand_score(labels_true, labels_pred):
     if denominator == 0:
         return 1.0
     result = float((Fraction(index) - expected) / denominator)
+    if result == 0:
+        return 0.0
+    return result
+
+
+def fowlkes_mallows_score(labels_true, labels_pred):
+    """Return the Fowlkes-Mallows index of two integer label partitions.
+
+    Both arguments must be non-empty lists of equal length whose elements
+    are exactly ``int`` (booleans are rejected). The inputs are not
+    modified. Deterministic: same inputs, same result.
+
+    Rows and columns of the contingency table correspond to the distinct
+    labels of ``labels_true`` and ``labels_pred`` respectively, each in
+    ascending label order; contingency counts ``n_ij`` accumulate by
+    sample index, with row sums ``a_i`` and column sums ``b_j`` taken in
+    that order. With ``C(x) = x * (x - 1) // 2``, ``TP = sum C(n_ij)``,
+    ``P = sum C(a_i)``, and ``Q = sum C(b_j)`` are accumulated exactly as
+    Python integers in that order. When ``P * Q == 0`` the result is
+    ``0.0``; otherwise the result is ``TP / math.sqrt(P * Q)`` as a
+    ``float``, with an exact zero normalized to ``0.0``. If ``math.sqrt``,
+    the integer-to-float conversion, or the division raises
+    ``OverflowError``/``ValueError``, or if the denominator or the result
+    is not finite, ``FloatingPointError`` is raised.
+    """
+    n = _check_metric_vectors(labels_true, labels_pred)
+    for value in labels_true:
+        if type(value) is not int:
+            raise ValueError("labels_true must contain only integers")
+    for value in labels_pred:
+        if type(value) is not int:
+            raise ValueError("labels_pred must contain only integers")
+
+    def comb2(x):
+        return x * (x - 1) // 2
+
+    row_labels = sorted(set(labels_true))
+    col_labels = sorted(set(labels_pred))
+    row_index = {label: i for i, label in enumerate(row_labels)}
+    col_index = {label: j for j, label in enumerate(col_labels)}
+
+    counts = [[0] * len(col_labels) for _ in row_labels]
+    for i in range(n):
+        counts[row_index[labels_true[i]]][col_index[labels_pred[i]]] += 1
+
+    row_sums = [sum(row) for row in counts]
+    col_sums = [
+        sum(counts[i][j] for i in range(len(row_labels)))
+        for j in range(len(col_labels))
+    ]
+
+    tp = sum(comb2(value) for row in counts for value in row)
+    p = sum(comb2(value) for value in row_sums)
+    q = sum(comb2(value) for value in col_sums)
+
+    if p * q == 0:
+        return 0.0
+    try:
+        denominator = math.sqrt(p * q)
+        result = tp / denominator
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "fowlkes_mallows_score result is not representable"
+        ) from exc
+    if not math.isfinite(denominator) or not math.isfinite(result):
+        raise FloatingPointError(
+            "fowlkes_mallows_score result is not finite"
+        )
     if result == 0:
         return 0.0
     return result
