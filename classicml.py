@@ -21,6 +21,8 @@ Exports:
         vectors agree.
     mean_squared_error -- mean of squared element-wise differences of two
         finite real vectors.
+    max_error -- largest absolute element-wise difference of two finite
+        real vectors.
     mean_absolute_error -- weighted mean of element-wise absolute
         differences of two finite real vectors.
     median_absolute_error -- weighted median of element-wise absolute
@@ -140,6 +142,7 @@ __all__ = [
     "PCA",
     "accuracy_score",
     "mean_squared_error",
+    "max_error",
     "mean_absolute_error",
     "median_absolute_error",
     "mean_squared_log_error",
@@ -1514,6 +1517,84 @@ def mean_squared_error(y_true, y_pred):
     if result == 0:
         result = 0.0
     return result
+
+
+def max_error(y_true, y_pred) -> float:
+    """Return the largest absolute element-wise prediction error.
+
+    Both arguments must be non-empty lists of equal length whose elements
+    are finite values of type exactly ``int`` or ``float`` (booleans and
+    numeric subclasses are rejected). Any container, empty-list, length,
+    type, or finiteness violation (including ``OverflowError`` raised by
+    ``math.isfinite``) raises ValueError.
+
+    After validation, both sides are converted to ``float`` in input
+    index order and, for each index, ``r_i = abs(t_i - p_i)`` is
+    computed. Residuals are compared in order of appearance and a
+    residual is kept only when it is strictly greater than the current
+    maximum, so the first residual attaining the maximum is retained.
+    Overflow, invalid operations during the post-validation float
+    conversion, subtraction, absolute value, or comparison, and any
+    non-finite intermediate value raise FloatingPointError. An exact
+    zero result is normalized to positive ``0.0``.
+
+    The return value is a float. The inputs are not modified.
+    Deterministic: same inputs, same result.
+    """
+    n = _check_metric_vectors(y_true, y_pred)
+    for name, values in (("y_true", y_true), ("y_pred", y_pred)):
+        for value in values:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "%s must contain only finite non-boolean numbers" % name
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "%s must contain only finite non-boolean numbers" % name
+                ) from exc
+            if not finite:
+                raise ValueError(
+                    "%s must contain only finite non-boolean numbers" % name
+                )
+
+    maximum = 0.0
+    for i in range(n):
+        try:
+            t_i = float(y_true[i])
+            p_i = float(y_pred[i])
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during max error"
+            ) from exc
+        if not math.isfinite(t_i) or not math.isfinite(p_i):
+            raise FloatingPointError(
+                "non-finite value encountered during max error"
+            )
+        try:
+            residual = abs(t_i - p_i)
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during max error"
+            ) from exc
+        if not math.isfinite(residual):
+            raise FloatingPointError(
+                "non-finite value encountered during max error"
+            )
+        try:
+            strictly_greater = residual > maximum
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during max error"
+            ) from exc
+        if strictly_greater:
+            maximum = residual
+    if maximum == 0:
+        maximum = 0.0
+    return maximum
 
 
 def mean_absolute_error(y_true, y_pred, sample_weight=None) -> float:
