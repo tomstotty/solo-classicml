@@ -29,6 +29,9 @@ Exports:
         finite real vectors.
     mean_squared_log_error -- weighted mean squared logarithmic error of
         two finite non-negative real vectors.
+    root_mean_squared_log_error -- square root of the weighted mean
+        squared logarithmic error of two finite non-negative real
+        vectors.
     r2_score -- coefficient of determination of two finite real vectors,
         optionally weighted.
     explained_variance_score -- weighted explained variance regression
@@ -146,6 +149,7 @@ __all__ = [
     "median_absolute_error",
     "max_error",
     "mean_squared_log_error",
+    "root_mean_squared_log_error",
     "r2_score",
     "explained_variance_score",
     "mean_absolute_percentage_error",
@@ -2024,6 +2028,54 @@ def mean_squared_log_error(y_true, y_pred, sample_weight=None) -> float:
     if not math.isfinite(result):
         raise FloatingPointError(
             "non-finite value encountered during mean squared log error"
+        )
+    if result == 0:
+        result = 0.0
+    return result
+
+
+def root_mean_squared_log_error(y_true, y_pred, sample_weight=None) -> float:
+    """Return the weighted root mean squared logarithmic error.
+
+    ``y_true``, ``y_pred``, and ``sample_weight`` follow exactly the
+    validation rules of :func:`mean_squared_log_error`: ``y_true`` and
+    ``y_pred`` must be non-empty lists of equal length whose elements
+    are finite non-negative values of type exactly ``int`` or ``float``
+    (booleans are rejected), and ``sample_weight`` must be ``None`` --
+    every sample then weighs ``1.0`` -- or a list of the same length
+    whose elements follow the same rules, with a total weight greater
+    than zero. Any container, length, type, range, or finiteness
+    violation raises ValueError; every exception raised by the
+    underlying ``mean_squared_log_error`` call propagates unchanged.
+
+    The implementation obtains the mean squared logarithmic error
+    ``m`` from ``mean_squared_log_error(y_true, y_pred, sample_weight)``
+    and returns ``math.sqrt(m)``. ``m`` must be a finite non-negative
+    float; if it is not, if ``math.sqrt`` raises ``OverflowError`` or
+    ``ValueError``, or if the square root is non-finite, a
+    FloatingPointError is raised. An exact zero ``m`` yields positive
+    ``0.0``.
+
+    The return value is a float. The inputs are not modified.
+    Deterministic: same inputs, same result.
+    """
+    m = mean_squared_log_error(y_true, y_pred, sample_weight)
+    if type(m) is not float or not math.isfinite(m) or m < 0:
+        raise FloatingPointError(
+            "non-finite value encountered during root mean squared log "
+            "error"
+        )
+    try:
+        result = math.sqrt(m)
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during root mean squared log "
+            "error"
+        ) from exc
+    if not math.isfinite(result):
+        raise FloatingPointError(
+            "non-finite value encountered during root mean squared log "
+            "error"
         )
     if result == 0:
         result = 0.0
