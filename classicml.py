@@ -9828,6 +9828,8 @@ _SERIAL_KEYS_KMEANS = (
 _SERIAL_KEYS_PCA = ("class", "mean", "components")
 _SERIAL_KEYS_LINEAR = ("class", "lr", "l2", "max_iter", "tol", "w", "b")
 _SERIAL_KEYS_SCALER = ("class", "n_features_in", "mean", "scale")
+_SERIAL_KEYS_TREE = ("class", "max_depth", "n_features_in", "tree")
+_SERIAL_KEYS_TREE_NODE = ("label", "feature", "threshold", "left", "right")
 
 
 def _quantize_fixed(value):
@@ -9886,16 +9888,21 @@ def _encode_vector(vector, length):
 
 def dumps(model):
     """Serialize a fitted KMeans, PCA, LinearRegression,
-    LogisticRegression, or StandardScaler model to compact JSON text.
+    LogisticRegression, StandardScaler, or DecisionTreeClassifier model
+    to compact JSON text.
 
     The result contains no whitespace and no trailing newline. Integers
-    (``n_clusters``, ``max_iter``, ``seed``, ``n_features_in``) are emitted
-    as JSON integers; ``lr``, ``l2``, ``tol``, ``b`` and every array
-    coordinate is quantized to 10 decimal places with ROUND_HALF_UP
-    (negative zero becomes ``0.0000000000``). A positive ``lr``/``tol``
-    that quantizes to zero is rejected, as are any non-fitted models,
-    unsupported objects, invalid construction parameters, and malformed
-    or non-finite state. The argument is not modified.
+    (``n_clusters``, ``max_iter``, ``seed``, ``n_features_in``,
+    ``max_depth``, node ``label``/``feature``) are emitted as JSON
+    integers; ``lr``, ``l2``, ``tol``, ``b``, node ``threshold`` and
+    every array coordinate is quantized to 10 decimal places with
+    ROUND_HALF_UP (negative zero becomes ``0.0000000000``). A tree with
+    ``max_depth=None`` emits ``"max_depth":"none"``; leaf nodes emit
+    ``"feature":-1,"threshold":0.0000000000,"left":[],"right":[]``. A
+    positive ``lr``/``tol`` that quantizes to zero is rejected, as are
+    any non-fitted models, unsupported objects, invalid construction
+    parameters, and malformed or non-finite state. The argument is not
+    modified.
     """
     if isinstance(model, KMeans):
         try:
@@ -9929,9 +9936,18 @@ def dumps(model):
         except Exception as exc:
             raise ValueError("invalid StandardScaler state") from exc
 
+    if isinstance(model, DecisionTreeClassifier):
+        try:
+            return _dumps_tree(model)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("invalid DecisionTreeClassifier state") from exc
+
     raise ValueError(
         "dumps only supports fitted KMeans, PCA, LinearRegression, "
-        "LogisticRegression, and StandardScaler models"
+        "LogisticRegression, StandardScaler, and DecisionTreeClassifier "
+        "models"
     )
 
 
@@ -10143,6 +10159,92 @@ def _quantize_state_number(value):
     if decimal_value == 0:
         return "0.0000000000"
     return format(decimal_value, "f")
+
+
+def _dumps_tree(model):
+    """Serialize a fitted DecisionTreeClassifier.
+
+    ``max_depth`` is emitted as a positive JSON integer, or the string
+    ``"none"`` when the tree is depth-unconstrained. ``_n_features``
+    must be a positive exact int and the root a well-formed node: leaves
+    carry no threshold or children and are emitted with ``feature`` -1,
+    ``threshold`` 0.0000000000 and empty child arrays; internal nodes
+    carry an exact-int feature in ``[0, n_features_in)``, a finite
+    threshold quantized literally with ``Decimal(str(v))`` (10 places,
+    ROUND_HALF_UP, negative zero normalized), and two node children.
+    """
+    root = model._root
+    n_features = model._n_features
+    if root is None or n_features is None:
+        raise ValueError(
+            "DecisionTreeClassifier must be fitted before dumps is called"
+        )
+    max_depth = model.max_depth
+    # Re-validate the construction parameter exactly as __init__ does.
+    if max_depth is not None and (
+        type(max_depth) is not int or max_depth < 1
+    ):
+        raise ValueError(
+            "DecisionTreeClassifier has invalid construction parameters"
+        )
+    if type(n_features) is not int or n_features <= 0:
+        raise ValueError("n_features_in must be a positive integer")
+    if max_depth is None:
+        depth_text = '"none"'
+    else:
+        depth_text = str(max_depth)
+    return (
+        '{"class":"DecisionTreeClassifier","max_depth":'
+        + depth_text
+        + ',"n_features_in":'
+        + str(n_features)
+        + ',"tree":'
+        + _dump_tree_node(root, n_features)
+        + "}"
+    )
+
+
+def _dump_tree_node(node, n_features):
+    if not isinstance(node, _DecisionTreeNode):
+        raise ValueError("tree must contain only decision tree nodes")
+    label = node.label
+    if type(label) is not int:
+        raise ValueError("node labels must be integers")
+    feature = node.feature
+    if feature is None:
+        if (
+            node.threshold is not None
+            or node.left is not None
+            or node.right is not None
+        ):
+            raise ValueError(
+                "leaf nodes must have no threshold or children"
+            )
+        return (
+            '{"label":'
+            + str(label)
+            + ',"feature":-1,"threshold":0.0000000000,"left":[],"right":[]}'
+        )
+    if type(feature) is not int or not 0 <= feature < n_features:
+        raise ValueError(
+            "internal node feature must be an integer in "
+            "[0, n_features_in)"
+        )
+    _require_scaler_number(node.threshold, "threshold")
+    threshold_text = _quantize_state_number(node.threshold)
+    return (
+        '{"label":'
+        + str(label)
+        + ',"feature":'
+        + str(feature)
+        + ',"threshold":'
+        + threshold_text
+        + ',"left":'
+        + _dump_tree_node(node.left, n_features)
+        + ',"right":'
+        + _dump_tree_node(node.right, n_features)
+        + "}"
+    )
 
 
 _JSON_INT_RE = re.compile(r"^(0|-?[1-9][0-9]*)$")
@@ -10475,9 +10577,76 @@ def _load_scaler(pairs):
     return model
 
 
+def _load_tree(pairs):
+    keys = tuple(key for key, _ in pairs)
+    if keys != _SERIAL_KEYS_TREE:
+        raise ValueError(
+            "DecisionTreeClassifier JSON must have exactly the "
+            "serialized keys in the serialized order"
+        )
+    data = _convert(pairs)
+
+    class_name = data["class"]
+    if not isinstance(class_name, str) or class_name != "DecisionTreeClassifier":
+        raise ValueError('class must be "DecisionTreeClassifier"')
+
+    depth_entry = data["max_depth"]
+    if isinstance(depth_entry, str):
+        if depth_entry != "none":
+            raise ValueError('max_depth must be a positive integer or "none"')
+        max_depth = None
+    else:
+        max_depth = _expect_int(depth_entry, "max_depth")
+        if max_depth < 1:
+            raise ValueError("max_depth must be a positive integer")
+
+    n_features = _expect_int(data["n_features_in"], "n_features_in")
+    if n_features <= 0:
+        raise ValueError("n_features_in must be greater than 0")
+
+    root = _load_tree_node(data["tree"], n_features)
+
+    model = DecisionTreeClassifier(max_depth=max_depth)
+    model._root = root
+    model._n_features = n_features
+    return model
+
+
+def _load_tree_node(node, n_features):
+    if not isinstance(node, dict) or tuple(node.keys()) != _SERIAL_KEYS_TREE_NODE:
+        raise ValueError(
+            "tree nodes must be objects with exactly the keys "
+            "label, feature, threshold, left, right in that order"
+        )
+    label = _expect_int(node["label"], "label")
+    feature = _expect_int(node["feature"], "feature")
+    if feature == -1:
+        threshold = _expect_fixed(node["threshold"], "threshold")
+        if threshold != 0.0:
+            raise ValueError(
+                "leaf nodes must have threshold 0.0000000000"
+            )
+        for child in (node["left"], node["right"]):
+            if not isinstance(child, list) or len(child) != 0:
+                raise ValueError(
+                    "leaf nodes must have empty left and right arrays"
+                )
+        return _DecisionTreeNode(label)
+    if feature < 0 or feature >= n_features:
+        raise ValueError("feature must be in [0, n_features_in)")
+    threshold = _expect_fixed(node["threshold"], "threshold")
+    result = _DecisionTreeNode(label)
+    result.feature = feature
+    result.threshold = threshold
+    result.left = _load_tree_node(node["left"], n_features)
+    result.right = _load_tree_node(node["right"], n_features)
+    return result
+
+
 def loads(text):
     """Reconstruct a fitted KMeans, PCA, LinearRegression,
-    LogisticRegression, or StandardScaler from text produced by dumps.
+    LogisticRegression, StandardScaler, or DecisionTreeClassifier from
+    text produced by dumps.
 
     Only the exact byte format emitted by :func:`dumps` is accepted: a
     ``str`` holding compact JSON with no whitespace, no duplicate keys,
@@ -10487,8 +10656,9 @@ def loads(text):
     parse failures, booleans, exponent notation, non-finite values, or
     illegal parameters -- raises ValueError. The returned model is
     independent of the input and fitted; KMeans recovers its column count
-    from centroid width, the linear models from the length of ``w``, and
-    StandardScaler from ``n_features_in``. The argument is not modified.
+    from centroid width, the linear models from the length of ``w``,
+    StandardScaler from ``n_features_in``, and DecisionTreeClassifier
+    from its own ``n_features_in``. The argument is not modified.
     """
     if not isinstance(text, str) or len(text) == 0:
         raise ValueError("loads requires a non-empty str")
@@ -10544,6 +10714,13 @@ def loads(text):
     if class_entry == "StandardScaler":
         try:
             return _load_scaler(pairs)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("malformed serialized model") from exc
+    if class_entry == "DecisionTreeClassifier":
+        try:
+            return _load_tree(pairs)
         except ValueError:
             raise
         except Exception as exc:
