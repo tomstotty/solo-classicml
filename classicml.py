@@ -15,6 +15,8 @@ Exports:
         population standard deviation.
     KMeans -- deterministic k-means clustering with Lloyd's iterations and
         seeded centroid initialization.
+    DBSCAN -- deterministic density-based clustering with a fixed
+        neighborhood radius and minimum-neighbor count.
     PCA -- deterministic first-principal-component projection for
         two-dimensional data.
     accuracy_score -- fraction of positions where two integer label
@@ -148,6 +150,7 @@ import math
 import random
 import re
 import sys
+from collections import deque
 from decimal import Decimal, ROUND_HALF_UP, localcontext
 from fractions import Fraction
 
@@ -159,6 +162,7 @@ __all__ = [
     "RandomForestClassifier",
     "StandardScaler",
     "KMeans",
+    "DBSCAN",
     "PCA",
     "accuracy_score",
     "mean_squared_error",
@@ -1401,6 +1405,115 @@ class KMeans:
     def fit_predict(self, X):
         self.fit(X)
         return self.predict(X)
+
+
+class DBSCAN:
+    """Deterministic density-based clustering.
+
+    Two points are neighbors when their squared Euclidean distance,
+    computed as ``math.fsum`` of the squared coordinate differences in
+    column order, is at most ``eps ** 2``; every point is its own
+    neighbor. A point with at least ``min_samples`` neighbors is a core
+    point. Core points are scanned in ascending index order; when an
+    unclustered core point is found it starts a new cluster (numbered in
+    discovery order from 0) and expands it with a FIFO queue: each
+    neighbor of a dequeued core point is enqueued in ascending index
+    order when it has not been enqueued before, and every reached point
+    joins the cluster. Afterwards, each non-core point receives the
+    smallest cluster number found among its core neighbors, or ``-1``
+    when it has none. Neighbor lists are cached in ascending index
+    order. Neither method modifies its input. The same inputs always
+    give the same result.
+
+    After a successful fit, ``labels_`` is a list of integers in input
+    order; it is ``None`` initially and after a failed fit.
+    ``fit_predict`` fits and returns a fresh copy of ``labels_``; an
+    exception raised by ``fit`` propagates unchanged. Overflow or a
+    non-finite result during distance computation raises
+    FloatingPointError.
+    """
+
+    def __init__(self, eps=0.5, min_samples=5):
+        if type(eps) not in (int, float) or not math.isfinite(eps):
+            raise ValueError("eps must be a finite non-boolean real number")
+        if eps <= 0:
+            raise ValueError("eps must be greater than 0")
+        if type(min_samples) is not int or min_samples <= 0:
+            raise ValueError(
+                "min_samples must be a positive integer"
+            )
+
+        self.eps = eps
+        self.min_samples = min_samples
+        self.labels_ = None
+
+    def fit(self, X):
+        self.labels_ = None
+
+        _check_exact_matrix(X)
+        n = len(X)
+        try:
+            eps_squared = self.eps * self.eps
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during fit"
+            ) from exc
+        if isinstance(eps_squared, float) and not math.isfinite(eps_squared):
+            raise FloatingPointError(
+                "non-finite value encountered during fit"
+            )
+
+        neighbors = []
+        for i in range(n):
+            nearby = []
+            for j in range(n):
+                if i == j:
+                    nearby.append(j)
+                    continue
+                if _squared_distance(X[i], X[j]) <= eps_squared:
+                    nearby.append(j)
+            neighbors.append(nearby)
+
+        core = [
+            len(neighbors[i]) >= self.min_samples for i in range(n)
+        ]
+
+        labels = [-1] * n
+        enqueued = [False] * n
+        cluster_id = -1
+
+        for i in range(n):
+            if not core[i] or enqueued[i]:
+                continue
+            cluster_id += 1
+            labels[i] = cluster_id
+            queue = deque([i])
+            enqueued[i] = True
+            while queue:
+                point = queue.popleft()
+                if not core[point]:
+                    continue
+                for j in neighbors[point]:
+                    if not enqueued[j]:
+                        enqueued[j] = True
+                        labels[j] = cluster_id
+                        if core[j]:
+                            queue.append(j)
+
+        for i in range(n):
+            if core[i]:
+                continue
+            for j in neighbors[i]:
+                if core[j]:
+                    if labels[i] == -1 or labels[j] < labels[i]:
+                        labels[i] = labels[j]
+
+        self.labels_ = labels
+        return self
+
+    def fit_predict(self, X) -> "list[int]":
+        self.fit(X)
+        return list(self.labels_)
 
 
 class PCA:
