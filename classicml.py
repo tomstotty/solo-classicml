@@ -142,6 +142,7 @@ __all__ = [
     "explained_variance_score",
     "mean_absolute_percentage_error",
     "mean_pinball_loss",
+    "mean_huber_loss",
     "mean_poisson_deviance",
     "mean_gamma_deviance",
     "mean_tweedie_deviance",
@@ -2547,6 +2548,169 @@ def mean_pinball_loss(y_true, y_pred, alpha=0.5, sample_weight=None) -> float:
     if not math.isfinite(result):
         raise FloatingPointError(
             "non-finite value encountered during mean pinball loss"
+        )
+    if result == 0:
+        result = 0.0
+    return result
+
+
+def mean_huber_loss(y_true, y_pred, delta=1.0, sample_weight=None) -> float:
+    """Return the weighted mean Huber loss.
+
+    ``y_true`` and ``y_pred`` must be non-empty lists of equal length
+    whose elements are finite values of type exactly ``int`` or
+    ``float`` (booleans are rejected). ``delta`` must be a finite value
+    of type exactly ``int`` or ``float`` (booleans are rejected) and
+    strictly greater than zero. ``sample_weight`` must be ``None`` --
+    every sample then weighs ``1.0`` -- or a list of the same length
+    whose elements are finite non-negative values of type exactly
+    ``int`` or ``float`` (booleans are rejected). Any container, length,
+    type, range, or finiteness violation (including ``OverflowError``
+    raised by ``math.isfinite``) raises ValueError.
+
+    After validation, the values, delta, and weights are converted to
+    ``float`` in input order. ``math.fsum`` computes the total weight
+    ``W = sum(w_i)``; if that summation overflows or is invalid, is
+    non-finite, or ``W`` is less than or equal to zero, a ValueError is
+    raised. For each index, with ``r = y_true_i - y_pred_i`` and
+    ``a = abs(r)``, the per-sample loss is ``l = 0.5 * r * r`` when
+    ``a <= delta`` and ``l = delta * (a - 0.5 * delta)`` otherwise. In
+    input order, ``math.fsum`` computes ``L = sum(w_i * l_i)`` and the
+    result is ``L / W``. Overflow, invalid operations during the
+    post-validation conversion or arithmetic, and non-finite
+    intermediate values or results raise FloatingPointError. An exact
+    zero result is normalized to ``0.0``.
+
+    The return value is a float. The inputs are not modified.
+    Deterministic: same inputs, same result.
+    """
+    n = _check_metric_vectors(y_true, y_pred)
+    for name, values in (("y_true", y_true), ("y_pred", y_pred)):
+        for value in values:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "%s must contain only finite non-boolean numbers" % name
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "%s must contain only finite non-boolean numbers" % name
+                ) from exc
+            if not finite:
+                raise ValueError(
+                    "%s must contain only finite non-boolean numbers" % name
+                )
+
+    if type(delta) not in (int, float):
+        raise ValueError("delta must be a finite non-boolean number > 0")
+    try:
+        delta_finite = math.isfinite(delta)
+    except OverflowError as exc:
+        raise ValueError(
+            "delta must be a finite non-boolean number > 0"
+        ) from exc
+    if not delta_finite or delta <= 0:
+        raise ValueError("delta must be a finite non-boolean number > 0")
+
+    if sample_weight is not None:
+        if not isinstance(sample_weight, list) or len(sample_weight) != n:
+            raise ValueError(
+                "sample_weight must be a list with the same length as "
+                "y_true"
+            )
+        for value in sample_weight:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                ) from exc
+            if not finite or value < 0:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+
+    try:
+        t = [float(value) for value in y_true]
+        p = [float(value) for value in y_pred]
+        d = float(delta)
+        if sample_weight is None:
+            w = [1.0] * n
+        else:
+            w = [float(value) for value in sample_weight]
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during mean huber loss"
+        ) from exc
+    for values in (t, p, w):
+        for value in values:
+            if not math.isfinite(value):
+                raise FloatingPointError(
+                    "non-finite value encountered during mean huber loss"
+                )
+    if not math.isfinite(d):
+        raise FloatingPointError(
+            "non-finite value encountered during mean huber loss"
+        )
+
+    try:
+        total_weight = math.fsum(w)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError("the total weight must be greater than 0") from exc
+    if not math.isfinite(total_weight) or total_weight <= 0.0:
+        raise ValueError("the total weight must be greater than 0")
+
+    loss_terms = []
+    for i in range(n):
+        try:
+            r = t[i] - p[i]
+            a = abs(r)
+            if a <= d:
+                loss = 0.5 * r * r
+            else:
+                loss = d * (a - 0.5 * d)
+            term = w[i] * loss
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during mean huber loss"
+            ) from exc
+        if not math.isfinite(loss) or not math.isfinite(term):
+            raise FloatingPointError(
+                "non-finite value encountered during mean huber loss"
+            )
+        loss_terms.append(term)
+
+    try:
+        total_loss = math.fsum(loss_terms)
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during mean huber loss"
+        ) from exc
+    if not math.isfinite(total_loss):
+        raise FloatingPointError(
+            "non-finite value encountered during mean huber loss"
+        )
+    try:
+        result = total_loss / total_weight
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during mean huber loss"
+        ) from exc
+    if not math.isfinite(result):
+        raise FloatingPointError(
+            "non-finite value encountered during mean huber loss"
         )
     if result == 0:
         result = 0.0
