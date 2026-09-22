@@ -76,6 +76,8 @@ Exports:
         the probability of the true class clamped away from zero.
     hinge_loss -- weighted binary hinge loss of a +/-1 label vector and
         a real-valued score vector.
+    logit_loss -- weighted binary logistic (cross-entropy) loss of a
+        binary label vector and an unconstrained real score vector.
     multiclass_hinge_loss -- weighted multiclass Crammer-Singer hinge
         loss over a score matrix with one column per class.
     silhouette_score -- mean silhouette coefficient of a clustering over
@@ -195,6 +197,7 @@ __all__ = [
     "log_loss",
     "multiclass_log_loss",
     "hinge_loss",
+    "logit_loss",
     "multiclass_hinge_loss",
     "silhouette_score",
     "silhouette_samples",
@@ -6928,6 +6931,177 @@ def hinge_loss(y_true, y_pred, sample_weight=None) -> float:
     if not math.isfinite(total_loss) or not math.isfinite(result):
         raise FloatingPointError(
             "non-finite value encountered during hinge loss computation"
+        )
+    if result == 0:
+        result = 0.0
+    return result
+
+
+def _logit_loss_float(value):
+    """Convert a validated score/weight to float; overflow, invalid
+    operations, and non-finite results raise FloatingPointError."""
+    try:
+        result = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during logit-loss computation"
+        ) from exc
+    if not math.isfinite(result):
+        raise FloatingPointError(
+            "non-finite value encountered during logit-loss computation"
+        )
+    return result
+
+
+def logit_loss(y_true, y_score, pos_label=1, sample_weight=None) -> float:
+    """Compute the weighted binary logistic (cross-entropy) loss of scores.
+
+    ``y_true`` and ``y_score`` must be non-empty lists of equal length.
+    ``y_true`` must contain values of type exactly ``int`` (booleans are
+    rejected) drawn from exactly two distinct labels, and ``pos_label``
+    must be an exact ``int`` equal to one of them. Every element of
+    ``y_score`` must be a finite value of type exactly ``int`` or
+    ``float`` (booleans are rejected). ``sample_weight`` must be
+    ``None`` -- every sample then weighs ``1.0`` -- or a list of the same
+    length whose elements are finite non-negative values of type exactly
+    ``int`` or ``float`` (booleans are rejected). Any violation --
+    container, length, type, label, range, or finiteness checks,
+    including overflow during those checks -- raises ValueError.
+
+    After validation, the scores and weights are converted to ``float``
+    in input order (scores first, then weights) and the converted
+    weights are summed with ``math.fsum``; overflow or an invalid operation during that
+    summation, a non-finite total, or a total that is not greater than
+    zero raises ValueError. For each sample, in input order, ``t_i`` is
+    ``1.0`` when the label equals ``pos_label`` and ``0.0`` otherwise,
+    ``z_i`` is the score, and the per-sample loss is
+    ``max(z_i, 0.0) - t_i * z_i + math.log1p(math.exp(-abs(z_i)))``.
+    The result is ``math.fsum(w_i * loss_i) / W`` with both sums
+    accumulated in input order; an exact zero is normalized to positive
+    ``0.0``. Overflow or invalid operations during the conversion,
+    multiplication, maximum, absolute value, exponent, logarithm,
+    addition, summation, or division, and non-finite intermediate values
+    or results, raise FloatingPointError.
+
+    The return value is a float. The inputs are not modified.
+    Deterministic: same inputs, same result.
+    """
+    if not isinstance(y_true, list) or not isinstance(y_score, list):
+        raise ValueError("y_true and y_score must be lists")
+    if len(y_true) == 0 or len(y_score) == 0:
+        raise ValueError("y_true and y_score must be non-empty lists")
+    if len(y_true) != len(y_score):
+        raise ValueError("y_true and y_score must have the same length")
+    n = len(y_true)
+
+    for value in y_true:
+        if type(value) is not int:
+            raise ValueError("y_true must contain only integers")
+    if type(pos_label) is not int:
+        raise ValueError("pos_label must be an integer")
+    labels = set(y_true)
+    if len(labels) != 2 or pos_label not in labels:
+        raise ValueError(
+            "y_true must contain exactly two distinct labels with "
+            "pos_label among them"
+        )
+
+    for value in y_score:
+        if type(value) not in (int, float):
+            raise ValueError(
+                "y_score must contain only finite non-boolean numbers"
+            )
+        # math.isfinite raises OverflowError for ints too large to
+        # convert to float; such values fail the finite requirement.
+        try:
+            finite = math.isfinite(value)
+        except OverflowError as exc:
+            raise ValueError(
+                "y_score must contain only finite non-boolean numbers"
+            ) from exc
+        if not finite:
+            raise ValueError(
+                "y_score must contain only finite non-boolean numbers"
+            )
+
+    has_weights = sample_weight is not None
+    if has_weights:
+        if not isinstance(sample_weight, list) or len(sample_weight) != n:
+            raise ValueError(
+                "sample_weight must be a list with the same length as "
+                "y_true"
+            )
+        for value in sample_weight:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                ) from exc
+            if not finite or value < 0:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+
+    # After validation, the scores and weights are converted to float
+    # in input order (scores first, then weights); a conversion failure
+    # or a non-finite converted value raises FloatingPointError.
+    scores = [_logit_loss_float(value) for value in y_score]
+    if has_weights:
+        weights = [_logit_loss_float(value) for value in sample_weight]
+    else:
+        weights = [1.0] * n
+
+    # The weights have just been converted to float, so summing them is
+    # still part of the input checks: overflow, invalid operations, a
+    # non-finite total, and a non-positive total all raise ValueError.
+    try:
+        total_weight = math.fsum(weights)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError("the total weight must be greater than 0") from exc
+    if not math.isfinite(total_weight) or total_weight <= 0.0:
+        raise ValueError("the total weight must be greater than 0")
+
+    terms = []
+    for i in range(n):
+        z = scores[i]
+        t = 1.0 if y_true[i] == pos_label else 0.0
+        try:
+            sample_loss = (
+                max(z, 0.0)
+                - t * z
+                + math.log1p(math.exp(-abs(z)))
+            )
+            term = weights[i] * sample_loss
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during logit-loss computation"
+            ) from exc
+        if not math.isfinite(sample_loss) or not math.isfinite(term):
+            raise FloatingPointError(
+                "non-finite value encountered during logit-loss computation"
+            )
+        terms.append(term)
+
+    try:
+        total_loss = math.fsum(terms)
+        result = total_loss / total_weight
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during logit-loss computation"
+        ) from exc
+    if not math.isfinite(total_loss) or not math.isfinite(result):
+        raise FloatingPointError(
+            "non-finite value encountered during logit-loss computation"
         )
     if result == 0:
         result = 0.0
