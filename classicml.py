@@ -8997,6 +8997,7 @@ _SERIAL_KEYS_KMEANS = (
     "cluster_centers",
 )
 _SERIAL_KEYS_PCA = ("class", "mean", "components")
+_SERIAL_KEYS_LINEAR = ("class", "lr", "l2", "max_iter", "tol", "w", "b")
 
 
 def _quantize_fixed(value):
@@ -9054,15 +9055,17 @@ def _encode_vector(vector, length):
 
 
 def dumps(model):
-    """Serialize a fitted KMeans or PCA model to compact JSON text.
+    """Serialize a fitted KMeans, PCA, LinearRegression, or
+    LogisticRegression model to compact JSON text.
 
     The result contains no whitespace and no trailing newline. Integers
     (``n_clusters``, ``max_iter``, ``seed``) are emitted as JSON integers;
-    ``tol`` and every array coordinate is quantized to 10 decimal places
-    with ROUND_HALF_UP (negative zero becomes ``0.0000000000``). A positive
-    ``tol`` that quantizes to zero is rejected, as are any non-fitted
-    models, non-KMeans/PCA objects, invalid construction parameters, and
-    malformed or non-finite state. The argument is not modified.
+    ``lr``, ``l2``, ``tol``, ``b`` and every array coordinate is quantized
+    to 10 decimal places with ROUND_HALF_UP (negative zero becomes
+    ``0.0000000000``). A positive ``lr``/``tol`` that quantizes to zero is
+    rejected, as are any non-fitted models, unsupported objects, invalid
+    construction parameters, and malformed or non-finite state. The
+    argument is not modified.
     """
     if isinstance(model, KMeans):
         try:
@@ -9080,7 +9083,18 @@ def dumps(model):
         except Exception as exc:
             raise ValueError("invalid PCA state") from exc
 
-    raise ValueError("dumps only supports fitted KMeans and PCA models")
+    if isinstance(model, (LinearRegression, LogisticRegression)):
+        try:
+            return _dumps_linear(model)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("invalid linear model state") from exc
+
+    raise ValueError(
+        "dumps only supports fitted KMeans, PCA, LinearRegression, "
+        "and LogisticRegression models"
+    )
 
 
 def _dumps_kmeans(model):
@@ -9155,6 +9169,67 @@ def _dumps_pca(model):
         + mean_text
         + ',"components":'
         + components_text
+        + "}"
+    )
+
+
+def _dumps_linear(model):
+    """Serialize a fitted LinearRegression or LogisticRegression.
+
+    Both classes share the same constructor signature and fitted state
+    (``w``/``b``), so one encoder covers both; the emitted ``class`` is
+    the model's own class name.
+    """
+    w = model.w
+    b = model.b
+    if w is None or b is None:
+        raise ValueError("model must be fitted before dumps is called")
+    lr = model.lr
+    l2 = model.l2
+    max_iter = model.max_iter
+    tol = model.tol
+    # Re-validate the construction parameters exactly as __init__ does.
+    if (
+        not _is_finite_number(lr)
+        or lr <= 0
+        or not _is_finite_number(l2)
+        or l2 < 0
+        or type(max_iter) is not int
+        or max_iter < 1
+        or not _is_finite_number(tol)
+        or tol <= 0
+    ):
+        raise ValueError("model has invalid construction parameters")
+    lr_text = _quantize_fixed(lr)
+    if Decimal(lr_text) == 0:
+        raise ValueError(
+            "lr must remain positive after quantization to 10 decimals"
+        )
+    l2_text = _quantize_fixed(l2)
+    tol_text = _quantize_fixed(tol)
+    if Decimal(tol_text) == 0:
+        raise ValueError(
+            "tol must remain positive after quantization to 10 decimals"
+        )
+    if not isinstance(w, list) or len(w) == 0:
+        raise ValueError("w must be a non-empty list")
+    w_text = "[" + ",".join(_quantize_fixed(v) for v in w) + "]"
+    b_text = _quantize_fixed(b)
+    return (
+        '{"class":"'
+        + type(model).__name__
+        + '","lr":'
+        + lr_text
+        + ',"l2":'
+        + l2_text
+        + ',"max_iter":'
+        + str(max_iter)
+        + ',"tol":'
+        + tol_text
+        + ',"w":'
+        + w_text
+        + ',"b":'
+        + b_text
         + "}"
     )
 
@@ -9422,8 +9497,46 @@ def _load_pca(pairs):
     return model
 
 
+def _load_linear(pairs, model_class, class_name):
+    keys = tuple(key for key, _ in pairs)
+    if keys != _SERIAL_KEYS_LINEAR:
+        raise ValueError("%s JSON must have exactly the serialized keys "
+                         "in the serialized order" % class_name)
+    data = _convert(pairs)
+
+    class_entry = data["class"]
+    if not isinstance(class_entry, str) or class_entry != class_name:
+        raise ValueError('class must be "%s"' % class_name)
+
+    lr = _expect_fixed(data["lr"], "lr")
+    if lr <= 0.0:
+        raise ValueError("lr must be greater than 0")
+    l2 = _expect_fixed(data["l2"], "l2")
+    if l2 < 0.0:
+        raise ValueError("l2 must be non-negative")
+    max_iter = _expect_int(data["max_iter"], "max_iter")
+    if max_iter < 1:
+        raise ValueError("max_iter must be at least 1")
+    tol = _expect_fixed(data["tol"], "tol")
+    if tol <= 0.0:
+        raise ValueError("tol must be greater than 0")
+
+    w_node = data["w"]
+    if not isinstance(w_node, list) or len(w_node) == 0:
+        raise ValueError("w must be a non-empty array")
+    w = [_expect_fixed(v, "w element") for v in w_node]
+
+    b = _expect_fixed(data["b"], "b")
+
+    model = model_class(lr=lr, l2=l2, max_iter=max_iter, tol=tol)
+    model.w = list(w)
+    model.b = b
+    return model
+
+
 def loads(text):
-    """Reconstruct a fitted KMeans or PCA from text produced by dumps.
+    """Reconstruct a fitted KMeans, PCA, LinearRegression, or
+    LogisticRegression from text produced by dumps.
 
     Only the exact byte format emitted by :func:`dumps` is accepted: a
     ``str`` holding compact JSON with no whitespace, no duplicate keys,
@@ -9433,7 +9546,8 @@ def loads(text):
     parse failures, booleans, exponent notation, non-finite values, or
     illegal parameters -- raises ValueError. The returned model is
     independent of the input and fitted; KMeans recovers its column count
-    from centroid width. The argument is not modified.
+    from centroid width, the linear models from the length of ``w``.
+    The argument is not modified.
     """
     if not isinstance(text, str) or len(text) == 0:
         raise ValueError("loads requires a non-empty str")
@@ -9468,6 +9582,20 @@ def loads(text):
     if class_entry == "PCA":
         try:
             return _load_pca(pairs)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("malformed serialized model") from exc
+    if class_entry == "LinearRegression":
+        try:
+            return _load_linear(pairs, LinearRegression, "LinearRegression")
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("malformed serialized model") from exc
+    if class_entry == "LogisticRegression":
+        try:
+            return _load_linear(pairs, LogisticRegression, "LogisticRegression")
         except ValueError:
             raise
         except Exception as exc:
