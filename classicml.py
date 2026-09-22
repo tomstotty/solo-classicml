@@ -21,6 +21,8 @@ Exports:
         neighborhood and a minimum core-point sample count.
     AgglomerativeClustering -- deterministic bottom-up clustering with
         average linkage.
+    GaussianMixture -- deterministic one-dimensional Gaussian mixture
+        model fitted by expectation-maximization from sorted initial means.
     accuracy_score -- fraction of positions where two integer label
         vectors agree.
     mean_squared_error -- weighted mean of squared element-wise
@@ -167,6 +169,7 @@ __all__ = [
     "PCA",
     "DBSCAN",
     "AgglomerativeClustering",
+    "GaussianMixture",
     "accuracy_score",
     "mean_squared_error",
     "root_mean_squared_error",
@@ -1839,6 +1842,276 @@ class AgglomerativeClustering:
                 labels[index] = label
         self.labels_ = labels
         return list(labels)
+
+
+class GaussianMixture:
+    """Deterministic one-dimensional Gaussian mixture model fitted by the
+    expectation-maximization algorithm.
+
+    The ``n_components`` mixture weights, means, and variances start from
+    weights ``1 / n_components``, means equal to the ``n_components``
+    smallest training values in ascending order, and variances ``1.0``.
+    Each round computes, for every sample ``x_i`` and component ``j``, the
+    log responsibility
+
+        ell_ij = log(w_j) - (log(2*pi*v_j) + (x_i - m_j)**2 / v_j) / 2
+
+    and then the softmax responsibilities
+
+        r_ij = exp(ell_ij - a_i) / sum_h exp(ell_ih - a_i),
+
+    where ``a_i = max_j ell_ij``; ties for the largest log responsibility
+    go to the smallest component index. The component parameters are
+    updated synchronously from
+
+        N_j = sum_i r_ij,  w_j = N_j / n,
+        m_j = sum_i r_ij * x_i / N_j,
+        v_j = max(sum_i r_ij * (x_i - m_j)**2 / N_j, 1e-12),
+
+    with all sums accumulated in ascending index order via
+    ``math.fsum``. Rounds stop when the largest absolute change across the
+    three parameter groups is at most ``1e-6``, after at most 100 rounds.
+    An empty component, an arithmetic ``OverflowError``/``ValueError``, or
+    a non-finite result raises FloatingPointError. Neither ``fit`` nor
+    ``predict`` modifies its input, and the same parameters and inputs
+    always give the same result.
+
+    After a successful fit, ``predict`` returns a tuple of the index of
+    the component with the largest responsibility for each input value
+    (ties go to the smallest index) and the responsibility matrix with
+    one row per input value and one column per component in ascending
+    component order.
+    """
+
+    def __init__(self, n_components=2):
+        if type(n_components) is not int or n_components <= 0:
+            raise ValueError("n_components must be a positive integer")
+        self.n_components = n_components
+        self.weights_ = None
+        self.means_ = None
+        self.variances_ = None
+
+    @staticmethod
+    def _check_1d_vector(X):
+        """Validate a non-empty vector whose elements have type exactly
+        ``int`` or ``float`` (booleans and subclasses rejected), with
+        finite values; an overflow raised while checking finiteness of a
+        huge integer is reported as ValueError too."""
+        if not isinstance(X, list) or len(X) == 0:
+            raise ValueError("X must be a non-empty list")
+        for value in X:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "X must contain only finite int or float elements"
+                )
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "X must contain only finite int or float elements"
+                ) from exc
+            if not finite:
+                raise ValueError(
+                    "X must contain only finite int or float elements"
+                )
+
+    @staticmethod
+    def _log_responsibilities(X, weights, means, variances):
+        """Return the n-by-k matrix of unnormalized log responsibilities;
+        any arithmetic failure or non-finite result raises
+        FloatingPointError."""
+        k = len(weights)
+        log_ell = []
+        for x in X:
+            row = []
+            for j in range(k):
+                try:
+                    diff = x - means[j]
+                    square = diff * diff
+                    ell = (
+                        math.log(weights[j])
+                        - (
+                            math.log(2.0 * math.pi * variances[j])
+                            + square / variances[j]
+                        )
+                        / 2.0
+                    )
+                except (OverflowError, ValueError) as exc:
+                    raise FloatingPointError(
+                        "non-finite value encountered during fitting"
+                    ) from exc
+                if not math.isfinite(ell):
+                    raise FloatingPointError(
+                        "non-finite value encountered during fitting"
+                    )
+                row.append(ell)
+            log_ell.append(row)
+        return log_ell
+
+    @classmethod
+    def _responsibilities(cls, X, weights, means, variances):
+        """Return the softmax responsibility matrix for ``X``; any
+        arithmetic failure or non-finite result raises
+        FloatingPointError."""
+        log_ell = cls._log_responsibilities(
+            X, weights, means, variances
+        )
+        responsibilities = []
+        for row in log_ell:
+            largest = row[0]
+            for ell in row[1:]:
+                if ell > largest:
+                    largest = ell
+            try:
+                exps = [math.exp(ell - largest) for ell in row]
+                total = math.fsum(exps)
+            except (OverflowError, ValueError) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during fitting"
+                ) from exc
+            if not math.isfinite(total) or total <= 0.0:
+                raise FloatingPointError(
+                    "non-finite value encountered during fitting"
+                )
+            scaled = []
+            for exponent in exps:
+                value = exponent / total
+                if not math.isfinite(value):
+                    raise FloatingPointError(
+                        "non-finite value encountered during fitting"
+                    )
+                scaled.append(value)
+            responsibilities.append(scaled)
+        return responsibilities
+
+    def fit(self, X):
+        # Reset first so a failed fit leaves the model unfitted.
+        self.weights_ = None
+        self.means_ = None
+        self.variances_ = None
+
+        self._check_1d_vector(X)
+        n = len(X)
+        k = self.n_components
+        if n < k:
+            raise ValueError(
+                "n_components must not exceed the number of samples"
+            )
+
+        weights = [1.0 / k for _ in range(k)]
+        means = sorted(X)[:k]
+        variances = [1.0 for _ in range(k)]
+
+        for _ in range(100):
+            responsibilities = self._responsibilities(
+                X, weights, means, variances
+            )
+
+            counts = []
+            new_weights = []
+            new_means = []
+            for j in range(k):
+                try:
+                    count = math.fsum(
+                        responsibilities[i][j] for i in range(n)
+                    )
+                except (OverflowError, ValueError) as exc:
+                    raise FloatingPointError(
+                        "non-finite value encountered during fitting"
+                    ) from exc
+                if not math.isfinite(count) or count <= 0.0:
+                    raise FloatingPointError(
+                        "non-finite value encountered during fitting"
+                    )
+                counts.append(count)
+
+                try:
+                    weight = count / n
+                    weighted_total = math.fsum(
+                        responsibilities[i][j] * X[i] for i in range(n)
+                    )
+                    mean = weighted_total / count
+                except (OverflowError, ValueError) as exc:
+                    raise FloatingPointError(
+                        "non-finite value encountered during fitting"
+                    ) from exc
+                if not (
+                    math.isfinite(weight) and math.isfinite(mean)
+                ):
+                    raise FloatingPointError(
+                        "non-finite value encountered during fitting"
+                    )
+                new_weights.append(weight)
+                new_means.append(mean)
+
+            new_variances = []
+            for j in range(k):
+                mean = new_means[j]
+                try:
+                    squared_total = math.fsum(
+                        responsibilities[i][j] * (X[i] - mean) ** 2
+                        for i in range(n)
+                    )
+                    variance = max(squared_total / counts[j], 1e-12)
+                except (OverflowError, ValueError) as exc:
+                    raise FloatingPointError(
+                        "non-finite value encountered during fitting"
+                    ) from exc
+                if not math.isfinite(variance):
+                    raise FloatingPointError(
+                        "non-finite value encountered during fitting"
+                    )
+                new_variances.append(variance)
+
+            max_change = 0.0
+            for j in range(k):
+                for old, new in (
+                    (weights[j], new_weights[j]),
+                    (means[j], new_means[j]),
+                    (variances[j], new_variances[j]),
+                ):
+                    try:
+                        change = abs(new - old)
+                    except (OverflowError, ValueError) as exc:
+                        raise FloatingPointError(
+                            "non-finite value encountered during fitting"
+                        ) from exc
+                    if not math.isfinite(change):
+                        raise FloatingPointError(
+                            "non-finite value encountered during fitting"
+                        )
+                    if change > max_change:
+                        max_change = change
+
+            weights = new_weights
+            means = new_means
+            variances = new_variances
+            if max_change <= 1e-6:
+                break
+
+        self.weights_ = weights
+        self.means_ = means
+        self.variances_ = variances
+        return self
+
+    def predict(self, X):
+        if self.weights_ is None:
+            raise ValueError("model must be fitted before predict is called")
+        self._check_1d_vector(X)
+
+        responsibilities = self._responsibilities(
+            X, self.weights_, self.means_, self.variances_
+        )
+        labels = []
+        for row in responsibilities:
+            best_index = 0
+            best_value = row[0]
+            for j in range(1, self.n_components):
+                if row[j] > best_value:
+                    best_value = row[j]
+                    best_index = j
+            labels.append(best_index)
+        return labels, responsibilities
 
 
 def _check_metric_vectors(y_true, y_pred):
