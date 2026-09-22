@@ -1174,6 +1174,13 @@ class KMeans:
     at most ``max_iter`` rounds, and the final centroids are kept. Neither
     ``fit`` nor ``predict`` modifies its input. The same parameters and
     inputs always give the same result.
+
+    After a successful fit, ``transform`` returns, for each input row, a
+    fresh list of length ``n_clusters`` with the squared Euclidean
+    distances to the centroids in ascending centroid index order; an exact
+    zero is normalized to ``0.0``. ``fit_predict`` fits and then returns
+    the prediction labels; an exception raised by ``fit`` propagates
+    unchanged.
     """
 
     def __init__(self, n_clusters=8, max_iter=300, tol=1e-4, seed=0):
@@ -1302,6 +1309,30 @@ class KMeans:
             )
 
         return [self._assign(row, self.cluster_centers_) for row in X]
+
+    def transform(self, X):
+        if self.cluster_centers_ is None:
+            raise ValueError("model must be fitted before transform is called")
+        width = _check_exact_matrix(X)
+        if width != self._n_features:
+            raise ValueError(
+                "X must have the same number of features as the training data"
+            )
+
+        results = []
+        for row in X:
+            distances = []
+            for k in range(self.n_clusters):
+                distance = _squared_distance(row, self.cluster_centers_[k])
+                if distance == 0:
+                    distance = 0.0
+                distances.append(distance)
+            results.append(distances)
+        return results
+
+    def fit_predict(self, X):
+        self.fit(X)
+        return self.predict(X)
 
 
 class PCA:
