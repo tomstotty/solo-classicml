@@ -19,6 +19,8 @@ Exports:
         two-dimensional data.
     DBSCAN -- deterministic density-based clustering with an epsilon
         neighborhood and a minimum core-point sample count.
+    AgglomerativeClustering -- deterministic bottom-up clustering with
+        average linkage.
     accuracy_score -- fraction of positions where two integer label
         vectors agree.
     mean_squared_error -- weighted mean of squared element-wise
@@ -164,6 +166,7 @@ __all__ = [
     "KMeans",
     "PCA",
     "DBSCAN",
+    "AgglomerativeClustering",
     "accuracy_score",
     "mean_squared_error",
     "root_mean_squared_error",
@@ -1549,11 +1552,19 @@ class DBSCAN:
     """
 
     def __init__(self, eps=0.5, min_samples=5):
-        if type(eps) not in (int, float) or not math.isfinite(eps):
+        if type(eps) not in (int, float):
             raise ValueError(
                 "eps must be a finite non-boolean int or float greater than 0"
             )
-        if eps <= 0:
+        try:
+            eps_finite = math.isfinite(eps)
+        except OverflowError:
+            # math.isfinite raises OverflowError on exact ints too large to
+            # convert to float; treat them like any other invalid eps.
+            raise ValueError(
+                "eps must be a finite non-boolean int or float greater than 0"
+            )
+        if not eps_finite or eps <= 0:
             raise ValueError(
                 "eps must be a finite non-boolean int or float greater than 0"
             )
@@ -1681,6 +1692,153 @@ class DBSCAN:
     def fit_predict(self, X):
         self.fit(X)
         return list(self.labels_)
+
+
+class AgglomerativeClustering:
+    """Deterministic agglomerative (bottom-up) clustering with average
+    linkage.
+
+    Initially every input index is its own cluster, represented by a
+    tuple of member indices in strictly ascending order. The pairwise
+    distance is ``sqrt(math.fsum((X[i][k] - X[j][k]) ** 2))`` with the
+    squared terms accumulated in ascending column order. The distance
+    ``D(A, B)`` between two clusters is the mean of all cross-cluster
+    pairwise distances, summed via ``math.fsum`` with members of ``A`` on
+    the outer loop and members of ``B`` on the inner loop, divided by
+    the number of pairs.
+
+    Each round the surviving clusters are sorted by their member tuple,
+    and the pair with the lexicographically smallest
+    ``(distance, A, B)`` tuple -- distance first, then the two member
+    tuples -- is merged; the merged members stay in ascending order.
+    Merging repeats until ``n_clusters`` clusters remain. The final
+    clusters are numbered from zero in ascending order of their smallest
+    member index, and ``fit_predict`` returns a fresh integer list in
+    input order. The input is never modified, and no randomness is used.
+    """
+
+    def __init__(self, n_clusters=2):
+        if type(n_clusters) is not int or n_clusters <= 0:
+            raise ValueError("n_clusters must be a positive integer")
+        self.n_clusters = n_clusters
+        self.labels_ = None
+
+    @staticmethod
+    def _distance(row_a, row_b):
+        """Euclidean distance; overflow or a non-finite result raises
+        FloatingPointError."""
+        terms = []
+        for k in range(len(row_a)):
+            try:
+                diff = row_a[k] - row_b[k]
+            except (OverflowError, ValueError) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during distance computation"
+                ) from exc
+            try:
+                square = diff ** 2
+            except (OverflowError, ValueError) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during distance computation"
+                ) from exc
+            if isinstance(square, float) and not math.isfinite(square):
+                raise FloatingPointError(
+                    "non-finite value encountered during distance computation"
+                )
+            terms.append(square)
+        try:
+            total = math.fsum(terms)
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during distance computation"
+            ) from exc
+        if not math.isfinite(total):
+            raise FloatingPointError(
+                "non-finite value encountered during distance computation"
+            )
+        try:
+            result = math.sqrt(total)
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during distance computation"
+            ) from exc
+        if not math.isfinite(result):
+            raise FloatingPointError(
+                "non-finite value encountered during distance computation"
+            )
+        return result
+
+    def _cluster_distance(self, members_a, members_b, X):
+        """Average-linkage distance: mean of all cross-cluster pairwise
+        distances, accumulated with A members on the outer loop."""
+        terms = []
+        for i in members_a:
+            for j in members_b:
+                terms.append(self._distance(X[i], X[j]))
+        try:
+            total = math.fsum(terms)
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during linkage computation"
+            ) from exc
+        if not math.isfinite(total):
+            raise FloatingPointError(
+                "non-finite value encountered during linkage computation"
+            )
+        try:
+            mean = total / len(terms)
+        except (OverflowError, ValueError, ZeroDivisionError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during linkage computation"
+            ) from exc
+        if not math.isfinite(mean):
+            raise FloatingPointError(
+                "non-finite value encountered during linkage computation"
+            )
+        return mean
+
+    def fit_predict(self, X):
+        _check_exact_matrix(X)
+        n = len(X)
+        if n < self.n_clusters:
+            raise ValueError(
+                "n_clusters must not exceed the number of samples"
+            )
+
+        clusters = [(i,) for i in range(n)]
+        while len(clusters) > self.n_clusters:
+            # Sort clusters by their ascending member tuples before each
+            # round so distance ties resolve lexicographically.
+            clusters.sort()
+            best_key = None
+            best_pair = None
+            for a_index in range(len(clusters)):
+                for b_index in range(a_index + 1, len(clusters)):
+                    members_a = clusters[a_index]
+                    members_b = clusters[b_index]
+                    distance = self._cluster_distance(
+                        members_a, members_b, X
+                    )
+                    key = (distance, members_a, members_b)
+                    if best_key is None or key < best_key:
+                        best_key = key
+                        best_pair = (a_index, b_index)
+            a_index, b_index = best_pair
+            merged = tuple(
+                sorted(clusters[a_index] + clusters[b_index])
+            )
+            del clusters[b_index]
+            del clusters[a_index]
+            clusters.append(merged)
+
+        # Number final clusters from zero by ascending smallest member.
+        clusters.sort()
+        labels = [0] * n
+        for label, members in enumerate(clusters):
+            for index in members:
+                labels[index] = label
+        self.labels_ = labels
+        return list(labels)
 
 
 def _check_metric_vectors(y_true, y_pred):
