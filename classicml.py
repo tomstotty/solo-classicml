@@ -25,6 +25,8 @@ Exports:
         differences of two finite real vectors.
     median_absolute_error -- weighted median of element-wise absolute
         differences of two finite real vectors.
+    max_error -- maximum of the element-wise absolute differences of two
+        finite real vectors.
     mean_squared_log_error -- weighted mean squared logarithmic error of
         two finite non-negative real vectors.
     r2_score -- coefficient of determination of two finite real vectors,
@@ -142,6 +144,7 @@ __all__ = [
     "mean_squared_error",
     "mean_absolute_error",
     "median_absolute_error",
+    "max_error",
     "mean_squared_log_error",
     "r2_score",
     "explained_variance_score",
@@ -1650,6 +1653,78 @@ def mean_absolute_error(y_true, y_pred, sample_weight=None) -> float:
         raise FloatingPointError(
             "non-finite value encountered during mean absolute error"
         )
+    if result == 0:
+        result = 0.0
+    return result
+
+
+def max_error(y_true, y_pred) -> float:
+    """Return the maximum of the element-wise absolute differences.
+
+    Both arguments must be non-empty lists of equal length whose elements
+    are finite values of type exactly ``int`` or ``float`` (booleans and
+    other numeric subclasses are rejected). The inputs are not modified.
+    After validation both vectors are converted to ``float`` in input
+    order; the conversion, subtraction, ``abs``, and comparison are all
+    checked -- overflow, invalid operations, and non-finite intermediate
+    values raise FloatingPointError. An exact zero result is normalized
+    to ``0.0``. Deterministic: same inputs, same result.
+    """
+    n = _check_metric_vectors(y_true, y_pred)
+    for name, values in (("y_true", y_true), ("y_pred", y_pred)):
+        for value in values:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "%s must contain only finite non-boolean numbers" % name
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "%s must contain only finite non-boolean numbers" % name
+                ) from exc
+            if not finite:
+                raise ValueError(
+                    "%s must contain only finite non-boolean numbers" % name
+                )
+
+    t = []
+    p = []
+    for i in range(n):
+        try:
+            t.append(float(y_true[i]))
+            p.append(float(y_pred[i]))
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during max error"
+            ) from exc
+
+    best = None
+    for i in range(n):
+        try:
+            r = abs(t[i] - p[i])
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during max error"
+            ) from exc
+        if not math.isfinite(r):
+            raise FloatingPointError(
+                "non-finite value encountered during max error"
+            )
+        if best is None:
+            best = r
+        else:
+            try:
+                larger = r > best
+            except (OverflowError, ValueError) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during max error"
+                ) from exc
+            if larger:
+                best = r
+    result = float(best)
     if result == 0:
         result = 0.0
     return result
