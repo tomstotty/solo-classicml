@@ -9884,6 +9884,14 @@ _SERIAL_KEYS_LINEAR = ("class", "lr", "l2", "max_iter", "tol", "w", "b")
 _SERIAL_KEYS_SCALER = ("class", "n_features_in", "mean", "scale")
 _SERIAL_KEYS_TREE = ("class", "max_depth", "n_features_in", "tree")
 _SERIAL_KEYS_TREE_NODE = ("label", "feature", "threshold", "left", "right")
+_SERIAL_KEYS_FOREST = (
+    "class",
+    "n_estimators",
+    "max_features",
+    "seed",
+    "n_features_in",
+    "trees",
+)
 
 
 def _quantize_fixed(value):
@@ -9942,8 +9950,8 @@ def _encode_vector(vector, length):
 
 def dumps(model):
     """Serialize a fitted KMeans, PCA, LinearRegression,
-    LogisticRegression, StandardScaler, or DecisionTreeClassifier model
-    to compact JSON text.
+    LogisticRegression, StandardScaler, DecisionTreeClassifier, or
+    RandomForestClassifier model to compact JSON text.
 
     The result contains no whitespace and no trailing newline. Integers
     (``n_clusters``, ``max_iter``, ``seed``, ``n_features_in``) are emitted
@@ -9959,6 +9967,12 @@ def dumps(model):
     ``feature``, ``threshold``, ``left``, ``right`` in that order, with
     leaves encoded as ``feature`` -1, ``threshold`` 0.0000000000 and
     empty ``left``/``right`` arrays.
+
+    For RandomForestClassifier, the top-level keys are ``class``,
+    ``n_estimators``, ``max_features``, ``seed``, ``n_features_in`` and
+    ``trees`` in that order; the parameters are JSON integers and
+    ``trees`` holds exactly ``n_estimators`` nodes encoded like the
+    DecisionTreeClassifier node format.
     """
     if isinstance(model, KMeans):
         try:
@@ -10000,10 +10014,18 @@ def dumps(model):
         except Exception as exc:
             raise ValueError("invalid DecisionTreeClassifier state") from exc
 
+    if isinstance(model, RandomForestClassifier):
+        try:
+            return _dumps_forest(model)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("invalid RandomForestClassifier state") from exc
+
     raise ValueError(
         "dumps only supports fitted KMeans, PCA, LinearRegression, "
-        "LogisticRegression, StandardScaler, and DecisionTreeClassifier "
-        "models"
+        "LogisticRegression, StandardScaler, DecisionTreeClassifier, "
+        "and RandomForestClassifier models"
     )
 
 
@@ -10300,6 +10322,60 @@ def _encode_tree_node(node, n_features):
         + left_text
         + ',"right":'
         + right_text
+        + "}"
+    )
+
+
+def _dumps_forest(model):
+    """Serialize a fitted RandomForestClassifier.
+
+    The top-level keys are ``class``, ``n_estimators``, ``max_features``,
+    ``seed``, ``n_features_in`` and ``trees`` in that order. Every
+    parameter is emitted as a JSON integer and ``trees`` holds exactly
+    ``n_estimators`` nodes encoded by ``_encode_tree_node``.
+    """
+    trees = model._trees
+    n_features = model._n_features
+    if trees is None or n_features is None:
+        raise ValueError(
+            "RandomForestClassifier must be fitted before dumps is called"
+        )
+    n_estimators = model.n_estimators
+    max_features = model.max_features
+    seed = model.seed
+    # Re-validate the construction parameters exactly as __init__ does.
+    if (
+        type(n_estimators) is not int
+        or n_estimators <= 0
+        or type(max_features) is not int
+        or max_features <= 0
+        or type(seed) is not int
+    ):
+        raise ValueError(
+            "RandomForestClassifier has invalid construction parameters"
+        )
+    if type(n_features) is not int or n_features <= 0:
+        raise ValueError("n_features_in must be a positive integer")
+    if max_features > n_features:
+        raise ValueError("max_features must not exceed n_features_in")
+    if not isinstance(trees, list) or len(trees) != n_estimators:
+        raise ValueError("trees must be a list of n_estimators nodes")
+    trees_text = (
+        "["
+        + ",".join(_encode_tree_node(tree, n_features) for tree in trees)
+        + "]"
+    )
+    return (
+        '{"class":"RandomForestClassifier","n_estimators":'
+        + str(n_estimators)
+        + ',"max_features":'
+        + str(max_features)
+        + ',"seed":'
+        + str(seed)
+        + ',"n_features_in":'
+        + str(n_features)
+        + ',"trees":'
+        + trees_text
         + "}"
     )
 
@@ -10702,10 +10778,49 @@ def _load_tree_node(node, n_features):
     return result
 
 
+def _load_forest(pairs):
+    keys = tuple(key for key, _ in pairs)
+    if keys != _SERIAL_KEYS_FOREST:
+        raise ValueError(
+            "RandomForestClassifier JSON must have exactly the serialized "
+            "keys in the serialized order"
+        )
+    data = _convert(pairs)
+
+    class_name = data["class"]
+    if not isinstance(class_name, str) or class_name != "RandomForestClassifier":
+        raise ValueError('class must be "RandomForestClassifier"')
+
+    n_estimators = _expect_int(data["n_estimators"], "n_estimators")
+    if n_estimators <= 0:
+        raise ValueError("n_estimators must be greater than 0")
+    max_features = _expect_int(data["max_features"], "max_features")
+    if max_features <= 0:
+        raise ValueError("max_features must be greater than 0")
+    seed = _expect_int(data["seed"], "seed")
+    n_features = _expect_int(data["n_features_in"], "n_features_in")
+    if n_features <= 0:
+        raise ValueError("n_features_in must be greater than 0")
+    if max_features > n_features:
+        raise ValueError("max_features must not exceed n_features_in")
+
+    trees_node = data["trees"]
+    if not isinstance(trees_node, list) or len(trees_node) != n_estimators:
+        raise ValueError("trees must contain exactly n_estimators nodes")
+    trees = [_load_tree_node(node, n_features) for node in trees_node]
+
+    model = RandomForestClassifier(
+        n_estimators=n_estimators, max_features=max_features, seed=seed
+    )
+    model._trees = trees
+    model._n_features = n_features
+    return model
+
+
 def loads(text):
     """Reconstruct a fitted KMeans, PCA, LinearRegression,
-    LogisticRegression, StandardScaler, or DecisionTreeClassifier from
-    text produced by dumps.
+    LogisticRegression, StandardScaler, DecisionTreeClassifier, or
+    RandomForestClassifier from text produced by dumps.
 
     Only the exact byte format emitted by :func:`dumps` is accepted: a
     ``str`` holding compact JSON with no whitespace, no duplicate keys,
@@ -10716,8 +10831,9 @@ def loads(text):
     notation, non-finite values, or illegal parameters -- raises
     ValueError. The returned model is independent of the input and
     fitted; KMeans recovers its column count from centroid width, the
-    linear models from the length of ``w``, and StandardScaler and
-    DecisionTreeClassifier from ``n_features_in``.
+    linear models from the length of ``w``, and StandardScaler,
+    DecisionTreeClassifier and RandomForestClassifier from
+    ``n_features_in``.
     The argument is not modified.
     """
     if type(text) is not str or len(text) == 0:
@@ -10781,6 +10897,13 @@ def loads(text):
     if class_entry == "DecisionTreeClassifier":
         try:
             return _load_tree(pairs)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("malformed serialized model") from exc
+    if class_entry == "RandomForestClassifier":
+        try:
+            return _load_forest(pairs)
         except ValueError:
             raise
         except Exception as exc:
