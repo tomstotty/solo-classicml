@@ -17,6 +17,8 @@ Exports:
         seeded centroid initialization.
     PCA -- deterministic first-principal-component projection for
         two-dimensional data.
+    DBSCAN -- deterministic density-based clustering with an epsilon
+        neighborhood and a minimum core-point sample count.
     accuracy_score -- fraction of positions where two integer label
         vectors agree.
     mean_squared_error -- weighted mean of squared element-wise
@@ -148,6 +150,7 @@ import math
 import random
 import re
 import sys
+from collections import deque
 from decimal import Decimal, ROUND_HALF_UP, localcontext
 from fractions import Fraction
 
@@ -160,6 +163,7 @@ __all__ = [
     "StandardScaler",
     "KMeans",
     "PCA",
+    "DBSCAN",
     "accuracy_score",
     "mean_squared_error",
     "root_mean_squared_error",
@@ -1522,6 +1526,161 @@ class PCA:
     def fit_transform(self, X):
         self.fit(X)
         return self.transform(X)
+
+
+class DBSCAN:
+    """Deterministic density-based spatial clustering.
+
+    Two points are neighbors when their squared Euclidean distance,
+    ``math.fsum((X[i][k] - X[j][k]) ** 2)`` accumulated in ascending
+    column order, is at most ``eps ** 2``; each point is its own neighbor.
+    A point whose neighbor count is at least ``min_samples`` is a core
+    point. Core points are scanned in ascending index order, and each
+    newly discovered core starts a cluster: its not-yet-clustered core
+    neighbors are traversed FIFO, enqueued in ascending neighbor index
+    order (each core point is enqueued at most once), and every core point
+    reached joins the cluster. Cluster numbers increase from zero in
+    discovery order. Afterwards the non-core points are processed in
+    ascending index order and assigned the smallest cluster label among
+    their core neighbors, or ``-1`` when they have none. ``labels_`` is
+    ``None`` initially and after a failed fit; a successful fit stores an
+    integer list in input order. Neither ``fit`` nor ``fit_predict``
+    modifies the input. No randomness is used.
+    """
+
+    def __init__(self, eps=0.5, min_samples=5):
+        if type(eps) not in (int, float) or not math.isfinite(eps):
+            raise ValueError(
+                "eps must be a finite non-boolean int or float greater than 0"
+            )
+        if eps <= 0:
+            raise ValueError(
+                "eps must be a finite non-boolean int or float greater than 0"
+            )
+        if type(min_samples) is not int or min_samples <= 0:
+            raise ValueError("min_samples must be a positive integer")
+
+        self.eps = eps
+        self.min_samples = min_samples
+        self.labels_ = None
+
+    @staticmethod
+    def _squared_distance(row_a, row_b):
+        """Squared Euclidean distance with terms accumulated in column
+        order via ``math.fsum``; overflow or a non-finite result raises
+        FloatingPointError."""
+        terms = []
+        for k in range(len(row_a)):
+            try:
+                diff = row_a[k] - row_b[k]
+            except (OverflowError, ValueError) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during distance computation"
+                ) from exc
+            try:
+                square = diff ** 2
+            except (OverflowError, ValueError) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during distance computation"
+                ) from exc
+            if isinstance(square, float) and not math.isfinite(square):
+                raise FloatingPointError(
+                    "non-finite value encountered during distance computation"
+                )
+            terms.append(square)
+        try:
+            total = math.fsum(terms)
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during distance computation"
+            ) from exc
+        if not math.isfinite(total):
+            raise FloatingPointError(
+                "non-finite value encountered during distance computation"
+            )
+        return total
+
+    def fit(self, X):
+        self.labels_ = None
+
+        _check_exact_matrix(X)
+        n = len(X)
+
+        try:
+            eps_squared = self.eps ** 2
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during fit"
+            ) from exc
+        if isinstance(eps_squared, float) and not math.isfinite(eps_squared):
+            raise FloatingPointError(
+                "non-finite value encountered during fit"
+            )
+
+        # Neighbor lists, each in strictly ascending index order; a point is
+        # always its own neighbor.
+        neighbors = []
+        for i in range(n):
+            row_neighbors = []
+            for j in range(n):
+                if self._squared_distance(X[i], X[j]) <= eps_squared:
+                    row_neighbors.append(j)
+            neighbors.append(row_neighbors)
+
+        core = [
+            len(row_neighbors) >= self.min_samples
+            for row_neighbors in neighbors
+        ]
+
+        labels = [-1] * n
+        next_label = 0
+        # Core points that have already been reached by a cluster.
+        clustered_core = [False] * n
+
+        for i in range(n):
+            if not core[i] or clustered_core[i]:
+                continue
+            label = next_label
+            next_label += 1
+            labels[i] = label
+            clustered_core[i] = True
+            queue = deque()
+            # Enqueue this core's not-yet-clustered core neighbors; the
+            # neighbor list is already ascending, so enqueue order is
+            # ascending and every core point is enqueued at most once.
+            for j in neighbors[i]:
+                if core[j] and not clustered_core[j]:
+                    clustered_core[j] = True
+                    labels[j] = label
+                    queue.append(j)
+            while queue:
+                point = queue.popleft()
+                for j in neighbors[point]:
+                    if core[j] and not clustered_core[j]:
+                        clustered_core[j] = True
+                        labels[j] = label
+                        queue.append(j)
+
+        # Border points take the smallest cluster label among their core
+        # neighbors; points with none remain noise (-1). Core labels never
+        # change here.
+        for i in range(n):
+            if core[i]:
+                continue
+            border_label = -1
+            for j in neighbors[i]:
+                if core[j]:
+                    candidate = labels[j]
+                    if border_label == -1 or candidate < border_label:
+                        border_label = candidate
+            labels[i] = border_label
+
+        self.labels_ = labels
+        return self
+
+    def fit_predict(self, X):
+        self.fit(X)
+        return list(self.labels_)
 
 
 def _check_metric_vectors(y_true, y_pred):
