@@ -168,6 +168,7 @@ __all__ = [
     "mean_poisson_deviance",
     "mean_gamma_deviance",
     "mean_tweedie_deviance",
+    "d2_tweedie_score",
     "precision_recall_fscore_support",
     "confusion_matrix",
     "precision_score",
@@ -4503,6 +4504,122 @@ def mean_tweedie_deviance(y_true, y_pred, power=1.5, sample_weight=None) -> floa
         raise FloatingPointError(
             "non-finite value encountered during mean Tweedie deviance"
         )
+    if result == 0:
+        result = 0.0
+    return result
+
+
+def d2_tweedie_score(y_true, y_pred, power=1.5, sample_weight=None) -> float:
+    """Return the D^2 Tweedie score: relative improvement over a constant.
+
+    The score is ``1 - D / D0`` where ``D`` is the weighted mean Tweedie
+    deviance of ``y_pred`` and ``D0`` is the weighted mean Tweedie
+    deviance of the constant baseline ``mu``, the weighted mean of
+    ``y_true``. It measures how much the predictions improve on always
+    predicting that constant.
+
+    The four-argument validation -- containers, lengths, exact types,
+    rejection of booleans, finiteness, value ranges, and the total
+    weight -- is exactly that of :func:`mean_tweedie_deviance`, which is
+    called first with the same arguments to obtain ``D``; any exception
+    it raises propagates unchanged.
+
+    After validation, the true values and weights are converted to
+    ``float`` in input order (``None`` weights become ``1.0``).
+    ``math.fsum`` computes the total weight ``W = sum(w_i)`` and then
+    ``mu = math.fsum(w_i * y_true_i) / W``. If that weight summation
+    overflows or is invalid, is non-finite, or ``W`` is less than or
+    equal to zero, a ValueError is raised. When ``mu`` is exactly zero
+    the baseline deviance is ``D0 = 0.0``; otherwise ``D0`` is obtained
+    by calling :func:`mean_tweedie_deviance` with
+    ``[mu] * len(y_true)`` as the prediction. When ``D0`` is non-zero
+    the result is ``1.0 - D / D0``; when ``D0`` and ``D`` are both zero
+    the result is ``1.0``; when only ``D0`` is zero the result is
+    ``0.0``.
+
+    Overflow, invalid operations, or division by zero during the
+    post-validation conversion, multiplication, summation, division, or
+    final division, and any non-finite intermediate value or result,
+    raise FloatingPointError. An exact zero result is normalized to
+    ``0.0``.
+
+    The return value is a float. The inputs are not modified.
+    Deterministic: same inputs, same result.
+    """
+    # Validation and the model deviance D are delegated entirely to
+    # mean_tweedie_deviance; its exceptions (ValueError and
+    # FloatingPointError alike) propagate unchanged.
+    model_deviance = mean_tweedie_deviance(
+        y_true, y_pred, power, sample_weight
+    )
+
+    n = len(y_true)
+    try:
+        t = [float(value) for value in y_true]
+        if sample_weight is None:
+            w = [1.0] * n
+        else:
+            w = [float(value) for value in sample_weight]
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during d2 Tweedie score"
+        ) from exc
+    for values in (t, w):
+        for value in values:
+            if not math.isfinite(value):
+                raise FloatingPointError(
+                    "non-finite value encountered during d2 Tweedie score"
+                )
+
+    try:
+        total_weight = math.fsum(w)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError("the total weight must be greater than 0") from exc
+    if not math.isfinite(total_weight) or total_weight <= 0.0:
+        raise ValueError("the total weight must be greater than 0")
+
+    try:
+        weighted_true = math.fsum([w[i] * t[i] for i in range(n)])
+        if not math.isfinite(weighted_true):
+            raise FloatingPointError(
+                "non-finite value encountered during d2 Tweedie score"
+            )
+        mu = weighted_true / total_weight
+        if not math.isfinite(mu):
+            raise FloatingPointError(
+                "non-finite value encountered during d2 Tweedie score"
+            )
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during d2 Tweedie score"
+        ) from exc
+
+    if mu == 0.0:
+        baseline_deviance = 0.0
+    else:
+        baseline = [mu] * n
+        # mu is a strictly positive finite float, so this call cannot
+        # raise; its result is therefore finite.
+        baseline_deviance = mean_tweedie_deviance(
+            y_true, baseline, power, sample_weight
+        )
+
+    if baseline_deviance != 0.0:
+        try:
+            result = 1.0 - model_deviance / baseline_deviance
+        except (OverflowError, ValueError, ZeroDivisionError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during d2 Tweedie score"
+            ) from exc
+        if not math.isfinite(result):
+            raise FloatingPointError(
+                "non-finite value encountered during d2 Tweedie score"
+            )
+    elif model_deviance == 0.0:
+        result = 1.0
+    else:
+        result = 0.0
+
     if result == 0:
         result = 0.0
     return result
