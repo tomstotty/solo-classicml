@@ -9458,6 +9458,7 @@ _SERIAL_KEYS_KMEANS = (
 )
 _SERIAL_KEYS_PCA = ("class", "mean", "components")
 _SERIAL_KEYS_LINEAR = ("class", "lr", "l2", "max_iter", "tol", "w", "b")
+_SERIAL_KEYS_SCALER = ("class", "n_features_in", "mean", "scale")
 
 
 def _quantize_fixed(value):
@@ -9515,17 +9516,18 @@ def _encode_vector(vector, length):
 
 
 def dumps(model):
-    """Serialize a fitted KMeans, PCA, LinearRegression, or
-    LogisticRegression model to compact JSON text.
+    """Serialize a fitted KMeans, PCA, LinearRegression,
+    LogisticRegression, or StandardScaler model to compact JSON text.
 
     The result contains no whitespace and no trailing newline. Integers
-    (``n_clusters``, ``max_iter``, ``seed``) are emitted as JSON integers;
-    ``lr``, ``l2``, ``tol``, ``b`` and every array coordinate is quantized
-    to 10 decimal places with ROUND_HALF_UP (negative zero becomes
-    ``0.0000000000``). A positive ``lr``/``tol`` that quantizes to zero is
-    rejected, as are any non-fitted models, unsupported objects, invalid
-    construction parameters, and malformed or non-finite state. The
-    argument is not modified.
+    (``n_clusters``, ``max_iter``, ``seed``, ``n_features_in``) are
+    emitted as JSON integers; ``lr``, ``l2``, ``tol``, ``b`` and every
+    array coordinate is quantized to 10 decimal places with
+    ROUND_HALF_UP (negative zero becomes ``0.0000000000``). A positive
+    ``lr``/``tol`` that quantizes to zero is rejected, as are any
+    non-fitted models, unsupported objects, invalid construction
+    parameters, and malformed or non-finite state. The argument is not
+    modified.
     """
     if isinstance(model, KMeans):
         try:
@@ -9551,9 +9553,17 @@ def dumps(model):
         except Exception as exc:
             raise ValueError("invalid linear model state") from exc
 
+    if isinstance(model, StandardScaler):
+        try:
+            return _dumps_scaler(model)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("invalid StandardScaler state") from exc
+
     raise ValueError(
         "dumps only supports fitted KMeans, PCA, LinearRegression, "
-        "and LogisticRegression models"
+        "LogisticRegression, and StandardScaler models"
     )
 
 
@@ -9690,6 +9700,34 @@ def _dumps_linear(model):
         + w_text
         + ',"b":'
         + b_text
+        + "}"
+    )
+
+
+def _dumps_scaler(model):
+    mean = model.mean_
+    scale = model.scale_
+    n_features = model.n_features_in_
+    if mean is None or scale is None or n_features is None:
+        raise ValueError(
+            "StandardScaler must be fitted before dumps is called"
+        )
+    if type(n_features) is not int or n_features <= 0:
+        raise ValueError("n_features_in_ must be a positive integer")
+    # _encode_vector enforces non-empty lists of exactly n_features
+    # finite non-boolean int/float elements.
+    mean_text = _encode_vector(mean, n_features)
+    scale_text = _encode_vector(scale, n_features)
+    for value in scale:
+        if value <= 0:
+            raise ValueError("scale_ elements must be greater than 0")
+    return (
+        '{"class":"StandardScaler","n_features_in":'
+        + str(n_features)
+        + ',"mean":'
+        + mean_text
+        + ',"scale":'
+        + scale_text
         + "}"
     )
 
@@ -9994,9 +10032,37 @@ def _load_linear(pairs, model_class, class_name):
     return model
 
 
+def _load_scaler(pairs):
+    keys = tuple(key for key, _ in pairs)
+    if keys != _SERIAL_KEYS_SCALER:
+        raise ValueError("StandardScaler JSON must have exactly the "
+                         "serialized keys in the serialized order")
+    data = _convert(pairs)
+
+    class_name = data["class"]
+    if not isinstance(class_name, str) or class_name != "StandardScaler":
+        raise ValueError('class must be "StandardScaler"')
+
+    n_features = _expect_int(data["n_features_in"], "n_features_in")
+    if n_features <= 0:
+        raise ValueError("n_features_in must be greater than 0")
+
+    mean = _expect_fixed_vector(data["mean"], n_features, "mean")
+    scale = _expect_fixed_vector(data["scale"], n_features, "scale")
+    for value in scale:
+        if value <= 0.0:
+            raise ValueError("scale elements must be greater than 0")
+
+    model = StandardScaler()
+    model.mean_ = list(mean)
+    model.scale_ = list(scale)
+    model.n_features_in_ = n_features
+    return model
+
+
 def loads(text):
-    """Reconstruct a fitted KMeans, PCA, LinearRegression, or
-    LogisticRegression from text produced by dumps.
+    """Reconstruct a fitted KMeans, PCA, LinearRegression,
+    LogisticRegression, or StandardScaler from text produced by dumps.
 
     Only the exact byte format emitted by :func:`dumps` is accepted: a
     ``str`` holding compact JSON with no whitespace, no duplicate keys,
@@ -10006,8 +10072,8 @@ def loads(text):
     parse failures, booleans, exponent notation, non-finite values, or
     illegal parameters -- raises ValueError. The returned model is
     independent of the input and fitted; KMeans recovers its column count
-    from centroid width, the linear models from the length of ``w``.
-    The argument is not modified.
+    from centroid width, the linear models from the length of ``w``, and
+    StandardScaler from ``n_features_in``. The argument is not modified.
     """
     if not isinstance(text, str) or len(text) == 0:
         raise ValueError("loads requires a non-empty str")
@@ -10056,6 +10122,13 @@ def loads(text):
     if class_entry == "LogisticRegression":
         try:
             return _load_linear(pairs, LogisticRegression, "LogisticRegression")
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("malformed serialized model") from exc
+    if class_entry == "StandardScaler":
+        try:
+            return _load_scaler(pairs)
         except ValueError:
             raise
         except Exception as exc:
