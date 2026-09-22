@@ -234,6 +234,7 @@ __all__ = [
     "mean_reciprocal_rank_score",
     "precision_at_k_score",
     "recall_at_k_score",
+    "mean_average_precision_at_k_score",
     "dumps",
     "loads",
 ]
@@ -10924,8 +10925,10 @@ def _weighted_mean_at_k(y_true, y_score, k, sample_weight, mode):
 
     if mode == "precision":
         label = "precision at k score"
-    else:
+    elif mode == "recall":
         label = "recall at k score"
+    else:
+        label = "mean average precision at k score"
 
     def non_finite(exc):
         return FloatingPointError(
@@ -10954,17 +10957,52 @@ def _weighted_mean_at_k(y_true, y_score, k, sample_weight, mode):
     for i in range(n):
         labels = y_true[i]
         scores = y_score[i]
-        top = sorted(range(width), key=lambda j: (-scores[j], j))[:k]
+        try:
+            top = sorted(
+                range(width), key=lambda j: (-scores[j], j)
+            )[:k]
+        except (OverflowError, ValueError) as exc:
+            raise non_finite(exc) from exc
         hits = 0
-        for j in top:
-            if labels[j] == 1:
-                hits += 1
+        if mode == "map":
+            positives = 0
+            for j in range(width):
+                if labels[j] == 1:
+                    positives += 1
+            if positives == 0:
+                row_score = 0.0
+            else:
+                cumulative = 0
+                hit_count = 0
+                for rank, j in enumerate(top, start=1):
+                    if labels[j] == 1:
+                        hit_count += 1
+                        try:
+                            cumulative += hit_count / rank
+                        except (
+                            OverflowError,
+                            ValueError,
+                            ZeroDivisionError,
+                        ) as exc:
+                            raise non_finite(exc) from exc
+                try:
+                    row_score = cumulative / min(positives, k)
+                except (
+                    OverflowError,
+                    ValueError,
+                    ZeroDivisionError,
+                ) as exc:
+                    raise non_finite(exc) from exc
+        else:
+            for j in top:
+                if labels[j] == 1:
+                    hits += 1
         if mode == "precision":
             try:
                 row_score = hits / k
             except (OverflowError, ValueError, ZeroDivisionError) as exc:
                 raise non_finite(exc) from exc
-        else:
+        elif mode == "recall":
             positives = 0
             for j in range(width):
                 if labels[j] == 1:
@@ -11093,6 +11131,51 @@ def recall_at_k_score(
     """
     return _weighted_mean_at_k(
         y_true, y_score, k, sample_weight, "recall"
+    )
+
+
+def mean_average_precision_at_k_score(
+    y_true, y_score, k=1, sample_weight=None
+) -> float:
+    """Return the weighted mean per-sample average precision at ``k``.
+
+    ``y_true`` must be a non-empty rectangular list of rows with at
+    least two columns whose elements are exactly the integers ``0`` and
+    ``1`` (booleans are rejected). ``y_score`` must be a list of the
+    same shape whose elements are finite values of type exactly ``int``
+    or ``float`` (booleans are rejected). ``k`` must be an exact ``int``
+    (booleans are rejected) with ``1 <= k <= m`` where ``m`` is the
+    number of columns. ``sample_weight`` must be ``None`` -- every
+    sample then weighs ``1.0`` -- or a list with the same length as the
+    number of rows whose elements are finite non-negative values of
+    type exactly ``int`` or ``float`` (booleans are rejected). Any
+    container, shape, length, type, value, range, or finiteness
+    violation (including ``OverflowError`` raised by
+    ``math.isfinite``) raises ValueError.
+
+    For row ``i`` the column indices are sorted ascending by
+    ``(-y_score[i][j], j)`` and only the first ``k`` are retained, so
+    ties favor the smaller index. Walking the retained columns in rank
+    order ``r = 1, ..., k``, every time the true label is ``1`` a hit
+    counter ``h`` is incremented and ``h / r`` is accumulated. Let
+    ``p`` be the number of positive labels in the whole row; the row
+    score is ``q_i = 0.0`` when ``p == 0`` and the accumulated value
+    divided by ``min(p, k)`` otherwise. After validation the weights
+    are converted to ``float`` in row order; ``math.fsum`` computes the
+    total weight ``W = sum(w_i)`` and the weighted score
+    ``S = sum(w_i * q_i)``, and the result is ``S / W``. Overflow or
+    invalid operations during the ``W`` summation, a non-finite ``W``,
+    or ``W <= 0`` raise ValueError; overflow, invalid operations, and
+    non-finite values during the post-validation conversion, the score
+    negation, the divisions and accumulations, the weighted
+    multiplication, the ``S`` summation, or the final division raise
+    FloatingPointError. An exact zero result is normalized to ``0.0``.
+
+    The return value is a float. The inputs are not modified.
+    Deterministic: same inputs, same result.
+    """
+    return _weighted_mean_at_k(
+        y_true, y_score, k, sample_weight, "map"
     )
 
 
