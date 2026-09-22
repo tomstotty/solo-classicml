@@ -233,6 +233,7 @@ __all__ = [
 ]
 
 _QUANTUM = Decimal("1E-10")
+_QUANTUM12 = Decimal("1E-12")
 _TRAIN_KEYS = ("X", "y", "lr", "l2", "max_iter", "tol")
 _KNN_KEYS = ("X", "y", "n_neighbors", "Q")
 
@@ -10648,6 +10649,13 @@ _SERIAL_KEYS_LINEAR = ("class", "lr", "l2", "max_iter", "tol", "w", "b")
 _SERIAL_KEYS_SCALER = ("class", "n_features_in", "mean", "scale")
 _SERIAL_KEYS_TREE = ("class", "max_depth", "n_features_in", "tree")
 _SERIAL_KEYS_TREE_NODE = ("label", "feature", "threshold", "left", "right")
+_SERIAL_KEYS_GAUSSIAN = (
+    "class",
+    "n_components",
+    "weights",
+    "means",
+    "variances",
+)
 _SERIAL_KEYS_FOREST = (
     "class",
     "n_estimators",
@@ -10688,6 +10696,36 @@ def _quantize_fixed(value):
     return format(decimal_value, "f")
 
 
+def _quantize_fixed12(value):
+    """Quantize a finite non-boolean real to 12 decimal places (HALF_UP)
+    and return its canonical fixed-point JSON lexical form.
+
+    The value first passes through ``float``; then
+    ``Decimal(str(v)).quantize(1E-12, ROUND_HALF_UP)`` performs the
+    rounding. Negative zero normalizes to ``0.000000000000``. Every
+    rejection (booleans, non-numbers, non-finite or unconvertibly large
+    values) is a ValueError.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("serialized values must be finite real numbers")
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "serialized values must be finite real numbers"
+        ) from exc
+    if not math.isfinite(number):
+        raise ValueError("serialized values must be finite real numbers")
+    with localcontext() as ctx:
+        ctx.prec = 400
+        decimal_value = Decimal(str(number)).quantize(
+            _QUANTUM12, rounding=ROUND_HALF_UP
+        )
+    if decimal_value == 0:
+        return "0.000000000000"
+    return format(decimal_value, "f")
+
+
 def _encode_matrix(matrix):
     if not isinstance(matrix, list) or len(matrix) == 0:
         raise ValueError("cluster_centers_ must be a non-empty list of rows")
@@ -10714,8 +10752,9 @@ def _encode_vector(vector, length):
 
 def dumps(model):
     """Serialize a fitted KMeans, PCA, LinearRegression,
-    LogisticRegression, StandardScaler, DecisionTreeClassifier, or
-    RandomForestClassifier model to compact JSON text.
+    LogisticRegression, StandardScaler, DecisionTreeClassifier,
+    RandomForestClassifier, or GaussianMixture model to compact JSON
+    text.
 
     The result contains no whitespace and no trailing newline. Integers
     (``n_clusters``, ``max_iter``, ``seed``, ``n_features_in``) are emitted
@@ -10736,6 +10775,16 @@ def dumps(model):
     ``n_estimators``, ``max_features``, ``seed``, ``n_features_in``,
     ``trees`` in that order, with exactly ``n_estimators`` trees whose
     nodes use the same node encoding as DecisionTreeClassifier.
+
+    For GaussianMixture the top-level keys are ``class``,
+    ``n_components``, ``weights``, ``means``, ``variances`` in that
+    order; ``n_components`` is a positive JSON integer and the three
+    arrays are non-empty lists of that length whose elements are exact
+    int/float values (booleans rejected). Each coordinate is converted
+    through ``float`` and quantized to 12 decimal places with
+    ROUND_HALF_UP (negative zero becomes ``0.000000000000``); weights
+    must be positive, means finite, and variances at least ``1e-12``,
+    with neither weights nor variances quantizing to zero.
     """
     if isinstance(model, KMeans):
         try:
@@ -10785,10 +10834,18 @@ def dumps(model):
         except Exception as exc:
             raise ValueError("invalid RandomForestClassifier state") from exc
 
+    if isinstance(model, GaussianMixture):
+        try:
+            return _dumps_gaussian(model)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("invalid GaussianMixture state") from exc
+
     raise ValueError(
         "dumps only supports fitted KMeans, PCA, LinearRegression, "
         "LogisticRegression, StandardScaler, DecisionTreeClassifier, "
-        "and RandomForestClassifier models"
+        "RandomForestClassifier, and GaussianMixture models"
     )
 
 
@@ -11145,8 +11202,107 @@ def _dumps_forest(model):
     )
 
 
+def _dumps_gaussian(model):
+    """Serialize a fitted GaussianMixture.
+
+    The top-level keys are class, n_components, weights, means, variances
+    in that order; ``n_components`` is a positive JSON integer and all
+    three arrays are non-empty lists of that same length whose elements
+    are exact finite int/float values (booleans rejected). Weights must be
+    strictly positive (also after 12-decimal quantization) and variances
+    at least ``1e-12``. Every coordinate passes through ``float`` before
+    being quantized to 12 decimals with ROUND_HALF_UP.
+    """
+    weights = model.weights_
+    means = model.means_
+    variances = model.variances_
+    if weights is None or means is None or variances is None:
+        raise ValueError(
+            "GaussianMixture must be fitted before dumps is called"
+        )
+    n_components = model.n_components
+    if type(n_components) is not int or n_components <= 0:
+        raise ValueError("n_components must be a positive integer")
+    for array, name in (
+        (weights, "weights_"),
+        (means, "means_"),
+        (variances, "variances_"),
+    ):
+        if not isinstance(array, list) or len(array) == 0:
+            raise ValueError("%s must be a non-empty list" % name)
+        if len(array) != n_components:
+            raise ValueError(
+                "%s length must equal n_components" % name
+            )
+        for value in array:
+            if isinstance(value, bool) or type(value) not in (int, float):
+                raise ValueError(
+                    "%s elements must be int or float" % name
+                )
+    weights_text = "[" + ",".join(
+        _quantize_gaussian_value(value, "weights_", positive=True)
+        for value in weights
+    ) + "]"
+    means_text = "[" + ",".join(
+        _quantize_gaussian_value(value, "means_") for value in means
+    ) + "]"
+    variances_text_parts = []
+    for value in variances:
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "variances_ elements must be finite numbers"
+            ) from exc
+        if not math.isfinite(number) or number < 1e-12:
+            raise ValueError(
+                "variances_ elements must be finite and at least 1e-12"
+            )
+        variances_text_parts.append(
+            _quantize_gaussian_value(value, "variances_", positive=True)
+        )
+    variances_text = "[" + ",".join(variances_text_parts) + "]"
+    return (
+        '{"class":"GaussianMixture","n_components":'
+        + str(n_components)
+        + ',"weights":'
+        + weights_text
+        + ',"means":'
+        + means_text
+        + ',"variances":'
+        + variances_text
+        + "}"
+    )
+
+
+def _quantize_gaussian_value(value, name, positive=False):
+    """Quantize one GaussianMixture coordinate to 12 fixed decimals.
+
+    The element is first converted with ``float`` and must stay finite;
+    strictly positive coordinates must quantize to a nonzero value.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "%s elements must be finite numbers" % name
+        ) from exc
+    if not math.isfinite(number):
+        raise ValueError("%s elements must be finite" % name)
+    if positive and number <= 0.0:
+        raise ValueError("%s elements must be strictly positive" % name)
+    token = _quantize_fixed12(number)
+    if positive and Decimal(token) == 0:
+        raise ValueError(
+            "%s elements must remain positive after quantization to 12 "
+            "decimals" % name
+        )
+    return token
+
+
 _JSON_INT_RE = re.compile(r"^(0|-?[1-9][0-9]*)$")
 _JSON_FLOAT_RE = re.compile(r"^-?(0|[1-9][0-9]*)\.[0-9]{10}$")
+_JSON_FLOAT12_RE = re.compile(r"^-?(0|[1-9][0-9]*)\.[0-9]{12}$")
 # The only strings in the format are fixed keys and class names: plain
 # printable ASCII without quotes, backslashes, or control characters.
 _JSON_STRING_RE = re.compile(r'"[^"\\\x00-\x1f]*"')
@@ -11168,8 +11324,9 @@ def _decode_json(text):
     Accepts the JSON grammar while rejecting whitespace anywhere, trailing
     characters, duplicate object keys, and numeric lexical forms outside
     the serialized byte format (exponent notation, leading-plus fractions,
-    non-10-digit decimals). Booleans/null are parsed so that their presence
-    as values can be rejected by the structural validators.
+    decimals that are neither 10 nor 12 digits). Booleans/null are parsed
+    so that their presence as values can be rejected by the structural
+    validators.
     """
     return _JsonParser(text).parse()
 
@@ -11274,6 +11431,8 @@ class _JsonParser:
             return ("int", token)
         if _JSON_FLOAT_RE.match(token):
             return ("fixed", token)
+        if _JSON_FLOAT12_RE.match(token):
+            return ("fixed12", token)
         # Any other valid JSON numeric form (e.g. exponents) is not part of
         # the serialized byte format.
         self.error()
@@ -11294,7 +11453,7 @@ def _convert(node):
         return result
     if isinstance(node, list):
         return [_convert(item) for item in node]
-    if isinstance(node, tuple) and node[0] in ("int", "fixed"):
+    if isinstance(node, tuple) and node[0] in ("int", "fixed", "fixed12"):
         return node
     if isinstance(node, str):
         return node
@@ -11333,6 +11492,29 @@ def _expect_fixed_vector(node, length, name):
     if not isinstance(node, list) or len(node) != length:
         raise ValueError("%s must have length %d" % (name, length))
     return [_expect_fixed(item, name + " element") for item in node]
+
+
+def _expect_fixed12(entry, name):
+    if not (
+        isinstance(entry, tuple)
+        and entry[0] == "fixed12"
+        and _JSON_FLOAT12_RE.match(entry[1])
+    ):
+        raise ValueError("%s must be a fixed 12-decimal JSON number" % name)
+    token = entry[1]
+    value = float(token)
+    if not math.isfinite(value):
+        raise ValueError("%s must be finite" % name)
+    # dumps normalizes negative zero to "0.000000000000".
+    if value == 0.0 and token[0] == "-":
+        raise ValueError("%s must not be negative zero" % name)
+    return value
+
+
+def _expect_fixed12_vector(node, length, name):
+    if not isinstance(node, list) or len(node) != length:
+        raise ValueError("%s must have length %d" % (name, length))
+    return [_expect_fixed12(item, name + " element") for item in node]
 
 
 def _load_kmeans(pairs):
@@ -11584,23 +11766,65 @@ def _load_forest(pairs):
     return model
 
 
+def _load_gaussian(pairs):
+    keys = tuple(key for key, _ in pairs)
+    if keys != _SERIAL_KEYS_GAUSSIAN:
+        raise ValueError(
+            "GaussianMixture JSON must have exactly the serialized keys "
+            "in the serialized order"
+        )
+    data = _convert(pairs)
+
+    class_name = data["class"]
+    if not isinstance(class_name, str) or class_name != "GaussianMixture":
+        raise ValueError('class must be "GaussianMixture"')
+
+    n_components = _expect_int(data["n_components"], "n_components")
+    if n_components <= 0:
+        raise ValueError("n_components must be greater than 0")
+
+    weights = _expect_fixed12_vector(
+        data["weights"], n_components, "weights"
+    )
+    for value in weights:
+        if value <= 0.0:
+            raise ValueError("weights must be strictly positive")
+
+    means = _expect_fixed12_vector(data["means"], n_components, "means")
+
+    variances = _expect_fixed12_vector(
+        data["variances"], n_components, "variances"
+    )
+    for value in variances:
+        if value < 1e-12:
+            raise ValueError("variances must be at least 1e-12")
+
+    model = GaussianMixture(n_components=n_components)
+    model.weights_ = list(weights)
+    model.means_ = list(means)
+    model.variances_ = list(variances)
+    return model
+
+
 def loads(text):
     """Reconstruct a fitted KMeans, PCA, LinearRegression,
-    LogisticRegression, StandardScaler, DecisionTreeClassifier, or
-    RandomForestClassifier from text produced by dumps.
+    LogisticRegression, StandardScaler, DecisionTreeClassifier,
+    RandomForestClassifier, or GaussianMixture from text produced by
+    dumps.
 
     Only the exact byte format emitted by :func:`dumps` is accepted: a
     ``str`` holding compact JSON with no whitespace, no duplicate keys,
     the exact key sets in order, JSON integers for integer parameters,
-    10-decimal fixed-point numbers for floats, and consistent array
-    shapes. Anything else -- including non-str input (str subclasses
-    included), empty strings, parse failures, booleans, exponent
-    notation, non-finite values, or illegal parameters -- raises
-    ValueError. The returned model is independent of the input and
-    fitted; KMeans recovers its column count from centroid width, the
-    linear models from the length of ``w``, and StandardScaler,
-    DecisionTreeClassifier, and RandomForestClassifier from
-    ``n_features_in``.
+    10-decimal fixed-point numbers for floats (12-decimal for
+    GaussianMixture), and consistent array shapes. Anything else --
+    including non-str input (str subclasses included), empty strings,
+    parse failures, booleans, exponent notation, non-finite values, or
+    illegal parameters -- raises ValueError. The returned model is
+    independent of the input and fitted; KMeans recovers its column
+    count from centroid width, the linear models from the length of
+    ``w``, StandardScaler/DecisionTreeClassifier/RandomForestClassifier
+    from ``n_features_in``, and GaussianMixture from
+    ``n_components``.
     The argument is not modified.
     """
     if type(text) is not str or len(text) == 0:
@@ -11671,6 +11895,13 @@ def loads(text):
     if class_entry == "RandomForestClassifier":
         try:
             return _load_forest(pairs)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("malformed serialized model") from exc
+    if class_entry == "GaussianMixture":
+        try:
+            return _load_gaussian(pairs)
         except ValueError:
             raise
         except Exception as exc:
