@@ -157,6 +157,7 @@ __all__ = [
     "d2_pinball_score",
     "mean_huber_loss",
     "mean_log_cosh_loss",
+    "mean_absolute_scaled_error",
     "mean_poisson_deviance",
     "mean_gamma_deviance",
     "mean_tweedie_deviance",
@@ -3344,7 +3345,14 @@ def mean_log_cosh_loss(y_true, y_pred, sample_weight=None) -> float:
         try:
             r = t[i] - p[i]
             a = abs(r)
-            loss = a + math.log1p(math.exp(-2.0 * a)) - log_two
+            # Save z and verify it is finite before handing it to
+            # math.exp; a non-finite exponent raises FloatingPointError.
+            z = -2.0 * a
+            if not math.isfinite(z):
+                raise FloatingPointError(
+                    "non-finite value encountered during mean log cosh loss"
+                )
+            loss = a + math.log1p(math.exp(z)) - log_two
             term = w[i] * loss
         except (OverflowError, ValueError) as exc:
             raise FloatingPointError(
@@ -3379,6 +3387,215 @@ def mean_log_cosh_loss(y_true, y_pred, sample_weight=None) -> float:
     if not math.isfinite(result):
         raise FloatingPointError(
             "non-finite value encountered during mean log cosh loss"
+        )
+    if result == 0:
+        result = 0.0
+    return result
+
+
+def mean_absolute_scaled_error(
+    y_true, y_pred, y_train, m=1, sample_weight=None
+) -> float:
+    """Return the mean absolute scaled error (MASE).
+
+    ``y_true`` and ``y_pred`` must be non-empty lists of equal length
+    and ``y_train`` must be a list whose length is strictly greater
+    than ``m``; every element of the three lists must be a finite
+    value of type exactly ``int`` or ``float`` (booleans are
+    rejected). ``m`` must be a positive value of type exactly ``int``
+    (booleans are rejected). ``sample_weight`` must be ``None`` --
+    every sample then weighs ``1.0`` -- or a list with the same length
+    as ``y_true`` whose elements are finite non-negative values of
+    type exactly ``int`` or ``float`` (booleans are rejected). Any
+    container, length, type, range, or finiteness violation
+    (including ``OverflowError`` raised by ``math.isfinite``) raises
+    ValueError.
+
+    After validation, the values are converted to ``float`` in input
+    order: ``t`` from ``y_true``, ``p`` from ``y_pred``, ``s`` from
+    ``y_train``, and ``w`` from ``sample_weight``; ``n = len(t)``. In ascending index order, ``math.fsum`` computes
+    the total weight ``W = sum(w_i)``; if that summation overflows or
+    is invalid, is non-finite, or ``W`` is less than or equal to
+    zero, a ValueError is raised. The seasonal scale is
+    ``D = (sum_{i=m}^{n-1} abs(s_i - s_{i-m})) / (n - m)``, again
+    summed in ascending index order with ``math.fsum``; if ``D``
+    equals zero a ValueError is raised. The weighted numerator is
+    ``N = sum(w_i * abs(t_i - p_i)) / W``. The result is ``N / D``.
+    Overflow, invalid operations during the post-validation
+    conversion or arithmetic (other than the ``W`` summation and the
+    zero ``D`` cases above), and non-finite intermediate values or
+    results raise FloatingPointError. An exact zero result is
+    normalized to ``0.0``.
+
+    The return value is a float. The inputs are not modified.
+    Deterministic: same inputs, same result.
+    """
+    n = _check_metric_vectors(y_true, y_pred)
+
+    if type(m) is not int or m <= 0:
+        raise ValueError("m must be a positive integer")
+
+    if not isinstance(y_train, list) or len(y_train) <= m:
+        raise ValueError("y_train must be a list whose length is greater than m")
+
+    for name, values in (
+        ("y_true", y_true),
+        ("y_pred", y_pred),
+        ("y_train", y_train),
+    ):
+        for value in values:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "%s must contain only finite non-boolean numbers" % name
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "%s must contain only finite non-boolean numbers" % name
+                ) from exc
+            if not finite:
+                raise ValueError(
+                    "%s must contain only finite non-boolean numbers" % name
+                )
+
+    if sample_weight is not None:
+        if not isinstance(sample_weight, list) or len(sample_weight) != n:
+            raise ValueError(
+                "sample_weight must be a list with the same length as "
+                "y_true"
+            )
+        for value in sample_weight:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                ) from exc
+            if not finite or value < 0:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+
+    try:
+        t = [float(value) for value in y_true]
+        p = [float(value) for value in y_pred]
+        s = [float(value) for value in y_train]
+        if sample_weight is None:
+            w = [1.0] * n
+        else:
+            w = [float(value) for value in sample_weight]
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during mean absolute scaled error"
+        ) from exc
+    for values in (t, p, s, w):
+        for value in values:
+            if not math.isfinite(value):
+                raise FloatingPointError(
+                    "non-finite value encountered during mean absolute "
+                    "scaled error"
+                )
+
+    try:
+        total_weight = math.fsum(w)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError("the total weight must be greater than 0") from exc
+    if not math.isfinite(total_weight) or total_weight <= 0.0:
+        raise ValueError("the total weight must be greater than 0")
+
+    season_differences = []
+    n_train = len(s)
+    for i in range(m, n_train):
+        try:
+            difference = abs(s[i] - s[i - m])
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during mean absolute scaled "
+                "error"
+            ) from exc
+        if not math.isfinite(difference):
+            raise FloatingPointError(
+                "non-finite value encountered during mean absolute scaled "
+                "error"
+            )
+        season_differences.append(difference)
+
+    try:
+        season_sum = math.fsum(season_differences)
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during mean absolute scaled error"
+        ) from exc
+    if not math.isfinite(season_sum):
+        raise FloatingPointError(
+            "non-finite value encountered during mean absolute scaled error"
+        )
+    # A zero seasonal sum (every s_i equals s_{i-m}) makes the scale
+    # undefined; it is a ValueError and must be caught before division.
+    if season_sum == 0:
+        raise ValueError(
+            "the mean seasonal difference of y_train must be greater than 0"
+        )
+    try:
+        scale = season_sum / (n_train - m)
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during mean absolute scaled error"
+        ) from exc
+    if not math.isfinite(scale):
+        raise FloatingPointError(
+            "non-finite value encountered during mean absolute scaled error"
+        )
+
+    error_terms = []
+    for i in range(n):
+        try:
+            error = abs(t[i] - p[i])
+            term = w[i] * error
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during mean absolute scaled "
+                "error"
+            ) from exc
+        if not math.isfinite(error) or not math.isfinite(term):
+            raise FloatingPointError(
+                "non-finite value encountered during mean absolute scaled "
+                "error"
+            )
+        error_terms.append(term)
+
+    try:
+        numerator = math.fsum(error_terms) / total_weight
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during mean absolute scaled error"
+        ) from exc
+    if not math.isfinite(numerator):
+        raise FloatingPointError(
+            "non-finite value encountered during mean absolute scaled error"
+        )
+
+    try:
+        result = numerator / scale
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during mean absolute scaled error"
+        ) from exc
+    if not math.isfinite(result):
+        raise FloatingPointError(
+            "non-finite value encountered during mean absolute scaled error"
         )
     if result == 0:
         result = 0.0
