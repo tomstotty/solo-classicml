@@ -1492,15 +1492,37 @@ def accuracy_score(y_true, y_pred):
     return correct / n
 
 
-def mean_squared_error(y_true, y_pred):
+def mean_squared_error(y_true, y_pred, sample_weight=None) -> float:
     """Return the mean of the squared element-wise differences.
 
-    Both arguments must be non-empty lists of equal length whose elements
-    are finite values of type exactly ``int`` or ``float`` (booleans are
-    rejected). The inputs are not modified. Differences, squares, the
-    ``math.fsum`` total, and the final division are all checked; overflow,
-    invalid operations, and non-finite intermediate values raise
-    FloatingPointError. An exact zero result is normalized to ``0.0``.
+    ``y_true`` and ``y_pred`` must be non-empty lists of equal length
+    whose elements are finite values of type exactly ``int`` or
+    ``float`` (booleans are rejected). ``sample_weight`` must be
+    ``None`` or a list of the same length whose elements are finite
+    non-negative values of type exactly ``int`` or ``float``. Any
+    container, length, type, range, or finiteness violation (including
+    ``OverflowError`` raised by ``math.isfinite``) raises ValueError.
+
+    When ``sample_weight`` is ``None``, the original values are used in
+    input order: ``d_i = y_true_i - y_pred_i``, ``q_i = d_i ** 2``, and
+    the result is ``math.fsum(q) / n``, so arbitrarily large valid
+    integers keep their existing exact result.
+
+    When weights are provided, the values and weights are converted to
+    ``float`` in input order; conversion errors or non-finite values
+    raise FloatingPointError. ``math.fsum`` computes the total weight
+    ``W = sum(w_i)``; if that summation overflows or is invalid, is
+    non-finite, or ``W`` is less than or equal to zero, a ValueError is
+    raised. For each index, ``d_i = y_true_i - y_pred_i``,
+    ``q_i = d_i ** 2``, and ``u_i = w_i * q_i``; in input order,
+    ``math.fsum`` computes ``S = sum(u_i)``, and the result is
+    ``S / W``. Other than ``W``, overflow, invalid operations, or
+    division by zero during the conversion, arithmetic, or summation,
+    and non-finite intermediate values or results, raise
+    FloatingPointError. An exact zero result is normalized to positive
+    ``0.0``.
+
+    The return value is a float. The inputs are not modified.
     Deterministic: same inputs, same result.
     """
     n = _check_metric_vectors(y_true, y_pred)
@@ -1523,29 +1545,81 @@ def mean_squared_error(y_true, y_pred):
                     "%s must contain only finite non-boolean numbers" % name
                 )
 
+    if sample_weight is None:
+        terms = []
+        for i in range(n):
+            d = y_true[i] - y_pred[i]
+            q = d ** 2
+            terms.append(q)
+        return math.fsum(terms) / n
+
+    if not isinstance(sample_weight, list) or len(sample_weight) != n:
+        raise ValueError(
+            "sample_weight must be a list with the same length as y_true"
+        )
+    for value in sample_weight:
+        if type(value) not in (int, float):
+            raise ValueError(
+                "sample_weight must contain only finite non-negative "
+                "non-boolean numbers"
+            )
+        # math.isfinite raises OverflowError for ints too large to
+        # convert to float; such values fail the finite requirement.
+        try:
+            finite = math.isfinite(value)
+        except OverflowError as exc:
+            raise ValueError(
+                "sample_weight must contain only finite non-negative "
+                "non-boolean numbers"
+            ) from exc
+        if not finite or value < 0:
+            raise ValueError(
+                "sample_weight must contain only finite non-negative "
+                "non-boolean numbers"
+            )
+
+    try:
+        t = [float(value) for value in y_true]
+        p = [float(value) for value in y_pred]
+        w = [float(value) for value in sample_weight]
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during mean squared error"
+        ) from exc
+    for values in (t, p, w):
+        for value in values:
+            if not math.isfinite(value):
+                raise FloatingPointError(
+                    "non-finite value encountered during mean squared error"
+                )
+
+    try:
+        total_weight = math.fsum(w)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError("the total weight must be greater than 0") from exc
+    if not math.isfinite(total_weight) or total_weight <= 0.0:
+        raise ValueError("the total weight must be greater than 0")
+
     terms = []
     for i in range(n):
         try:
-            d = y_true[i] - y_pred[i]
+            d = t[i] - p[i]
+            q = d ** 2
+            u = w[i] * q
         except (OverflowError, ValueError) as exc:
             raise FloatingPointError(
                 "non-finite value encountered during mean squared error"
             ) from exc
-        if isinstance(d, float) and not math.isfinite(d):
+        if (
+            not math.isfinite(d)
+            or not math.isfinite(q)
+            or not math.isfinite(u)
+        ):
             raise FloatingPointError(
                 "non-finite value encountered during mean squared error"
             )
-        try:
-            square = d ** 2
-        except (OverflowError, ValueError) as exc:
-            raise FloatingPointError(
-                "non-finite value encountered during mean squared error"
-            ) from exc
-        if isinstance(square, float) and not math.isfinite(square):
-            raise FloatingPointError(
-                "non-finite value encountered during mean squared error"
-            )
-        terms.append(square)
+        terms.append(u)
+
     try:
         total = math.fsum(terms)
     except (OverflowError, ValueError) as exc:
@@ -1557,8 +1631,8 @@ def mean_squared_error(y_true, y_pred):
             "non-finite value encountered during mean squared error"
         )
     try:
-        result = total / n
-    except (OverflowError, ValueError) as exc:
+        result = total / total_weight
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
         raise FloatingPointError(
             "non-finite value encountered during mean squared error"
         ) from exc
