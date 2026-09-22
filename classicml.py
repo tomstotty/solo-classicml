@@ -207,6 +207,7 @@ __all__ = [
     "coverage_error",
     "label_ranking_loss",
     "hamming_loss",
+    "hinge_loss",
     "dumps",
     "loads",
 ]
@@ -9276,6 +9277,160 @@ def hamming_loss(y_true, y_pred, sample_weight=None) -> float:
         if not math.isfinite(term):
             raise non_finite(None)
         weighted_terms.append(term)
+    try:
+        weighted_total = math.fsum(weighted_terms)
+    except (OverflowError, ValueError) as exc:
+        raise non_finite(exc) from exc
+    if not math.isfinite(weighted_total):
+        raise non_finite(None)
+    try:
+        result = weighted_total / total_weight
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        raise non_finite(exc) from exc
+    if not math.isfinite(result):
+        raise non_finite(None)
+    if result == 0:
+        return 0.0
+    return result
+
+
+def hinge_loss(y_true, y_pred, sample_weight=None) -> float:
+    """Return the weighted mean hinge loss of binary margin predictions.
+
+    ``y_true`` and ``y_pred`` must each be a non-empty list of the same
+    length. Every element of ``y_true`` must be an integer whose type is
+    exactly ``int`` with value ``-1`` or ``1``; every element of
+    ``y_pred`` must be a finite number whose type is exactly ``int`` or
+    ``float`` (booleans are rejected). ``sample_weight`` must be
+    ``None`` -- every sample then weighs ``1.0`` -- or a list with the
+    same length whose elements are finite non-negative values of type
+    exactly ``int`` or ``float`` (booleans are rejected). Any other
+    container, length, type, value, or finiteness violation (including
+    ``OverflowError`` raised by ``math.isfinite``) raises ValueError.
+
+    After validation the predictions and weights are converted to
+    ``float`` in sample order, and ``math.fsum`` computes the total
+    weight ``W = sum(w_i)``; overflow or invalid operations during that
+    summation, a non-finite ``W``, or ``W <= 0`` raise ValueError. For
+    sample ``i`` the margin is ``z_i = 1.0 - y_true_i * score_i``, the
+    per-sample loss is ``max(0.0, z_i)``, and the weighted term is
+    ``w_i * loss_i``, all of which must stay finite. The weighted loss
+    ``L = sum(w_i * loss_i)`` is accumulated with ``math.fsum`` in
+    sample order, and the result is ``L / W``. Overflow, invalid
+    operations, division by zero, or non-finite values during the
+    post-validation conversions, the multiplication or subtraction, the
+    ``max``, the weighted multiplication, the loss summation, or the
+    final division raise FloatingPointError. An exact zero result is
+    normalized to ``0.0``.
+
+    The return value is a float. The inputs are not modified.
+    Deterministic: same inputs, same result.
+    """
+    if not isinstance(y_true, list) or len(y_true) == 0:
+        raise ValueError("y_true must be a non-empty list")
+    if not isinstance(y_pred, list) or len(y_pred) == 0:
+        raise ValueError("y_pred must be a non-empty list")
+    n = len(y_true)
+    if len(y_pred) != n:
+        raise ValueError("y_true and y_pred must have the same length")
+
+    for value in y_true:
+        if type(value) is not int or value not in (-1, 1):
+            raise ValueError("y_true must contain only the integers -1 and 1")
+
+    for value in y_pred:
+        if type(value) not in (int, float):
+            raise ValueError(
+                "y_pred must contain only finite non-boolean numbers"
+            )
+        # math.isfinite raises OverflowError for ints too large to
+        # convert to float; such values fail the finite requirement.
+        try:
+            finite = math.isfinite(value)
+        except OverflowError as exc:
+            raise ValueError(
+                "y_pred must contain only finite non-boolean numbers"
+            ) from exc
+        if not finite:
+            raise ValueError(
+                "y_pred must contain only finite non-boolean numbers"
+            )
+
+    if sample_weight is not None:
+        if not isinstance(sample_weight, list) or len(sample_weight) != n:
+            raise ValueError(
+                "sample_weight must be a list with the same length as "
+                "y_true"
+            )
+        for value in sample_weight:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                ) from exc
+            if not finite or value < 0:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+
+    def non_finite(exc):
+        return FloatingPointError(
+            "non-finite value encountered during hinge loss"
+        )
+
+    try:
+        scores = [float(value) for value in y_pred]
+    except (OverflowError, ValueError) as exc:
+        raise non_finite(exc) from exc
+    for value in scores:
+        if not math.isfinite(value):
+            raise non_finite(None)
+
+    if sample_weight is None:
+        weights = [1.0] * n
+    else:
+        try:
+            weights = [float(value) for value in sample_weight]
+        except (OverflowError, ValueError) as exc:
+            raise non_finite(exc) from exc
+        for value in weights:
+            if not math.isfinite(value):
+                raise non_finite(None)
+
+    try:
+        total_weight = math.fsum(weights)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError("the total weight must be greater than 0") from exc
+    if not math.isfinite(total_weight) or total_weight <= 0.0:
+        raise ValueError("the total weight must be greater than 0")
+
+    weighted_terms = []
+    for i in range(n):
+        try:
+            margin = 1.0 - y_true[i] * scores[i]
+        except (OverflowError, ValueError) as exc:
+            raise non_finite(exc) from exc
+        if not math.isfinite(margin):
+            raise non_finite(None)
+        loss = max(0.0, margin)
+        if not math.isfinite(loss):
+            raise non_finite(None)
+        try:
+            term = weights[i] * loss
+        except (OverflowError, ValueError) as exc:
+            raise non_finite(exc) from exc
+        if not math.isfinite(term):
+            raise non_finite(None)
+        weighted_terms.append(term)
+
     try:
         weighted_total = math.fsum(weighted_terms)
     except (OverflowError, ValueError) as exc:
