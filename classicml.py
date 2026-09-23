@@ -1129,6 +1129,184 @@ class RandomForestClassifier:
         return results
 
 
+class AdaBoostClassifier:
+    """Deterministic discrete AdaBoost classifier with decision stumps.
+
+    Training starts with uniform weights ``w_i = 1 / n``. Every round
+    enumerates weak classifiers in ascending feature-index order; for a
+    feature its distinct column values in ascending order serve as
+    thresholds ``t``, and for each threshold the sign ``s`` is tried as
+    ``-1`` then ``1``. A stump predicts ``h = s`` when ``x <= t`` and
+    ``h = -s`` otherwise. Its weighted error is
+    ``e = fsum(w_i for misclassified samples)`` accumulated in sample
+    order, and the selected stump is the first candidate in ascending
+    ``(e, feature index, t, s)`` order.
+
+    If ``e >= 0.5`` boosting ends; with no stump saved yet this is an
+    error. Otherwise the stump weight is
+    ``a = 0.5 * log((1 - q) / q)`` with
+    ``q = min(max(e, 1e-15), 1 - 1e-15)``. The weights become
+    ``w_i * exp(-a * y_i * h_i)``, normalized by their sample-order
+    ``fsum``, and the stump together with ``a`` is saved. A perfectly
+    fitting stump (``e == 0``) ends boosting after it is saved; at most
+    ``n_estimators`` rounds run.
+
+    Prediction sums ``a * h`` over the saved stumps in save order using
+    ``math.fsum`` and returns ``1`` for a positive sum and ``-1``
+    otherwise. Every arithmetic step after input validation is checked:
+    overflow, invalid operations, and non-finite intermediate values
+    raise FloatingPointError.
+    """
+
+    def __init__(self, n_estimators: int = 50):
+        if type(n_estimators) is not int or n_estimators <= 0:
+            raise ValueError("n_estimators must be a positive integer")
+        self.n_estimators = n_estimators
+        self._weak = None
+        self._n_features = None
+
+    def fit(self, X, y):
+        self._weak = None
+        self._n_features = None
+        width = _check_tree_matrix(X)
+        n = len(X)
+        if not isinstance(y, list) or len(y) != n:
+            raise ValueError("y must be a list with the same length as X")
+        for value in y:
+            if type(value) is not int or (value != -1 and value != 1):
+                raise ValueError("y must contain only the labels -1 and 1")
+        has_negative = False
+        has_positive = False
+        for value in y:
+            if value == -1:
+                has_negative = True
+            else:
+                has_positive = True
+        if not has_negative or not has_positive:
+            raise ValueError("y must contain both labels -1 and 1")
+
+        try:
+            weights = [1.0 / n for _ in range(n)]
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during boosting"
+            ) from exc
+        for value in weights:
+            if not math.isfinite(value):
+                raise FloatingPointError(
+                    "non-finite value encountered during boosting"
+                )
+
+        weak = []
+        for _ in range(self.n_estimators):
+            best = None  # (error, feature index, threshold, sign)
+            best_preds = None
+            for j in range(width):
+                values = sorted(set(row[j] for row in X))
+                for t in values:
+                    for s in (-1, 1):
+                        preds = [
+                            s if X[i][j] <= t else -s for i in range(n)
+                        ]
+                        missed = [
+                            weights[i]
+                            for i in range(n)
+                            if preds[i] != y[i]
+                        ]
+                        try:
+                            error = math.fsum(missed)
+                        except (OverflowError, ValueError) as exc:
+                            raise FloatingPointError(
+                                "non-finite value encountered during boosting"
+                            ) from exc
+                        if not math.isfinite(error):
+                            raise FloatingPointError(
+                                "non-finite value encountered during boosting"
+                            )
+                        key = (error, j, t, s)
+                        if best is None or key < best:
+                            best = key
+                            best_preds = preds
+
+            error, feature, threshold, sign = best
+            if error >= 0.5:
+                if not weak:
+                    raise ValueError(
+                        "every weak classifier has weighted error at "
+                        "least 0.5"
+                    )
+                break
+
+            try:
+                q = min(max(error, 1e-15), 1.0 - 1e-15)
+                ratio = (1.0 - q) / q
+                alpha = 0.5 * math.log(ratio)
+                if not math.isfinite(alpha):
+                    raise FloatingPointError(
+                        "non-finite value encountered during boosting"
+                    )
+                scaled = [
+                    weights[i]
+                    * math.exp(-alpha * y[i] * best_preds[i])
+                    for i in range(n)
+                ]
+                for value in scaled:
+                    if not math.isfinite(value):
+                        raise FloatingPointError(
+                            "non-finite value encountered during boosting"
+                        )
+                total = math.fsum(scaled)
+                if not math.isfinite(total) or total <= 0.0:
+                    raise FloatingPointError(
+                        "non-finite value encountered during boosting"
+                    )
+                weights = [value / total for value in scaled]
+                for value in weights:
+                    if not math.isfinite(value):
+                        raise FloatingPointError(
+                            "non-finite value encountered during boosting"
+                        )
+            except (OverflowError, ValueError) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during boosting"
+                ) from exc
+
+            weak.append((feature, threshold, sign, alpha))
+            if error == 0.0:
+                break
+
+        self._weak = weak
+        self._n_features = width
+        return self
+
+    def predict(self, X) -> "list[int]":
+        if self._weak is None:
+            raise ValueError("model must be fitted before predict is called")
+        width = _check_tree_matrix(X)
+        if width != self._n_features:
+            raise ValueError(
+                "X must have the same number of features as the training data"
+            )
+
+        results = []
+        try:
+            for row in X:
+                score = math.fsum(
+                    alpha * (sign if row[feature] <= threshold else -sign)
+                    for feature, threshold, sign, alpha in self._weak
+                )
+                if not math.isfinite(score):
+                    raise FloatingPointError(
+                        "non-finite value encountered during prediction"
+                    )
+                results.append(1 if score > 0.0 else -1)
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during prediction"
+            ) from exc
+        return results
+
+
 class StandardScaler:
     """Standardize columns by their mean and population standard deviation.
 
