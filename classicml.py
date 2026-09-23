@@ -1885,15 +1885,22 @@ class AgglomerativeClustering:
     and the pair with the lexicographically smallest
     ``(distance, A, B)`` tuple -- distance first, then the two member
     tuples -- is merged; the merged members stay in ascending order.
-    Merging repeats until ``n_clusters`` clusters remain. The final
-    clusters are numbered from zero in ascending order of their smallest
-    member index, and ``labels_`` is an integer list in input order. The
-    input is never modified, and no randomness is used.
+    Leaves have IDs ``0`` through ``n - 1``; the cluster created by
+    merge ``r`` (counted from zero) gets ID ``n + r``. Each merge
+    appends ``[id(A), id(B)]`` to ``children_`` in the order fixed by
+    the winning key, and the merge distance as a ``float`` to
+    ``distances_``. Merging repeats until ``n_clusters`` clusters
+    remain, so both lists have length ``n - n_clusters`` and are empty
+    when no merge occurs. The final clusters are numbered from zero in
+    ascending order of their smallest member index, and ``labels_`` is
+    an integer list in input order. The input is never modified, and no
+    randomness is used.
 
-    ``fit`` clears ``labels_`` before validation, leaves it ``None`` if
-    fitting fails, and returns ``self``; ``fit_predict`` calls ``fit``
-    and returns a fresh copy of ``labels_``. Any subtraction, squaring,
-    ``math.fsum``, square root, or division that raises
+    ``fit`` clears ``labels_``, ``children_``, and ``distances_``
+    before validation, leaves all three ``None`` if fitting fails, and
+    returns ``self``; ``fit_predict`` calls ``fit`` and returns a fresh
+    copy of ``labels_``. Any subtraction, squaring, ``math.fsum``,
+    square root, or division that raises
     ``OverflowError``/``ValueError`` or yields a non-finite value raises
     ``FloatingPointError``.
     """
@@ -1912,6 +1919,8 @@ class AgglomerativeClustering:
         self.n_clusters = n_clusters
         self.linkage = linkage
         self.labels_ = None
+        self.children_ = None
+        self.distances_ = None
 
     @staticmethod
     def _distance(row_a, row_b):
@@ -2007,9 +2016,11 @@ class AgglomerativeClustering:
         return best
 
     def fit(self, X):
-        # Clear before validation so a failed fit always leaves labels_
-        # as None.
+        # Clear before validation so a failed fit always leaves the
+        # fitted attributes as None.
         self.labels_ = None
+        self.children_ = None
+        self.distances_ = None
         _check_exact_matrix(X)
         n = len(X)
         if n < self.n_clusters:
@@ -2018,10 +2029,17 @@ class AgglomerativeClustering:
             )
 
         clusters = [(i,) for i in range(n)]
+        # Current node ID of each cluster: leaves keep 0..n-1 and the
+        # r-th merge creates node n+r.
+        cluster_ids = list(range(n))
+        children = []
+        distances = []
         while len(clusters) > self.n_clusters:
             # Sort clusters by their ascending member tuples before each
             # round so distance ties resolve lexicographically.
-            clusters.sort()
+            order = sorted(range(len(clusters)), key=lambda idx: clusters[idx])
+            clusters = [clusters[idx] for idx in order]
+            cluster_ids = [cluster_ids[idx] for idx in order]
             best_key = None
             best_pair = None
             for a_index in range(len(clusters)):
@@ -2036,12 +2054,21 @@ class AgglomerativeClustering:
                         best_key = key
                         best_pair = (a_index, b_index)
             a_index, b_index = best_pair
+            distance = float(best_key[0])
             merged = tuple(
                 sorted(clusters[a_index] + clusters[b_index])
             )
+            children.append(
+                [cluster_ids[a_index], cluster_ids[b_index]]
+            )
+            distances.append(distance)
+            merged_id = n + len(children) - 1
             del clusters[b_index]
+            del cluster_ids[b_index]
             del clusters[a_index]
+            del cluster_ids[a_index]
             clusters.append(merged)
+            cluster_ids.append(merged_id)
 
         # Number final clusters from zero by ascending smallest member.
         clusters.sort()
@@ -2050,6 +2077,8 @@ class AgglomerativeClustering:
             for index in members:
                 labels[index] = label
         self.labels_ = labels
+        self.children_ = children
+        self.distances_ = distances
         return self
 
     def fit_predict(self, X):
