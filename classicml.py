@@ -1897,6 +1897,17 @@ class GaussianMixture:
     (ties go to the smallest index) and the responsibility matrix with
     one row per input value and one column per component in ascending
     component order.
+
+    After a successful fit, ``score_samples`` returns, for each input
+    value in input order, the log of the mixture density
+
+        s = a + log(sum_j exp(l_j - a)),  a = max_j l_j,
+
+    with ``l_j`` the per-component log responsibility and the sum taken
+    over components in ascending index order via ``math.fsum``;
+    ``score`` returns the ``math.fsum`` mean of those values. Any
+    arithmetic failure or non-finite intermediate value raises
+    FloatingPointError; an exact zero is reported as positive ``0.0``.
     """
 
     def __init__(self, n_components=2):
@@ -2128,6 +2139,110 @@ class GaussianMixture:
                     best_index = j
             labels.append(best_index)
         return labels, responsibilities
+
+    def score_samples(self, X) -> list[float]:
+        """Return the log mixture density of each input value in input
+        order.
+
+        For each value ``x`` and component ``j`` the log responsibility
+        ``l_j`` is computed in ascending component order; with
+        ``a = max_j l_j`` the result is ``s = a + log(fsum(exp(l_j -
+        a)))``, all via :mod:`math`. An arithmetic
+        ``OverflowError``/``ValueError``/``ZeroDivisionError`` or any
+        non-finite intermediate value, result, or fitted mean raises
+        FloatingPointError. The input is not modified.
+        """
+        if self.weights_ is None:
+            raise ValueError(
+                "model must be fitted before score_samples is called"
+            )
+        self._check_1d_vector(X)
+
+        for mean in self.means_:
+            if not math.isfinite(mean):
+                raise FloatingPointError(
+                    "non-finite value encountered while scoring"
+                )
+
+        scores = []
+        k = self.n_components
+        for x in X:
+            log_ells = []
+            largest = None
+            for j in range(k):
+                try:
+                    ell = (
+                        math.log(self.weights_[j])
+                        - (
+                            math.log(
+                                2.0 * math.pi * self.variances_[j]
+                            )
+                            + (x - self.means_[j]) ** 2
+                            / self.variances_[j]
+                        )
+                        / 2.0
+                    )
+                except (
+                    OverflowError,
+                    ValueError,
+                    ZeroDivisionError,
+                ) as exc:
+                    raise FloatingPointError(
+                        "non-finite value encountered while scoring"
+                    ) from exc
+                if not math.isfinite(ell):
+                    raise FloatingPointError(
+                        "non-finite value encountered while scoring"
+                    )
+                log_ells.append(ell)
+                if largest is None or ell > largest:
+                    largest = ell
+
+            try:
+                shifted = [math.exp(ell - largest) for ell in log_ells]
+                total = math.fsum(shifted)
+                score = largest + math.log(total)
+            except (
+                OverflowError,
+                ValueError,
+                ZeroDivisionError,
+            ) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered while scoring"
+                ) from exc
+            if not math.isfinite(score):
+                raise FloatingPointError(
+                    "non-finite value encountered while scoring"
+                )
+            if score == 0.0:
+                score = 0.0
+            scores.append(score)
+        return scores
+
+    def score(self, X) -> float:
+        """Return the ``math.fsum`` mean of :meth:`score_samples`."""
+        if self.weights_ is None:
+            raise ValueError(
+                "model must be fitted before score is called"
+            )
+        samples = self.score_samples(X)
+        try:
+            result = math.fsum(samples) / len(X)
+        except (
+            OverflowError,
+            ValueError,
+            ZeroDivisionError,
+        ) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered while scoring"
+            ) from exc
+        if not math.isfinite(result):
+            raise FloatingPointError(
+                "non-finite value encountered while scoring"
+            )
+        if result == 0.0:
+            result = 0.0
+        return result
 
 
 def _check_metric_vectors(y_true, y_pred):
