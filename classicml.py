@@ -19,6 +19,9 @@ Exports:
     GradientBoostingRegressor -- deterministic gradient boosting for
         regression with level-wise decision stumps and a constant
         learning rate.
+    GradientBoostingClassifier -- deterministic gradient boosting for
+        binary classification (logistic loss) with decision stumps and a
+        constant learning rate.
     StandardScaler -- deterministic standardization by column mean and
         population standard deviation.
     KMeans -- deterministic k-means clustering with Lloyd's iterations and
@@ -185,6 +188,7 @@ __all__ = [
     "RandomForestClassifier",
     "AdaBoostClassifier",
     "GradientBoostingRegressor",
+    "GradientBoostingClassifier",
     "StandardScaler",
     "KMeans",
     "PCA",
@@ -1693,6 +1697,24 @@ def _check_gradient_target(y, n):
             raise ValueError("y must contain only finite non-boolean numbers")
 
 
+def _check_binary_gradient_target(y, n):
+    """Validate a 0/1 exact-integer target vector with the same length as
+    X; booleans and subclasses are rejected and both labels must occur."""
+    if not isinstance(y, list) or len(y) != n:
+        raise ValueError("y must be a list with the same length as X")
+    has_zero = False
+    has_one = False
+    for value in y:
+        if type(value) is not int or value not in (0, 1):
+            raise ValueError("y must contain only the integers 0 and 1")
+        if value == 0:
+            has_zero = True
+        else:
+            has_one = True
+    if not has_zero or not has_one:
+        raise ValueError("y must contain both labels 0 and 1")
+
+
 class GradientBoostingRegressor:
     """Deterministic gradient boosting for regression with level-wise
     decision stumps and a constant learning rate.
@@ -1996,6 +2018,264 @@ class GradientBoostingRegressor:
             current = updated
             stages.append(current)
         return stages
+
+
+class GradientBoostingClassifier:
+    """Deterministic gradient boosting for binary classification with
+    logistic loss, level-wise decision stumps, and a constant learning
+    rate.
+
+    Every target is the exact integer ``0`` or ``1`` and both classes must
+    occur. With ``F = math.fsum`` the initial log-odds constant is
+    ``c = log(q / (1 - q))`` where
+    ``q = min(max(F(y) / n, 1e-15), 1 - 1e-15)``; every training score
+    starts at ``c``. At each round the probabilities ``p_i`` follow the
+    numerically stable sigmoid used by LogisticRegression (the ``z >= 0``
+    branch uses ``1 / (1 + exp(-z))``, otherwise ``e = exp(z);
+    e / (1 + e)``) and the pseudo-residuals are ``r_i = y_i - p_i``.
+    Candidate stumps are enumerated exactly as in
+    GradientBoostingRegressor: feature index ``j`` ascending, then the
+    distinct ascending values of column ``j`` except its maximum, with the
+    ``x_ij <= t`` samples on the left. Each output is the sample-order
+    ``math.fsum`` mean residual of its side, and the selected stump is the
+    first in ascending lexicographic
+    ``(F((r_i - side_output) ** 2 in sample order), j, t)`` order. The
+    saved increments are ``learning_rate`` times the two side outputs, and
+    the training scores are updated synchronously with them.
+
+    A round ends training without saving a stump when no threshold exists
+    on any feature; otherwise training stops after saving when the larger
+    absolute value of the two increments is at most ``tol``, and in any
+    case after at most ``n_estimators`` rounds. Prediction accumulates the
+    saved increment of the side each sample belongs to, in save order,
+    starting from ``c``; the label is ``1`` when the resulting score is at
+    least zero and ``0`` otherwise. No randomness is used.
+    """
+
+    def __init__(self, n_estimators=100, learning_rate=0.1, tol=1e-8):
+        if type(n_estimators) is not int or n_estimators <= 0:
+            raise ValueError("n_estimators must be a positive integer")
+        _require_exact_finite_positive(learning_rate, "learning_rate")
+        _require_exact_finite_positive(tol, "tol")
+
+        self.n_estimators = n_estimators
+        self.learning_rate = learning_rate
+        self.tol = tol
+        self._constant = None
+        self._stumps = None
+        self._n_features = None
+
+    def fit(self, X, y):
+        # Clear the previous fit up front so that a failed validation or
+        # computation leaves the model unfitted.
+        self._constant = None
+        self._stumps = None
+        self._n_features = None
+        try:
+            width = _check_gradient_matrix(X)
+            _check_binary_gradient_target(y, len(X))
+        except OverflowError as exc:
+            # An int too large to convert to float failed its finiteness
+            # check: still a rejected input, hence ValueError.
+            raise ValueError(
+                "X must contain only finite non-boolean numbers"
+            ) from exc
+
+        n = len(X)
+        try:
+            proportion = math.fsum(y) / n
+            proportion = min(max(proportion, 1e-15), 1.0 - 1e-15)
+            constant = math.log(proportion / (1.0 - proportion))
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during gradient boosting"
+            ) from exc
+        if not math.isfinite(constant):
+            raise FloatingPointError(
+                "non-finite value encountered during gradient boosting"
+            )
+        constant = _positive_zero(constant)
+
+        scores = [constant for _ in range(n)]
+        eta = self.learning_rate
+        stumps = []
+
+        for _ in range(self.n_estimators):
+            residuals = []
+            for i in range(n):
+                try:
+                    probability = _sigmoid(scores[i])
+                    residual = y[i] - probability
+                except (OverflowError, ValueError) as exc:
+                    raise FloatingPointError(
+                        "non-finite value encountered during gradient boosting"
+                    ) from exc
+                if not _is_finite_or_int(residual):
+                    raise FloatingPointError(
+                        "non-finite value encountered during gradient boosting"
+                    )
+                residuals.append(_positive_zero(residual))
+
+            best = None  # (squared error, feature, threshold)
+            best_left = None
+            best_right = None
+            for j in range(width):
+                thresholds = sorted(set(row[j] for row in X))[:-1]
+                for t in thresholds:
+                    left = [
+                        residuals[i] for i in range(n) if X[i][j] <= t
+                    ]
+                    right = [
+                        residuals[i]
+                        for i in range(n)
+                        if not X[i][j] <= t
+                    ]
+                    left_mean, right_mean = self._side_means(left, right)
+
+                    terms = []
+                    for i in range(n):
+                        mean = left_mean if X[i][j] <= t else right_mean
+                        try:
+                            deviation = residuals[i] - mean
+                            term = deviation ** 2
+                        except (OverflowError, ValueError) as exc:
+                            raise FloatingPointError(
+                                "non-finite value encountered during gradient "
+                                "boosting"
+                            ) from exc
+                        if not _is_finite_or_int(term):
+                            raise FloatingPointError(
+                                "non-finite value encountered during gradient "
+                                "boosting"
+                            )
+                        terms.append(term)
+                    try:
+                        error = math.fsum(terms)
+                    except (OverflowError, ValueError) as exc:
+                        raise FloatingPointError(
+                            "non-finite value encountered during gradient "
+                            "boosting"
+                        ) from exc
+                    if not math.isfinite(error):
+                        raise FloatingPointError(
+                            "non-finite value encountered during gradient "
+                            "boosting"
+                        )
+
+                    candidate = (error, j, t)
+                    if best is None or candidate < best:
+                        best = candidate
+                        best_left = left_mean
+                        best_right = right_mean
+
+            if best is None:
+                # Every column is constant: no split is possible, so the
+                # constant model is retained.
+                break
+
+            try:
+                increment_left = eta * best_left
+                increment_right = eta * best_right
+            except (OverflowError, ValueError) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during gradient boosting"
+                ) from exc
+            if not (
+                _is_finite_or_int(increment_left)
+                and _is_finite_or_int(increment_right)
+            ):
+                raise FloatingPointError(
+                    "non-finite value encountered during gradient boosting"
+                )
+            increment_left = _positive_zero(increment_left)
+            increment_right = _positive_zero(increment_right)
+
+            _, feature, threshold = best
+            stumps.append((feature, threshold, increment_left, increment_right))
+            for i in range(n):
+                increment = (
+                    increment_left
+                    if X[i][feature] <= threshold
+                    else increment_right
+                )
+                try:
+                    updated = scores[i] + increment
+                except (OverflowError, ValueError) as exc:
+                    raise FloatingPointError(
+                        "non-finite value encountered during gradient boosting"
+                    ) from exc
+                if not _is_finite_or_int(updated):
+                    raise FloatingPointError(
+                        "non-finite value encountered during gradient boosting"
+                    )
+                scores[i] = _positive_zero(updated)
+
+            if (
+                max(abs(increment_left), abs(increment_right)) <= self.tol
+            ):
+                break
+
+        self._constant = constant
+        self._stumps = stumps
+        self._n_features = width
+        return self
+
+    @staticmethod
+    def _side_means(left, right):
+        """Return the sample-order fsum means of the two non-empty sides."""
+        means = []
+        for side in (left, right):
+            try:
+                mean = math.fsum(side) / len(side)
+            except (OverflowError, ValueError) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during gradient boosting"
+                ) from exc
+            if not math.isfinite(mean):
+                raise FloatingPointError(
+                    "non-finite value encountered during gradient boosting"
+                )
+            means.append(_positive_zero(mean))
+        return means[0], means[1]
+
+    def predict(self, X) -> list[int]:
+        if self._stumps is None:
+            raise ValueError("model must be fitted before predict is called")
+        try:
+            width = _check_gradient_matrix(X)
+        except OverflowError as exc:
+            raise ValueError(
+                "X must contain only finite non-boolean numbers"
+            ) from exc
+        if width != self._n_features:
+            raise ValueError(
+                "X must have the same number of features as the training data"
+            )
+
+        results = []
+        for row in X:
+            score = self._constant
+            for feature, threshold, increment_left, increment_right in (
+                self._stumps
+            ):
+                increment = (
+                    increment_left
+                    if row[feature] <= threshold
+                    else increment_right
+                )
+                try:
+                    score = score + increment
+                except (OverflowError, ValueError) as exc:
+                    raise FloatingPointError(
+                        "non-finite value encountered during gradient boosting"
+                    ) from exc
+                if not _is_finite_or_int(score):
+                    raise FloatingPointError(
+                        "non-finite value encountered during gradient boosting"
+                    )
+                score = _positive_zero(score)
+            results.append(1 if score >= 0 else 0)
+        return results
 
 
 class StandardScaler:
