@@ -14352,7 +14352,8 @@ def dumps(model):
     LogisticRegression, MultinomialLogisticRegression, StandardScaler,
     DecisionTreeClassifier, DecisionTreeRegressor,
     RandomForestClassifier, RandomForestRegressor, AdaBoostClassifier,
-    GradientBoostingRegressor, GaussianMixture, KNeighborsRegressor, or
+    GradientBoostingRegressor, GradientBoostingClassifier,
+    GaussianMixture, KNeighborsRegressor, or
     KNeighborsClassifier model to compact JSON text.
 
     The result contains no whitespace and no trailing newline. Integers
@@ -14416,9 +14417,11 @@ def dumps(model):
     decimal places; the quantized text must convert back with ``float``
     to exactly the original value.
 
-    For GradientBoostingRegressor the top-level keys are ``class``,
+    For GradientBoostingRegressor and GradientBoostingClassifier the
+    top-level keys are ``class``,
     ``n_estimators``, ``learning_rate``, ``tol``, ``n_features_in``,
-    ``constant``, ``stumps`` in that order; the two integers are
+    ``constant``, ``stumps`` in that order; ``class`` is the same-named
+    string of the fitted model; the two integers are
     positive JSON integers, ``learning_rate`` and ``tol`` are strictly
     positive finite exact int/float values quantized to 10 decimal
     places that must remain positive after quantization, and
@@ -14566,12 +14569,22 @@ def dumps(model):
 
     if isinstance(model, GradientBoostingRegressor):
         try:
-            return _dumps_boosting(model)
+            return _dumps_boosting(model, "GradientBoostingRegressor")
         except ValueError:
             raise
         except Exception as exc:
             raise ValueError(
                 "invalid GradientBoostingRegressor state"
+            ) from exc
+
+    if isinstance(model, GradientBoostingClassifier):
+        try:
+            return _dumps_boosting(model, "GradientBoostingClassifier")
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError(
+                "invalid GradientBoostingClassifier state"
             ) from exc
 
     if isinstance(model, GaussianMixture):
@@ -14608,6 +14621,7 @@ def dumps(model):
         "StandardScaler, DecisionTreeClassifier, DecisionTreeRegressor, "
         "RandomForestClassifier, RandomForestRegressor, "
         "AdaBoostClassifier, GradientBoostingRegressor, "
+        "GradientBoostingClassifier, "
         "GaussianMixture, KNeighborsRegressor, and "
         "KNeighborsClassifier models"
     )
@@ -15406,8 +15420,9 @@ def _quantize_boosting_number(value, name):
     return token
 
 
-def _dumps_boosting(model):
-    """Serialize a fitted GradientBoostingRegressor.
+def _dumps_boosting(model, class_name):
+    """Serialize a fitted GradientBoostingRegressor or
+    GradientBoostingClassifier (``class_name`` selects the format tag).
 
     The top-level keys are class, n_estimators, learning_rate, tol,
     n_features_in, constant, stumps in that order; ``n_estimators`` and
@@ -15430,7 +15445,7 @@ def _dumps_boosting(model):
     n_features = model._n_features
     if constant is None or stumps is None or n_features is None:
         raise ValueError(
-            "GradientBoostingRegressor must be fitted before dumps is "
+            class_name + " must be fitted before dumps is "
             "called"
         )
     n_estimators = model.n_estimators
@@ -15464,7 +15479,9 @@ def _dumps_boosting(model):
         _encode_boosting_stump(stump, n_features) for stump in stumps
     ) + "]"
     return (
-        '{"class":"GradientBoostingRegressor","n_estimators":'
+        '{"class":"'
+        + class_name
+        + '","n_estimators":'
         + str(n_estimators)
         + ',"learning_rate":'
         + learning_rate_text
@@ -16338,18 +16355,18 @@ def _load_stump(node, n_features):
     return (feature, threshold, sign, alpha)
 
 
-def _load_boosting(pairs):
+def _load_boosting(pairs, class_name):
     keys = tuple(key for key, _ in pairs)
     if keys != _SERIAL_KEYS_BOOSTING:
         raise ValueError(
-            "GradientBoostingRegressor JSON must have exactly the "
+            class_name + " JSON must have exactly the "
             "serialized keys in the serialized order"
         )
     data = _convert(pairs)
 
-    class_name = data["class"]
-    if not isinstance(class_name, str) or class_name != "GradientBoostingRegressor":
-        raise ValueError('class must be "GradientBoostingRegressor"')
+    class_entry = data["class"]
+    if not isinstance(class_entry, str) or class_entry != class_name:
+        raise ValueError('class must be "%s"' % class_name)
 
     n_estimators = _expect_int(data["n_estimators"], "n_estimators")
     if n_estimators <= 0:
@@ -16374,7 +16391,11 @@ def _load_boosting(pairs):
         _load_boosting_stump(stump, n_features) for stump in stumps_node
     ]
 
-    model = GradientBoostingRegressor(
+    model_class = {
+        "GradientBoostingRegressor": GradientBoostingRegressor,
+        "GradientBoostingClassifier": GradientBoostingClassifier,
+    }[class_name]
+    model = model_class(
         n_estimators=n_estimators,
         learning_rate=learning_rate,
         tol=tol,
@@ -16547,7 +16568,8 @@ def loads(text):
     LogisticRegression, MultinomialLogisticRegression, StandardScaler,
     DecisionTreeClassifier, DecisionTreeRegressor,
     RandomForestClassifier, RandomForestRegressor, AdaBoostClassifier,
-    GradientBoostingRegressor, GaussianMixture, KNeighborsRegressor, or
+    GradientBoostingRegressor, GradientBoostingClassifier,
+    GaussianMixture, KNeighborsRegressor, or
     KNeighborsClassifier from text produced by dumps.
 
     Only the exact byte format emitted by :func:`dumps` is accepted: a
@@ -16565,7 +16587,8 @@ def loads(text):
     StandardScaler/DecisionTreeClassifier/DecisionTreeRegressor/
     RandomForestClassifier/RandomForestRegressor from ``n_features_in``,
     AdaBoostClassifier from ``n_features_in``,
-    GradientBoostingRegressor from ``n_features_in``,
+    GradientBoostingRegressor/GradientBoostingClassifier from
+    ``n_features_in``,
     GaussianMixture from ``n_components``, KNeighborsRegressor from
     ``n_features_in`` with its stored ``X``/``y`` arrays copied rather
     than shared, and KNeighborsClassifier from ``n_features_in`` with
@@ -16676,7 +16699,14 @@ def loads(text):
             raise ValueError("malformed serialized model") from exc
     if class_entry == "GradientBoostingRegressor":
         try:
-            return _load_boosting(pairs)
+            return _load_boosting(pairs, "GradientBoostingRegressor")
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("malformed serialized model") from exc
+    if class_entry == "GradientBoostingClassifier":
+        try:
+            return _load_boosting(pairs, "GradientBoostingClassifier")
         except ValueError:
             raise
         except Exception as exc:
