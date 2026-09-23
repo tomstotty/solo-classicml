@@ -1687,11 +1687,12 @@ class RandomForestRegressor:
     in tree order. For each tree, ``n`` (the training set size) calls to
     ``rng.randrange(n)`` draw a bootstrap sample with replacement;
     repeated rows are kept in draw order. Then, at every other node in
-    left-before-right recursion order,
+    left-before-right recursion order, exactly one call to
     ``sorted(rng.sample(range(p), max_features))`` -- where ``p`` is the
     number of training features -- selects the features searched at that
-    node; single-sample and depth-limited nodes consume no sample. If no
-    selected feature offers a strict improvement the node is a leaf.
+    node; single-sample and depth-limited nodes consume no sample, and
+    every remaining node samples exactly once, even if no selected
+    feature offers a strict improvement (such a node is a leaf).
     Prediction averages the tree leaves in tree order with
     ``math.fsum(leaf_values) / n_estimators``. The same parameters and
     inputs always give the same result.
@@ -14049,6 +14050,7 @@ _SERIAL_KEYS_MULTINOMIAL = (
 _SERIAL_KEYS_SCALER = ("class", "n_features_in", "mean", "scale")
 _SERIAL_KEYS_TREE = ("class", "max_depth", "n_features_in", "tree")
 _SERIAL_KEYS_TREE_NODE = ("label", "feature", "threshold", "left", "right")
+_SERIAL_KEYS_TREE_REGRESSOR = ("class", "max_depth", "n_features_in", "tree")
 _SERIAL_KEYS_GAUSSIAN = (
     "class",
     "n_components",
@@ -14266,7 +14268,8 @@ def _dumps_knn_regressor(model):
 def dumps(model):
     """Serialize a fitted KMeans, PCA, LinearRegression,
     LogisticRegression, MultinomialLogisticRegression, StandardScaler,
-    DecisionTreeClassifier, RandomForestClassifier,
+    DecisionTreeClassifier, DecisionTreeRegressor,
+    RandomForestClassifier,
     RandomForestRegressor, AdaBoostClassifier,
     GradientBoostingRegressor, GaussianMixture, or KNeighborsRegressor
     model to compact JSON text.
@@ -14285,6 +14288,20 @@ def dumps(model):
     ``feature``, ``threshold``, ``left``, ``right`` in that order, with
     leaves encoded as ``feature`` -1, ``threshold`` 0.0000000000 and
     empty ``left``/``right`` arrays.
+
+    For DecisionTreeRegressor the top-level keys are ``class``,
+    ``max_depth``, ``n_features_in``, ``tree`` in that order; ``class``
+    is ``"DecisionTreeRegressor"``, ``max_depth`` is a positive JSON
+    integer or the string ``"none"``, ``n_features_in`` is a positive
+    JSON integer, and ``tree`` is a single tree whose nodes use the same
+    node encoding as a RandomForestRegressor tree (the keys ``value``,
+    ``feature``, ``threshold``, ``left``, ``right`` in that order, with
+    leaves encoded as ``feature`` -1, ``threshold`` 0.0000000000 and
+    empty ``left``/``right`` arrays, and every node ``value`` and
+    internal ``threshold`` quantized to 10 decimal places via
+    ``Decimal(str(v))`` with ROUND_HALF_UP, negative zero becoming
+    ``0.0000000000``, such that the quantized text converts back with
+    ``float`` to exactly the original value).
 
     For RandomForestClassifier the top-level keys are ``class``,
     ``n_estimators``, ``max_features``, ``seed``, ``n_features_in``,
@@ -14420,6 +14437,14 @@ def dumps(model):
         except Exception as exc:
             raise ValueError("invalid DecisionTreeClassifier state") from exc
 
+    if isinstance(model, DecisionTreeRegressor):
+        try:
+            return _dumps_tree_regressor(model)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("invalid DecisionTreeRegressor state") from exc
+
     if isinstance(model, RandomForestClassifier):
         try:
             return _dumps_forest(model)
@@ -14475,7 +14500,7 @@ def dumps(model):
     raise ValueError(
         "dumps only supports fitted KMeans, PCA, LinearRegression, "
         "LogisticRegression, MultinomialLogisticRegression, "
-        "StandardScaler, DecisionTreeClassifier, "
+        "StandardScaler, DecisionTreeClassifier, DecisionTreeRegressor, "
         "RandomForestClassifier, RandomForestRegressor, "
         "AdaBoostClassifier, GradientBoostingRegressor, "
         "GaussianMixture, and KNeighborsRegressor models"
@@ -14912,6 +14937,47 @@ def _encode_tree_node(node, n_features):
         + left_text
         + ',"right":'
         + right_text
+        + "}"
+    )
+
+
+def _dumps_tree_regressor(model):
+    """Serialize a fitted DecisionTreeRegressor.
+
+    The top-level keys are class, max_depth, n_features_in, tree in that
+    order; class is ``"DecisionTreeRegressor"``, ``max_depth`` is a
+    positive JSON integer or the string ``"none"``, and ``n_features_in``
+    is a positive JSON integer taken from the fitted feature count. The
+    ``tree`` value is a single tree encoded by
+    ``_encode_forest_regressor_node`` exactly as a RandomForestRegressor
+    tree. The construction parameter is re-validated exactly as
+    ``__init__`` performs the check.
+    """
+    root = model._root
+    n_features = model._n_features
+    if root is None or n_features is None:
+        raise ValueError(
+            "DecisionTreeRegressor must be fitted before dumps is called"
+        )
+    max_depth = model.max_depth
+    # Re-validate the construction parameter exactly as __init__ does.
+    if max_depth is not None and (
+        type(max_depth) is not int or max_depth < 1
+    ):
+        raise ValueError("max_depth must be None or a positive integer")
+    if type(n_features) is not int or n_features <= 0:
+        raise ValueError("n_features_in must be a positive integer")
+    if max_depth is None:
+        max_depth_text = '"none"'
+    else:
+        max_depth_text = str(max_depth)
+    return (
+        '{"class":"DecisionTreeRegressor","max_depth":'
+        + max_depth_text
+        + ',"n_features_in":'
+        + str(n_features)
+        + ',"tree":'
+        + _encode_forest_regressor_node(root, n_features)
         + "}"
     )
 
@@ -15930,6 +15996,41 @@ def _load_tree_node(node, n_features):
     return result
 
 
+def _load_tree_regressor(pairs):
+    keys = tuple(key for key, _ in pairs)
+    if keys != _SERIAL_KEYS_TREE_REGRESSOR:
+        raise ValueError(
+            "DecisionTreeRegressor JSON must have exactly the serialized "
+            "keys in the serialized order"
+        )
+    data = _convert(pairs)
+
+    class_name = data["class"]
+    if not isinstance(class_name, str) or class_name != "DecisionTreeRegressor":
+        raise ValueError('class must be "DecisionTreeRegressor"')
+
+    max_depth_entry = data["max_depth"]
+    if isinstance(max_depth_entry, str):
+        if max_depth_entry != "none":
+            raise ValueError('max_depth must be a positive integer or "none"')
+        max_depth = None
+    else:
+        max_depth = _expect_int(max_depth_entry, "max_depth")
+        if max_depth < 1:
+            raise ValueError("max_depth must be a positive integer")
+
+    n_features = _expect_int(data["n_features_in"], "n_features_in")
+    if n_features <= 0:
+        raise ValueError("n_features_in must be greater than 0")
+
+    root = _load_forest_regressor_node(data["tree"], n_features)
+
+    model = DecisionTreeRegressor(max_depth=max_depth)
+    model._root = root
+    model._n_features = n_features
+    return model
+
+
 def _load_forest(pairs):
     keys = tuple(key for key, _ in pairs)
     if keys != _SERIAL_KEYS_FOREST:
@@ -16290,7 +16391,8 @@ def _load_knn_regressor(pairs):
 def loads(text):
     """Reconstruct a fitted KMeans, PCA, LinearRegression,
     LogisticRegression, MultinomialLogisticRegression, StandardScaler,
-    DecisionTreeClassifier, RandomForestClassifier,
+    DecisionTreeClassifier, DecisionTreeRegressor,
+    RandomForestClassifier,
     RandomForestRegressor, AdaBoostClassifier, GradientBoostingRegressor,
     GaussianMixture, or KNeighborsRegressor from text produced by dumps.
 
@@ -16306,7 +16408,8 @@ def loads(text):
     count from centroid width, the linear models from the length of
     ``w``, MultinomialLogisticRegression from the column count of ``W``
     (with its ``classes``/``W``/``b`` arrays copied rather than shared),
-    StandardScaler/DecisionTreeClassifier/RandomForestClassifier/
+    StandardScaler/DecisionTreeClassifier/DecisionTreeRegressor/
+    RandomForestClassifier/
     RandomForestRegressor from ``n_features_in``, AdaBoostClassifier from
     ``n_features_in``,
     GradientBoostingRegressor from ``n_features_in``,
@@ -16383,6 +16486,13 @@ def loads(text):
     if class_entry == "DecisionTreeClassifier":
         try:
             return _load_tree(pairs)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("malformed serialized model") from exc
+    if class_entry == "DecisionTreeRegressor":
+        try:
+            return _load_tree_regressor(pairs)
         except ValueError:
             raise
         except Exception as exc:
