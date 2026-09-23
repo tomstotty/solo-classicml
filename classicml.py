@@ -1908,6 +1908,14 @@ class GaussianMixture:
     ``score`` returns the ``math.fsum`` mean of those values. Any
     arithmetic failure or non-finite intermediate value raises
     FloatingPointError; an exact zero is reported as positive ``0.0``.
+
+    After a successful fit, ``aic`` and ``bic`` return the information
+    criteria ``2*p - 2*L`` and ``log(n)*p - 2*L`` respectively, where
+    ``s`` is the list returned by ``score_samples`` in input order,
+    ``L = fsum(s)``, ``n`` is the number of samples, and
+    ``p = 3*n_components - 1`` free parameters. Any arithmetic failure
+    or non-finite intermediate value raises FloatingPointError; an exact
+    zero is reported as positive ``0.0``.
     """
 
     def __init__(self, n_components=2):
@@ -2243,6 +2251,81 @@ class GaussianMixture:
         if result == 0.0:
             result = 0.0
         return result
+
+    def _information_criterion(self, X, log_penalty):
+        """Shared AIC/BIC machinery; ``log_penalty`` is the penalty per
+        free parameter (``2.0`` for AIC, ``math.log`` applied to the
+        sample count for BIC)."""
+        samples = self.score_samples(X)
+        n = len(X)
+        p = 3 * self.n_components - 1
+        try:
+            total = math.fsum(samples)
+            penalty = (
+                log_penalty(n) if callable(log_penalty) else log_penalty
+            )
+        except (
+            OverflowError,
+            ValueError,
+            ZeroDivisionError,
+        ) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered while scoring"
+            ) from exc
+        if not math.isfinite(total) or not math.isfinite(penalty):
+            raise FloatingPointError(
+                "non-finite value encountered while scoring"
+            )
+        try:
+            result = penalty * p - 2.0 * total
+        except (
+            OverflowError,
+            ValueError,
+            ZeroDivisionError,
+        ) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered while scoring"
+            ) from exc
+        if not math.isfinite(result):
+            raise FloatingPointError(
+                "non-finite value encountered while scoring"
+            )
+        if result == 0.0:
+            result = 0.0
+        return result
+
+    def aic(self, X) -> float:
+        """Return the Akaike information criterion ``2*p - 2*L``.
+
+        ``L`` is the ``math.fsum`` of the values returned by
+        :meth:`score_samples` and ``p = 3*n_components - 1`` free
+        parameters. The model must be fitted; validation of ``X`` is
+        delegated to :meth:`score_samples`. Any arithmetic failure or
+        non-finite intermediate value raises FloatingPointError; an exact
+        zero is reported as positive ``0.0``.
+        """
+        if self.weights_ is None:
+            raise ValueError(
+                "model must be fitted before aic is called"
+            )
+        return self._information_criterion(X, 2.0)
+
+    def bic(self, X) -> float:
+        """Return the Bayesian information criterion ``log(n)*p - 2*L``.
+
+        ``L`` is the ``math.fsum`` of the values returned by
+        :meth:`score_samples`, ``n`` is the number of samples, and
+        ``p = 3*n_components - 1`` free parameters. The model must be
+        fitted; validation of ``X`` is delegated to
+        :meth:`score_samples`. Any arithmetic failure or non-finite
+        intermediate value raises FloatingPointError; an exact zero is
+        reported as positive ``0.0``.
+        """
+        if self.weights_ is None:
+            raise ValueError(
+                "model must be fitted before bic is called"
+            )
+        return self._information_criterion(X, math.log)
 
 
 def _check_metric_vectors(y_true, y_pred):
