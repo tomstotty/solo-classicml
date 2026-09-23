@@ -746,6 +746,66 @@ class KNeighborsClassifier:
             results.append(best_label)
         return results
 
+    def kneighbors(self, X, n_neighbors=None):
+        """Return ``(distances, indices)`` for the k nearest training rows.
+
+        ``distances`` and ``indices`` are equally shaped lists with one row
+        per query row; each index is an ``int`` training row index and each
+        distance is the ``math.sqrt`` of the squared Euclidean distance
+        accumulated with ``math.fsum``, ordered by ascending
+        ``(squared distance, training row index)``. An exact zero distance
+        is reported as positive ``0.0``.
+
+        ``n_neighbors`` must be ``None`` (the constructor value is used) or
+        an integer; the effective k must be between 1 and the number of
+        training samples. Overflow, invalid operations, and non-finite
+        values in the distance computation raise FloatingPointError.
+        """
+        if self._X is None:
+            raise ValueError("model must be fitted before kneighbors is called")
+        width = _check_matrix(X)
+        if width != self._width:
+            raise ValueError(
+                "X must have the same number of features as the training data"
+            )
+        if n_neighbors is None:
+            k = self.n_neighbors
+        elif type(n_neighbors) is not int:
+            raise ValueError("n_neighbors must be None or an integer")
+        else:
+            k = n_neighbors
+        if k < 1 or k > len(self._X):
+            raise ValueError(
+                "n_neighbors must be between 1 and the number of training samples"
+            )
+
+        all_distances = []
+        all_indices = []
+        for query in X:
+            squared = [
+                _squared_distance(query, train_row) for train_row in self._X
+            ]
+            order = sorted(range(len(self._X)), key=lambda i: (squared[i], i))
+            neighbor_indices = order[:k]
+            neighbor_distances = []
+            for i in neighbor_indices:
+                try:
+                    distance = math.sqrt(squared[i])
+                except (OverflowError, ValueError) as exc:
+                    raise FloatingPointError(
+                        "non-finite value encountered during distance computation"
+                    ) from exc
+                if not math.isfinite(distance):
+                    raise FloatingPointError(
+                        "non-finite value encountered during distance computation"
+                    )
+                if distance == 0:
+                    distance = 0.0
+                neighbor_distances.append(distance)
+            all_distances.append(neighbor_distances)
+            all_indices.append(list(neighbor_indices))
+        return all_distances, all_indices
+
 
 def _check_tree_matrix(X):
     """Validate a non-empty rectangular matrix whose elements have type
