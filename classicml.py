@@ -12757,6 +12757,15 @@ _SERIAL_KEYS_ADABOOST = (
     "stumps",
 )
 _SERIAL_KEYS_STUMP = ("feature", "threshold", "sign", "alpha")
+_SERIAL_KEYS_GRADIENT = (
+    "class",
+    "n_estimators",
+    "learning_rate",
+    "tol",
+    "n_features_in",
+    "constant",
+    "stumps",
+)
 
 
 def _quantize_fixed(value):
@@ -12846,8 +12855,8 @@ def _encode_vector(vector, length):
 def dumps(model):
     """Serialize a fitted KMeans, PCA, LinearRegression,
     LogisticRegression, StandardScaler, DecisionTreeClassifier,
-    RandomForestClassifier, AdaBoostClassifier, or GaussianMixture model
-    to compact JSON text.
+    RandomForestClassifier, AdaBoostClassifier, GaussianMixture, or
+    GradientBoostingRegressor model to compact JSON text.
 
     The result contains no whitespace and no trailing newline. Integers
     (``n_clusters``, ``max_iter``, ``seed``, ``n_features_in``) are emitted
@@ -12888,6 +12897,19 @@ def dumps(model):
     ROUND_HALF_UP (negative zero becomes ``0.000000000000``); weights
     must be positive, means finite, and variances at least ``1e-12``,
     with neither weights nor variances quantizing to zero.
+
+    For GradientBoostingRegressor the top-level keys are ``class``,
+    ``n_estimators``, ``learning_rate``, ``tol``, ``n_features_in``,
+    ``constant``, ``stumps`` in that order; ``n_estimators`` and
+    ``n_features_in`` are positive JSON integers and ``stumps`` is a
+    list of at most ``n_estimators`` stumps (it may be empty). Each
+    stump is a four-element JSON array holding ``feature``,
+    ``threshold``, ``left``, ``right`` in that order; ``feature`` is an
+    integer in ``[0, n_features_in)`` and every other value is an
+    exact finite int/float (booleans rejected) quantized literally to
+    10 decimal places with ``Decimal(str(v))`` and ROUND_HALF_UP, with
+    negative zero written as ``0.0000000000``. A positive
+    ``learning_rate``/``tol`` that quantizes to zero is rejected.
     """
     if isinstance(model, KMeans):
         try:
@@ -12953,11 +12975,21 @@ def dumps(model):
         except Exception as exc:
             raise ValueError("invalid GaussianMixture state") from exc
 
+    if isinstance(model, GradientBoostingRegressor):
+        try:
+            return _dumps_gradient(model)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError(
+                "invalid GradientBoostingRegressor state"
+            ) from exc
+
     raise ValueError(
         "dumps only supports fitted KMeans, PCA, LinearRegression, "
         "LogisticRegression, StandardScaler, DecisionTreeClassifier, "
-        "RandomForestClassifier, AdaBoostClassifier, and GaussianMixture "
-        "models"
+        "RandomForestClassifier, AdaBoostClassifier, GaussianMixture, "
+        "and GradientBoostingRegressor models"
     )
 
 
@@ -13508,6 +13540,110 @@ def _quantize_gaussian_value(value, name, positive=False):
             "decimals" % name
         )
     return token
+
+
+def _dumps_gradient(model):
+    """Serialize a fitted GradientBoostingRegressor.
+
+    The top-level keys are class, n_estimators, learning_rate, tol,
+    n_features_in, constant, stumps in that order; ``n_estimators`` and
+    ``n_features_in`` are positive JSON integers and ``stumps`` is a list
+    of at most ``n_estimators`` stumps (it may be empty). Each stump is a
+    four-element JSON array holding (feature, threshold, left, right);
+    ``feature`` is an exact integer in ``[0, n_features_in)`` and the
+    other three values are exact finite int/float values (booleans
+    rejected), quantized literally with
+    ``Decimal(str(v)).quantize(1E-10, ROUND_HALF_UP)``. A strictly
+    positive learning_rate/tol that quantizes to zero is rejected. The
+    construction parameters are re-validated exactly as ``__init__``
+    performs the checks, and the fitted state must match them in shape.
+    """
+    constant = model._constant
+    stumps = model._stumps
+    n_features = model._n_features
+    if constant is None or stumps is None or n_features is None:
+        raise ValueError(
+            "GradientBoostingRegressor must be fitted before dumps is "
+            "called"
+        )
+    n_estimators = model.n_estimators
+    learning_rate = model.learning_rate
+    tol = model.tol
+    # Re-validate the construction parameters exactly as __init__ does.
+    if type(n_estimators) is not int or n_estimators <= 0:
+        raise ValueError("n_estimators must be a positive integer")
+    _require_exact_finite_positive(learning_rate, "learning_rate")
+    _require_exact_finite_positive(tol, "tol")
+    if type(n_features) is not int or n_features <= 0:
+        raise ValueError("n_features_in must be a positive integer")
+    _require_scaler_number(constant, "constant")
+    if type(stumps) is not list or len(stumps) > n_estimators:
+        raise ValueError(
+            "stumps must be a list of at most n_estimators stumps"
+        )
+    learning_rate_text = _quantize_state_number(learning_rate)
+    if Decimal(learning_rate_text) == 0:
+        raise ValueError(
+            "learning_rate must remain positive after quantization to 10 "
+            "decimals"
+        )
+    tol_text = _quantize_state_number(tol)
+    if Decimal(tol_text) == 0:
+        raise ValueError(
+            "tol must remain positive after quantization to 10 decimals"
+        )
+    constant_text = _quantize_state_number(constant)
+    stumps_text = "[" + ",".join(
+        _encode_gradient_stump(stump, n_features) for stump in stumps
+    ) + "]"
+    return (
+        '{"class":"GradientBoostingRegressor","n_estimators":'
+        + str(n_estimators)
+        + ',"learning_rate":'
+        + learning_rate_text
+        + ',"tol":'
+        + tol_text
+        + ',"n_features_in":'
+        + str(n_features)
+        + ',"constant":'
+        + constant_text
+        + ',"stumps":'
+        + stumps_text
+        + "}"
+    )
+
+
+def _encode_gradient_stump(stump, n_features):
+    """Encode one gradient-boosting stump as a four-element JSON array
+    holding feature, threshold, left, right in that order.
+
+    ``feature`` is an exact integer in ``[0, n_features)``; the threshold
+    and the two side increments are exact finite int/float values
+    (booleans rejected) quantized literally with
+    ``Decimal(str(v))`` and ROUND_HALF_UP to 10 decimals (negative zero
+    becomes ``0.0000000000``).
+    """
+    if type(stump) is not tuple or len(stump) != 4:
+        raise ValueError(
+            "stumps must be (feature, threshold, left, right) 4-tuples"
+        )
+    feature, threshold, left, right = stump
+    if type(feature) is not int or not 0 <= feature < n_features:
+        raise ValueError("stump feature must be in [0, n_features_in)")
+    _require_scaler_number(threshold, "threshold")
+    _require_scaler_number(left, "left increment")
+    _require_scaler_number(right, "right increment")
+    return (
+        "["
+        + str(feature)
+        + ","
+        + _quantize_state_number(threshold)
+        + ","
+        + _quantize_state_number(left)
+        + ","
+        + _quantize_state_number(right)
+        + "]"
+    )
 
 
 _JSON_INT_RE = re.compile(r"^(0|-?[1-9][0-9]*)$")
@@ -14080,11 +14216,83 @@ def _load_gaussian(pairs):
     return model
 
 
+def _load_gradient(pairs):
+    keys = tuple(key for key, _ in pairs)
+    if keys != _SERIAL_KEYS_GRADIENT:
+        raise ValueError(
+            "GradientBoostingRegressor JSON must have exactly the "
+            "serialized keys in the serialized order"
+        )
+    data = _convert(pairs)
+
+    class_name = data["class"]
+    if (
+        not isinstance(class_name, str)
+        or class_name != "GradientBoostingRegressor"
+    ):
+        raise ValueError('class must be "GradientBoostingRegressor"')
+
+    n_estimators = _expect_int(data["n_estimators"], "n_estimators")
+    if n_estimators <= 0:
+        raise ValueError("n_estimators must be greater than 0")
+    learning_rate = _expect_fixed(data["learning_rate"], "learning_rate")
+    if learning_rate <= 0.0:
+        raise ValueError("learning_rate must be greater than 0")
+    tol = _expect_fixed(data["tol"], "tol")
+    if tol <= 0.0:
+        raise ValueError("tol must be greater than 0")
+    n_features = _expect_int(data["n_features_in"], "n_features_in")
+    if n_features <= 0:
+        raise ValueError("n_features_in must be greater than 0")
+
+    constant = _expect_fixed(data["constant"], "constant")
+
+    stumps_node = data["stumps"]
+    if not isinstance(stumps_node, list) or len(stumps_node) > n_estimators:
+        raise ValueError(
+            "stumps must be an array of at most n_estimators stumps"
+        )
+    stumps = [
+        _load_gradient_stump(stump, n_features) for stump in stumps_node
+    ]
+
+    model = GradientBoostingRegressor(
+        n_estimators=n_estimators,
+        learning_rate=learning_rate,
+        tol=tol,
+    )
+    model._constant = constant
+    model._stumps = stumps
+    model._n_features = n_features
+    return model
+
+
+def _load_gradient_stump(node, n_features):
+    """Rebuild one gradient-boosting stump from its converted JSON array.
+
+    The stump must be a four-element array holding feature, threshold,
+    left, right in that order: an integer feature in
+    ``[0, n_features)`` followed by three fixed 10-decimal numbers.
+    """
+    if not isinstance(node, list) or len(node) != 4:
+        raise ValueError(
+            "stumps must be four-element arrays holding feature, "
+            "threshold, left, right in that order"
+        )
+    feature = _expect_int(node[0], "stump feature")
+    if feature < 0 or feature >= n_features:
+        raise ValueError("stump feature must be in [0, n_features_in)")
+    threshold = _expect_fixed(node[1], "stump threshold")
+    left = _expect_fixed(node[2], "stump left increment")
+    right = _expect_fixed(node[3], "stump right increment")
+    return (feature, threshold, left, right)
+
+
 def loads(text):
     """Reconstruct a fitted KMeans, PCA, LinearRegression,
     LogisticRegression, StandardScaler, DecisionTreeClassifier,
-    RandomForestClassifier, AdaBoostClassifier, or GaussianMixture from
-    text produced by dumps.
+    RandomForestClassifier, AdaBoostClassifier, GaussianMixture, or
+    GradientBoostingRegressor from text produced by dumps.
 
     Only the exact byte format emitted by :func:`dumps` is accepted: a
     ``str`` holding compact JSON with no whitespace, no duplicate keys,
@@ -14098,7 +14306,8 @@ def loads(text):
     count from centroid width, the linear models from the length of
     ``w``, StandardScaler/DecisionTreeClassifier/RandomForestClassifier
     from ``n_features_in``, AdaBoostClassifier from ``n_features_in``,
-    and GaussianMixture from ``n_components``.
+    GaussianMixture from ``n_components``, and
+    GradientBoostingRegressor from ``n_features_in``.
     The argument is not modified.
     """
     if type(text) is not str or len(text) == 0:
@@ -14183,6 +14392,13 @@ def loads(text):
     if class_entry == "GaussianMixture":
         try:
             return _load_gaussian(pairs)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("malformed serialized model") from exc
+    if class_entry == "GradientBoostingRegressor":
+        try:
+            return _load_gradient(pairs)
         except ValueError:
             raise
         except Exception as exc:
