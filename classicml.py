@@ -1908,6 +1908,15 @@ class GaussianMixture:
     ``score`` returns the ``math.fsum`` mean of those values. Any
     arithmetic failure or non-finite intermediate value raises
     FloatingPointError; an exact zero is reported as positive ``0.0``.
+
+    The ``aic`` and ``bic`` methods first call ``score_samples``; with
+    ``s`` the per-sample scores, ``L = fsum(s)``, ``n = len(X)`` and
+    ``p = 3 * n_components - 1``, they return ``2*p - 2*L`` and
+    ``log(n)*p - 2*L`` respectively. Both require a fitted model
+    (ValueError otherwise), propagate errors from ``score_samples``
+    unchanged, and raise FloatingPointError on any arithmetic failure
+    or non-finite log likelihood, intermediate value, or result; an
+    exact zero is reported as positive ``0.0``.
     """
 
     def __init__(self, n_components=2):
@@ -2228,6 +2237,87 @@ class GaussianMixture:
         samples = self.score_samples(X)
         try:
             result = math.fsum(samples) / len(X)
+        except (
+            OverflowError,
+            ValueError,
+            ZeroDivisionError,
+        ) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered while scoring"
+            ) from exc
+        if not math.isfinite(result):
+            raise FloatingPointError(
+                "non-finite value encountered while scoring"
+            )
+        if result == 0.0:
+            result = 0.0
+        return result
+
+    def aic(self, X) -> float:
+        """Return the Akaike information criterion ``2*p - 2*L``.
+
+        First calls :meth:`score_samples` to obtain ``s`` in input
+        order, then with ``L = fsum(s)`` and
+        ``p = 3 * n_components - 1`` returns ``2.0*p - 2.0*L``. The
+        model must be fitted (ValueError otherwise); errors raised by
+        ``score_samples`` propagate unchanged. Any arithmetic
+        ``OverflowError``/``ValueError``/``ZeroDivisionError`` or
+        non-finite log likelihood, intermediate value, or result raises
+        FloatingPointError; an exact zero is reported as positive
+        ``0.0``. Neither the input nor the model state is modified.
+        """
+        if self.weights_ is None:
+            raise ValueError("model must be fitted before aic is called")
+        samples = self.score_samples(X)
+        p = 3 * self.n_components - 1
+        try:
+            log_likelihood = math.fsum(samples)
+            if not math.isfinite(log_likelihood):
+                raise FloatingPointError(
+                    "non-finite value encountered while scoring"
+                )
+            result = 2.0 * p - 2.0 * log_likelihood
+        except (
+            OverflowError,
+            ValueError,
+            ZeroDivisionError,
+        ) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered while scoring"
+            ) from exc
+        if not math.isfinite(result):
+            raise FloatingPointError(
+                "non-finite value encountered while scoring"
+            )
+        if result == 0.0:
+            result = 0.0
+        return result
+
+    def bic(self, X) -> float:
+        """Return the Bayesian information criterion ``log(n)*p - 2*L``.
+
+        First calls :meth:`score_samples` to obtain ``s`` in input
+        order, then with ``L = fsum(s)``, ``n = len(X)`` and
+        ``p = 3 * n_components - 1`` returns ``log(n)*p - 2.0*L``. The
+        model must be fitted (ValueError otherwise); errors raised by
+        ``score_samples`` propagate unchanged. Any arithmetic
+        ``OverflowError``/``ValueError``/``ZeroDivisionError`` or
+        non-finite log likelihood, intermediate value, or result raises
+        FloatingPointError; an exact zero is reported as positive
+        ``0.0``. Neither the input nor the model state is modified.
+        """
+        if self.weights_ is None:
+            raise ValueError("model must be fitted before bic is called")
+        samples = self.score_samples(X)
+        n = len(X)
+        p = 3 * self.n_components - 1
+        try:
+            log_likelihood = math.fsum(samples)
+            if not math.isfinite(log_likelihood):
+                raise FloatingPointError(
+                    "non-finite value encountered while scoring"
+                )
+            result = math.log(n) * p - 2.0 * log_likelihood
         except (
             OverflowError,
             ValueError,
