@@ -1326,6 +1326,121 @@ class AdaBoostClassifier:
             results.append(1 if score > 0 else -1)
         return results
 
+    def decision_function(self, X) -> list[float]:
+        """Return the signed margin of each row of X in input order.
+
+        X must satisfy the same validation as in predict: a non-empty
+        rectangular matrix of finite non-boolean numbers with the same
+        number of columns as the training data, and the model must be
+        fitted. Each saved weak classifier votes ``sign`` when
+        ``x[feature] <= threshold`` and ``-sign`` otherwise; the margin
+        is the ``math.fsum`` of ``alpha * vote`` over the weak
+        classifiers in save order. An OverflowError, ValueError, or
+        ZeroDivisionError from the multiplication or fsum, or any
+        non-finite term or sum, raises FloatingPointError. An exact zero
+        margin is returned as positive 0.0. The input and the model are
+        not modified and repeated calls return identical values.
+        """
+        if self._stumps is None:
+            raise ValueError(
+                "model must be fitted before decision_function is called"
+            )
+        width = _check_tree_matrix(X)
+        if width != self._n_features:
+            raise ValueError(
+                "X must have the same number of features as the training data"
+            )
+
+        results = []
+        for row in X:
+            terms = []
+            for feature, threshold, sign, alpha in self._stumps:
+                vote = sign if row[feature] <= threshold else -sign
+                try:
+                    term = alpha * vote
+                except (
+                    OverflowError,
+                    ValueError,
+                    ZeroDivisionError,
+                ) as exc:
+                    raise FloatingPointError(
+                        "non-finite value encountered during boosting"
+                    ) from exc
+                if isinstance(term, float) and not math.isfinite(term):
+                    raise FloatingPointError(
+                        "non-finite value encountered during boosting"
+                    )
+                terms.append(term)
+            try:
+                score = math.fsum(terms)
+            except (
+                OverflowError,
+                ValueError,
+                ZeroDivisionError,
+            ) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during boosting"
+                ) from exc
+            if not math.isfinite(score):
+                raise FloatingPointError(
+                    "non-finite value encountered during boosting"
+                )
+            if score == 0:
+                score = 0.0
+            results.append(score)
+        return results
+
+    def predict_proba(self, X) -> list[list[float]]:
+        """Return the class probabilities of each row of X in input
+        order.
+
+        X must satisfy the same validation as in predict (validation is
+        delegated to :meth:`decision_function`). For the margin ``s`` the
+        score ``z = 2.0 * s`` is mapped through the numerically stable
+        sigmoid (the ``z >= 0`` branch uses ``1 / (1 + exp(-z))``,
+        otherwise ``e = exp(z); e / (1 + e)``); each row returns
+        ``[1.0 - p, p]`` whose columns correspond to labels -1 and 1 in
+        that order. An OverflowError, ValueError, or ZeroDivisionError
+        from the multiplication, exp, addition, subtraction, or
+        division, or any non-finite intermediate or result, raises
+        FloatingPointError. An exact zero probability is returned as
+        positive 0.0. The input and the model are not modified and
+        repeated calls return identical values.
+        """
+        scores = self.decision_function(X)
+        results = []
+        for score in scores:
+            try:
+                z = 2.0 * score
+                if not math.isfinite(z):
+                    raise FloatingPointError(
+                        "non-finite value encountered during boosting"
+                    )
+                if z >= 0:
+                    p = 1.0 / (1.0 + math.exp(-z))
+                else:
+                    e = math.exp(z)
+                    p = e / (1.0 + e)
+                negative = 1.0 - p
+            except (
+                OverflowError,
+                ValueError,
+                ZeroDivisionError,
+            ) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during boosting"
+                ) from exc
+            if not math.isfinite(p) or not math.isfinite(negative):
+                raise FloatingPointError(
+                    "non-finite value encountered during boosting"
+                )
+            if p == 0:
+                p = 0.0
+            if negative == 0:
+                negative = 0.0
+            results.append([negative, p])
+        return results
+
 
 class StandardScaler:
     """Standardize columns by their mean and population standard deviation.
@@ -12922,7 +13037,7 @@ def _encode_stump(stump, n_features):
     must convert back with ``float`` to exactly the original value so a
     loaded model predicts identically.
     """
-    if not isinstance(stump, (tuple, list)) or len(stump) != 4:
+    if type(stump) is not tuple or len(stump) != 4:
         raise ValueError(
             "stumps must be (feature, threshold, sign, alpha) 4-tuples"
         )
