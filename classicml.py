@@ -190,6 +190,7 @@ __all__ = [
     "KNeighborsClassifier",
     "KNeighborsRegressor",
     "DecisionTreeClassifier",
+    "DecisionTreeRegressor",
     "RandomForestClassifier",
     "AdaBoostClassifier",
     "GradientBoostingRegressor",
@@ -1474,6 +1475,198 @@ class DecisionTreeClassifier:
                 else:
                     node = node.right
             results.append(node.label)
+        return results
+
+
+class _DecisionTreeRegressorNode:
+    """Node of a DecisionTreeRegressor tree (leaf when feature is None)."""
+
+    __slots__ = ("value", "feature", "threshold", "left", "right")
+
+    def __init__(self, value):
+        self.value = value
+        self.feature = None
+        self.threshold = None
+        self.left = None
+        self.right = None
+
+
+def _regressor_tree_mean(values):
+    """Mean of a non-empty list as ``math.fsum(values) / len(values)``.
+
+    Any overflow, invalid operation, or non-finite result in the
+    ``math.fsum`` or division steps raises FloatingPointError.
+    """
+    try:
+        mean = math.fsum(values) / len(values)
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during decision tree regression"
+        ) from exc
+    if not math.isfinite(mean):
+        raise FloatingPointError(
+            "non-finite value encountered during decision tree regression"
+        )
+    return mean
+
+
+def _regressor_tree_loss(values, mean):
+    """Squared-error loss ``fsum((value - mean) ** 2)`` in list order.
+
+    Any overflow, invalid operation, or non-finite intermediate or final
+    value in the subtraction, power, or ``math.fsum`` steps raises
+    FloatingPointError.
+    """
+    terms = []
+    for value in values:
+        try:
+            deviation = value - mean
+            term = deviation ** 2
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during decision tree "
+                "regression"
+            ) from exc
+        if not _is_finite_or_int(term):
+            raise FloatingPointError(
+                "non-finite value encountered during decision tree "
+                "regression"
+            )
+        terms.append(term)
+    try:
+        loss = math.fsum(terms)
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during decision tree regression"
+        ) from exc
+    if not math.isfinite(loss):
+        raise FloatingPointError(
+            "non-finite value encountered during decision tree regression"
+        )
+    return loss
+
+
+class DecisionTreeRegressor:
+    """Deterministic decision tree regressor with squared-error splits.
+
+    Each node's value is the mean of its targets, computed as a
+    sample-order ``math.fsum`` divided by the number of samples (the root
+    is at depth 0). A node becomes a leaf when it reaches ``max_depth``,
+    when it holds a single sample, or when no candidate split strictly
+    improves on the node's loss. For every feature, the distinct values in
+    ascending order -- except the maximum -- serve as thresholds ``t``
+    with ``x <= t`` going to the left child. A candidate's loss is the sum
+    of the two sides' ``math.fsum((y - side_mean) ** 2)`` in sample order;
+    only losses strictly below the parent's same-formula loss are
+    accepted, and the best candidate is the first in ascending
+    ``(loss, feature index, t)`` order. Children are built left first,
+    then right. No randomness is used.
+    """
+
+    def __init__(self, max_depth=None):
+        if max_depth is not None:
+            if type(max_depth) is not int or max_depth < 1:
+                raise ValueError(
+                    "max_depth must be None or a positive integer"
+                )
+        self.max_depth = max_depth
+        self._root = None
+        self._n_features = None
+
+    def fit(self, X, y):
+        # Clear the previous fit up front so that a failed validation or
+        # computation leaves the model unfitted.
+        self._root = None
+        self._n_features = None
+        try:
+            width = _check_gradient_matrix(X)
+            _check_gradient_target(y, len(X))
+        except OverflowError as exc:
+            # An int too large to convert to float failed its finiteness
+            # check: still a rejected input, hence ValueError.
+            raise ValueError(
+                "X and y must contain only finite non-boolean numbers"
+            ) from exc
+        root = self._build(X, y, list(range(len(X))), 0, width)
+        self._root = root
+        self._n_features = width
+        return self
+
+    def _build(self, X, y, indices, depth, width):
+        targets = [y[i] for i in indices]
+        node = _DecisionTreeRegressorNode(_regressor_tree_mean(targets))
+
+        if len(indices) == 1:
+            return node
+        if self.max_depth is not None and depth >= self.max_depth:
+            return node
+
+        parent_loss = _regressor_tree_loss(targets, node.value)
+        best = None  # (loss, feature index, threshold)
+        for j in range(width):
+            values = sorted(set(X[i][j] for i in indices))
+            for t in values[:-1]:
+                left_targets = []
+                right_targets = []
+                for i in indices:
+                    if X[i][j] <= t:
+                        left_targets.append(y[i])
+                    else:
+                        right_targets.append(y[i])
+                left_mean = _regressor_tree_mean(left_targets)
+                right_mean = _regressor_tree_mean(right_targets)
+                left_loss = _regressor_tree_loss(left_targets, left_mean)
+                right_loss = _regressor_tree_loss(right_targets, right_mean)
+                try:
+                    loss = left_loss + right_loss
+                except (OverflowError, ValueError) as exc:
+                    raise FloatingPointError(
+                        "non-finite value encountered during decision tree "
+                        "regression"
+                    ) from exc
+                if not math.isfinite(loss):
+                    raise FloatingPointError(
+                        "non-finite value encountered during decision tree "
+                        "regression"
+                    )
+                if loss < parent_loss and (
+                    best is None or (loss, j, t) < best
+                ):
+                    best = (loss, j, t)
+        if best is None:
+            return node
+
+        _, feature, threshold = best
+        left_indices = [i for i in indices if X[i][feature] <= threshold]
+        right_indices = [i for i in indices if X[i][feature] > threshold]
+        node.feature = feature
+        node.threshold = threshold
+        node.left = self._build(X, y, left_indices, depth + 1, width)
+        node.right = self._build(X, y, right_indices, depth + 1, width)
+        return node
+
+    def predict(self, X) -> list[float]:
+        if self._root is None:
+            raise ValueError("model must be fitted before predict is called")
+        try:
+            width = _check_gradient_matrix(X)
+        except OverflowError as exc:
+            raise ValueError(
+                "X must contain only finite non-boolean numbers"
+            ) from exc
+        if width != self._n_features:
+            raise ValueError(
+                "X must have the same number of features as the training data"
+            )
+        results = []
+        for row in X:
+            node = self._root
+            while node.feature is not None:
+                if row[node.feature] <= node.threshold:
+                    node = node.left
+                else:
+                    node = node.right
+            results.append(_positive_zero(node.value))
         return results
 
 
