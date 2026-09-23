@@ -1890,12 +1890,19 @@ class AgglomerativeClustering:
     member index, and ``labels_`` is an integer list in input order. The
     input is never modified, and no randomness is used.
 
-    ``fit`` clears ``labels_`` before validation, leaves it ``None`` if
-    fitting fails, and returns ``self``; ``fit_predict`` calls ``fit``
-    and returns a fresh copy of ``labels_``. Any subtraction, squaring,
-    ``math.fsum``, square root, or division that raises
-    ``OverflowError``/``ValueError`` or yields a non-finite value raises
-    ``FloatingPointError``.
+    Every merge is recorded: leaves keep node IDs ``0`` through ``n - 1``,
+    and the cluster created by merge number ``r`` (counted from zero) gets
+    node ID ``n + r``. Each round appends ``[id(A), id(B)]`` -- in the
+    order of the winning ``(distance, A, B)`` key -- to ``children_`` and
+    the merge distance as a ``float`` to ``distances_``. Both lists have
+    length ``n - n_clusters`` and are empty when no merge happens.
+
+    ``fit`` clears ``labels_``, ``children_``, and ``distances_`` before
+    validation, leaves them ``None`` if fitting fails, and returns
+    ``self``; ``fit_predict`` calls ``fit`` and returns a fresh copy of
+    ``labels_``. Any subtraction, squaring, ``math.fsum``, square root, or
+    division that raises ``OverflowError``/``ValueError`` or yields a
+    non-finite value raises ``FloatingPointError``.
     """
 
     def __init__(self, n_clusters=2, linkage="average"):
@@ -1912,6 +1919,8 @@ class AgglomerativeClustering:
         self.n_clusters = n_clusters
         self.linkage = linkage
         self.labels_ = None
+        self.children_ = None
+        self.distances_ = None
 
     @staticmethod
     def _distance(row_a, row_b):
@@ -2007,9 +2016,11 @@ class AgglomerativeClustering:
         return best
 
     def fit(self, X):
-        # Clear before validation so a failed fit always leaves labels_
-        # as None.
+        # Clear before validation so a failed fit always leaves all
+        # fitted attributes as None.
         self.labels_ = None
+        self.children_ = None
+        self.distances_ = None
         _check_exact_matrix(X)
         n = len(X)
         if n < self.n_clusters:
@@ -2017,17 +2028,22 @@ class AgglomerativeClustering:
                 "n_clusters must not exceed the number of samples"
             )
 
-        clusters = [(i,) for i in range(n)]
+        # Each entry pairs the ascending member tuple with its dendrogram
+        # node ID; leaves keep IDs 0..n-1 and merge r gets ID n+r.
+        clusters = [((i,), i) for i in range(n)]
+        children = []
+        distances = []
+        merge_count = 0
         while len(clusters) > self.n_clusters:
             # Sort clusters by their ascending member tuples before each
             # round so distance ties resolve lexicographically.
-            clusters.sort()
+            clusters.sort(key=lambda entry: entry[0])
             best_key = None
             best_pair = None
             for a_index in range(len(clusters)):
                 for b_index in range(a_index + 1, len(clusters)):
-                    members_a = clusters[a_index]
-                    members_b = clusters[b_index]
+                    members_a = clusters[a_index][0]
+                    members_b = clusters[b_index][0]
                     distance = self._cluster_distance(
                         members_a, members_b, X
                     )
@@ -2036,20 +2052,28 @@ class AgglomerativeClustering:
                         best_key = key
                         best_pair = (a_index, b_index)
             a_index, b_index = best_pair
+            distance, members_a, members_b = best_key
             merged = tuple(
-                sorted(clusters[a_index] + clusters[b_index])
+                sorted(clusters[a_index][0] + clusters[b_index][0])
             )
+            children.append(
+                [clusters[a_index][1], clusters[b_index][1]]
+            )
+            distances.append(float(distance))
             del clusters[b_index]
             del clusters[a_index]
-            clusters.append(merged)
+            clusters.append((merged, n + merge_count))
+            merge_count += 1
 
         # Number final clusters from zero by ascending smallest member.
-        clusters.sort()
+        clusters.sort(key=lambda entry: entry[0])
         labels = [0] * n
-        for label, members in enumerate(clusters):
+        for label, (members, _node_id) in enumerate(clusters):
             for index in members:
                 labels[index] = label
         self.labels_ = labels
+        self.children_ = children
+        self.distances_ = distances
         return self
 
     def fit_predict(self, X):
