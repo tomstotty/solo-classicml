@@ -15,6 +15,8 @@ Exports:
         weights.
     DecisionTreeClassifier -- deterministic binary decision tree classifier
         using Gini impurity splits.
+    DecisionTreeRegressor -- deterministic binary decision tree regressor
+        using squared-error (sum of squared deviations) splits.
     RandomForestClassifier -- deterministic bagged forest of Gini decision
         trees with per-node random feature subsampling.
     AdaBoostClassifier -- deterministic discrete AdaBoost of decision
@@ -190,6 +192,7 @@ __all__ = [
     "KNeighborsClassifier",
     "KNeighborsRegressor",
     "DecisionTreeClassifier",
+    "DecisionTreeRegressor",
     "RandomForestClassifier",
     "AdaBoostClassifier",
     "GradientBoostingRegressor",
@@ -1474,6 +1477,188 @@ class DecisionTreeClassifier:
                 else:
                     node = node.right
             results.append(node.label)
+        return results
+
+
+def _regression_mean(targets):
+    """Sample-order ``math.fsum`` mean of a non-empty target list.
+
+    The result is normalized to positive zero. Any overflow, invalid
+    operation, zero division, or non-finite result of the ``math.fsum``
+    sum or the division raises FloatingPointError.
+    """
+    try:
+        mean = math.fsum(targets) / len(targets)
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during regression tree fitting"
+        ) from exc
+    if not math.isfinite(mean):
+        raise FloatingPointError(
+            "non-finite value encountered during regression tree fitting"
+        )
+    return _positive_zero(mean)
+
+
+def _regression_squared_error(targets, mean):
+    """Sample-order ``fsum((y - mean) ** 2)`` of targets against a mean.
+
+    Any overflow, invalid operation, or non-finite result of a subtraction,
+    squaring, or the ``math.fsum`` sum raises FloatingPointError.
+    """
+    terms = []
+    for value in targets:
+        try:
+            deviation = value - mean
+            term = deviation ** 2
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during regression tree fitting"
+            ) from exc
+        if not _is_finite_or_int(term):
+            raise FloatingPointError(
+                "non-finite value encountered during regression tree fitting"
+            )
+        terms.append(term)
+    try:
+        total = math.fsum(terms)
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during regression tree fitting"
+        ) from exc
+    if not math.isfinite(total):
+        raise FloatingPointError(
+            "non-finite value encountered during regression tree fitting"
+        )
+    return total
+
+
+class _RegressionTreeNode:
+    """Node of a DecisionTreeRegressor tree (leaf when feature is None)."""
+
+    __slots__ = ("value", "feature", "threshold", "left", "right")
+
+    def __init__(self, value):
+        self.value = value
+        self.feature = None
+        self.threshold = None
+        self.left = None
+        self.right = None
+
+
+class DecisionTreeRegressor:
+    """Deterministic binary decision tree regressor with squared-error
+    splits.
+
+    Each node holds the mean of its samples' targets, computed as the
+    sample-order ``math.fsum`` of the targets divided by the sample count;
+    an exact zero is stored as positive ``0.0``. The root is at depth 0. A
+    node becomes a leaf when it reaches ``max_depth``, when it holds a
+    single sample, or when no candidate split strictly improves on the
+    node's squared error. For every feature, the distinct feature values in
+    ascending order -- except the maximum -- serve as thresholds ``t`` with
+    ``x <= t`` going to the left child. A candidate's loss is the sum of
+    the left and right squared errors, each the sample-order
+    ``math.fsum((y - side_mean) ** 2)`` over that side; only losses
+    strictly below the parent's squared error are accepted, and the best
+    candidate is the first in ascending ``(loss, feature index, t)``
+    order. Children are built left first, then right. Inputs are never
+    modified and no randomness is used.
+    """
+
+    def __init__(self, max_depth=None):
+        if max_depth is not None:
+            if type(max_depth) is not int or max_depth < 1:
+                raise ValueError(
+                    "max_depth must be None or a positive integer"
+                )
+        self.max_depth = max_depth
+        self._root = None
+        self._n_features = None
+
+    def fit(self, X, y):
+        # Clear the previous fit up front so that a failed validation or
+        # computation leaves the model unfitted.
+        self._root = None
+        self._n_features = None
+        try:
+            width = _check_gradient_matrix(X)
+            _check_gradient_target(y, len(X))
+        except OverflowError as exc:
+            # An int too large to convert to float failed its finiteness
+            # check: still a rejected input, hence ValueError.
+            raise ValueError(
+                "X and y must contain only finite non-boolean numbers"
+            ) from exc
+        root = self._build(X, y, list(range(len(X))), 0, width)
+        self._root = root
+        self._n_features = width
+        return self
+
+    def _build(self, X, y, indices, depth, width):
+        targets = [y[i] for i in indices]
+        node = _RegressionTreeNode(_regression_mean(targets))
+
+        if self.max_depth is not None and depth >= self.max_depth:
+            return node
+        if len(indices) == 1:
+            return node
+
+        parent_loss = _regression_squared_error(targets, node.value)
+        best = None  # (loss, feature index, threshold)
+        for j in range(width):
+            values = sorted(set(X[i][j] for i in indices))
+            for t in values[:-1]:
+                left_targets = []
+                right_targets = []
+                for i in indices:
+                    if X[i][j] <= t:
+                        left_targets.append(y[i])
+                    else:
+                        right_targets.append(y[i])
+                loss = _regression_squared_error(
+                    left_targets, _regression_mean(left_targets)
+                ) + _regression_squared_error(
+                    right_targets, _regression_mean(right_targets)
+                )
+                if loss < parent_loss and (
+                    best is None or (loss, j, t) < best
+                ):
+                    best = (loss, j, t)
+        if best is None:
+            return node
+
+        _, feature, threshold = best
+        left_indices = [i for i in indices if X[i][feature] <= threshold]
+        right_indices = [i for i in indices if X[i][feature] > threshold]
+        node.feature = feature
+        node.threshold = threshold
+        node.left = self._build(X, y, left_indices, depth + 1, width)
+        node.right = self._build(X, y, right_indices, depth + 1, width)
+        return node
+
+    def predict(self, X) -> list[float]:
+        if self._root is None:
+            raise ValueError("model must be fitted before predict is called")
+        try:
+            width = _check_gradient_matrix(X)
+        except OverflowError as exc:
+            raise ValueError(
+                "X must contain only finite non-boolean numbers"
+            ) from exc
+        if width != self._n_features:
+            raise ValueError(
+                "X must have the same number of features as the training data"
+            )
+        results = []
+        for row in X:
+            node = self._root
+            while node.feature is not None:
+                if row[node.feature] <= node.threshold:
+                    node = node.left
+                else:
+                    node = node.right
+            results.append(node.value)
         return results
 
 
