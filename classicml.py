@@ -5,6 +5,9 @@ Exports:
         an optional L2 (ridge) penalty, trained by full-batch gradient descent.
     LogisticRegression -- deterministic binary logistic regression with an
         optional L2 penalty, trained by full-batch gradient descent.
+    MultinomialLogisticRegression -- deterministic softmax multi-class
+        logistic regression with an optional L2 penalty, trained by
+        full-batch gradient descent.
     KNeighborsClassifier -- deterministic k-nearest-neighbors classifier
         using squared Euclidean distances.
     KNeighborsRegressor -- deterministic k-nearest-neighbors regressor
@@ -182,6 +185,7 @@ from fractions import Fraction
 __all__ = [
     "LinearRegression",
     "LogisticRegression",
+    "MultinomialLogisticRegression",
     "KNeighborsClassifier",
     "KNeighborsRegressor",
     "DecisionTreeClassifier",
@@ -346,6 +350,50 @@ def _sigmoid(z):
         return 1.0 / (1.0 + math.exp(-z))
     e = math.exp(z)
     return e / (1.0 + e)
+
+
+def _checked_parameter(value, name):
+    """Validate a finite non-boolean hyperparameter, mapping integer
+    conversion overflow (e.g. ``10**400``) to ValueError."""
+    try:
+        return _require_finite_number(value, name)
+    except OverflowError as exc:
+        raise ValueError(
+            "%s must be a finite non-boolean real number" % name
+        ) from exc
+
+
+def _softmax(z):
+    """Numerically stable softmax of a score list.
+
+    ``a = max(z)``; ``u_k = exp(z_k - a)`` and ``p_k = u_k / fsum(u)``,
+    evaluated in index order. Any arithmetic failure or non-finite
+    result raises FloatingPointError.
+    """
+    a = z[0]
+    for value in z[1:]:
+        if value > a:
+            a = value
+    try:
+        u = [math.exp(value - a) for value in z]
+        total = math.fsum(u)
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during softmax"
+        ) from exc
+    if not math.isfinite(total) or total <= 0.0:
+        raise FloatingPointError(
+            "non-finite value encountered during softmax"
+        )
+    p = []
+    for value in u:
+        prob = value / total
+        if not math.isfinite(prob):
+            raise FloatingPointError(
+                "non-finite value encountered during softmax"
+            )
+        p.append(prob)
+    return p
 
 
 class LinearRegression:
@@ -646,6 +694,268 @@ class LogisticRegression:
                 p = 0.0
             results.append(p)
         return results
+
+
+def _check_multiclass_vector(y, n):
+    """Validate an integer class-label vector with the same length as X.
+
+    Every element has type exactly ``int`` (booleans are rejected) and
+    at least two distinct labels must occur.
+    """
+    if not isinstance(y, list) or len(y) != n:
+        raise ValueError("y must be a list with the same length as X")
+    classes = set()
+    for value in y:
+        if type(value) is not int:
+            raise ValueError("y must contain only integers")
+        classes.add(value)
+    if len(classes) < 2:
+        raise ValueError("y must contain at least two distinct classes")
+    return sorted(classes)
+
+
+class MultinomialLogisticRegression:
+    """Multinomial (multi-class) logistic regression with a softmax output.
+
+    Fits one weight vector and intercept per class (classes sorted in
+    ascending order) by full-batch gradient descent on the mean
+    cross-entropy plus ``l2 * sum_k sum_j w_kj**2``; intercepts are not
+    penalized. All K weight vectors and intercepts start at zero and
+    are updated synchronously. Training uses no randomness.
+    """
+
+    def __init__(self, lr=0.01, l2=0.0, max_iter=1000, tol=1e-8):
+        _checked_parameter(lr, "lr")
+        if lr <= 0:
+            raise ValueError("lr must be greater than 0")
+        _checked_parameter(l2, "l2")
+        if l2 < 0:
+            raise ValueError("l2 must be non-negative")
+        if isinstance(max_iter, bool) or not isinstance(max_iter, int):
+            raise ValueError("max_iter must be an integer")
+        if max_iter < 1:
+            raise ValueError("max_iter must be at least 1")
+        _checked_parameter(tol, "tol")
+        if tol <= 0:
+            raise ValueError("tol must be greater than 0")
+
+        self.lr = lr
+        self.l2 = l2
+        self.max_iter = max_iter
+        self.tol = tol
+        self.classes = None
+        self.W = None
+        self.b = None
+
+    def _scores(self, X, width):
+        """Return the matrix ``z[i][k]`` of per-class scores for X.
+
+        Each score is ``math.fsum(w_kj * x_ij for j in feature order)
+        + b_k``, computed in sample then class order. Any arithmetic
+        failure or non-finite result raises FloatingPointError.
+        """
+        classes = self.classes
+        W = self.W
+        b = self.b
+        k_count = len(classes)
+        scores = []
+        for row in X:
+            row_scores = []
+            for k in range(k_count):
+                try:
+                    z = math.fsum(
+                        W[k][j] * row[j] for j in range(width)
+                    ) + b[k]
+                except (OverflowError, ValueError) as exc:
+                    raise FloatingPointError(
+                        "non-finite prediction encountered"
+                    ) from exc
+                if not math.isfinite(z):
+                    raise FloatingPointError(
+                        "non-finite prediction encountered"
+                    )
+                row_scores.append(z)
+            scores.append(row_scores)
+        return scores
+
+    def fit(self, X, y):
+        # Reset first so a failed fit leaves the model unfitted.
+        self.classes = None
+        self.W = None
+        self.b = None
+
+        try:
+            width = _check_matrix(X)
+            classes = _check_multiclass_vector(y, len(X))
+        except OverflowError as exc:
+            raise ValueError(
+                "X must contain only finite non-boolean numbers"
+            ) from exc
+
+        n = len(X)
+        k_count = len(classes)
+        W = [[0.0] * width for _ in range(k_count)]
+        b = [0.0] * k_count
+        lr = self.lr
+        l2 = self.l2
+        index = {label: k for k, label in enumerate(classes)}
+        targets = [index[value] for value in y]
+
+        for _ in range(self.max_iter):
+            # Forward pass: probabilities in sample/class/feature order.
+            probabilities = []
+            for i in range(n):
+                row = X[i]
+                z = []
+                for k in range(k_count):
+                    try:
+                        score = math.fsum(
+                            W[k][j] * row[j] for j in range(width)
+                        ) + b[k]
+                    except (OverflowError, ValueError) as exc:
+                        raise FloatingPointError(
+                            "non-finite value encountered during fit"
+                        ) from exc
+                    if not math.isfinite(score):
+                        raise FloatingPointError(
+                            "non-finite value encountered during fit"
+                        )
+                    z.append(score)
+                probabilities.append(_softmax(z))
+
+            # Gradients accumulated over samples, then synchronous update.
+            new_W = [[0.0] * width for _ in range(k_count)]
+            new_b = [0.0] * k_count
+            max_step = 0.0
+            for k in range(k_count):
+                for j in range(width):
+                    try:
+                        grad = (
+                            math.fsum(
+                                (
+                                    probabilities[i][k]
+                                    - (1.0 if targets[i] == k else 0.0)
+                                )
+                                * X[i][j]
+                                for i in range(n)
+                            )
+                            / n
+                            + 2.0 * l2 * W[k][j]
+                        )
+                    except (OverflowError, ValueError) as exc:
+                        raise FloatingPointError(
+                            "non-finite weight gradient encountered during fit"
+                        ) from exc
+                    if not math.isfinite(grad):
+                        raise FloatingPointError(
+                            "non-finite weight gradient encountered during fit"
+                        )
+                    try:
+                        updated = W[k][j] - lr * grad
+                    except (OverflowError, ValueError) as exc:
+                        raise FloatingPointError(
+                            "non-finite weight value encountered during fit"
+                        ) from exc
+                    if not math.isfinite(updated):
+                        raise FloatingPointError(
+                            "non-finite weight value encountered during fit"
+                        )
+                    new_W[k][j] = updated
+                    step = abs(updated - W[k][j])
+                    if step > max_step:
+                        max_step = step
+
+                try:
+                    grad_b = (
+                        math.fsum(
+                            probabilities[i][k]
+                            - (1.0 if targets[i] == k else 0.0)
+                            for i in range(n)
+                        )
+                        / n
+                    )
+                except (OverflowError, ValueError) as exc:
+                    raise FloatingPointError(
+                        "non-finite bias gradient encountered during fit"
+                    ) from exc
+                if not math.isfinite(grad_b):
+                    raise FloatingPointError(
+                        "non-finite bias gradient encountered during fit"
+                    )
+                try:
+                    updated_b = b[k] - lr * grad_b
+                except (OverflowError, ValueError) as exc:
+                    raise FloatingPointError(
+                        "non-finite bias value encountered during fit"
+                    ) from exc
+                if not math.isfinite(updated_b):
+                    raise FloatingPointError(
+                        "non-finite bias value encountered during fit"
+                    )
+                new_b[k] = updated_b
+                step_b = abs(updated_b - b[k])
+                if step_b > max_step:
+                    max_step = step_b
+
+            W = new_W
+            b = new_b
+
+            if max_step <= self.tol:
+                break
+
+        self.classes = classes
+        self.W = W
+        self.b = b
+        return self
+
+    def _validate_prediction(self, X):
+        if self.classes is None or self.W is None or self.b is None:
+            raise ValueError("model must be fitted before prediction")
+        try:
+            width = _check_matrix(X)
+        except OverflowError as exc:
+            raise ValueError(
+                "X must contain only finite non-boolean numbers"
+            ) from exc
+        if width != len(self.W[0]):
+            raise ValueError(
+                "X must have the same number of features as the training data"
+            )
+        return width
+
+    def decision_function(self, X):
+        """Return the per-class score matrix ``z`` (one row per sample,
+        one column per class in ascending class order)."""
+        width = self._validate_prediction(X)
+        return self._scores(X, width)
+
+    def predict_proba(self, X):
+        """Return the softmax probability matrix (one row per sample,
+        one column per class in ascending class order)."""
+        width = self._validate_prediction(X)
+        scores = self._scores(X, width)
+        return [_softmax(row) for row in scores]
+
+    def predict(self, X):
+        """Return the class with the largest probability for each row.
+
+        Ties are resolved toward the smaller class label (classes are
+        stored in ascending order, so the first column attaining the
+        maximum wins).
+        """
+        width = self._validate_prediction(X)
+        scores = self._scores(X, width)
+        predictions = []
+        for row in scores:
+            probabilities = _softmax(row)
+            best_k = 0
+            best_p = probabilities[0]
+            for k in range(1, len(probabilities)):
+                if probabilities[k] > best_p:
+                    best_p = probabilities[k]
+                    best_k = k
+            predictions.append(self.classes[best_k])
+        return predictions
 
 
 def _check_label_vector(y, n):
