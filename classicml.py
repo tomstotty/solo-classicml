@@ -11,6 +11,8 @@ Exports:
         using Gini impurity splits.
     RandomForestClassifier -- deterministic bagged forest of Gini decision
         trees with per-node random feature subsampling.
+    AdaBoostClassifier -- deterministic discrete AdaBoost of decision
+        stumps over +/-1 labels.
     StandardScaler -- deterministic standardization by column mean and
         population standard deviation.
     KMeans -- deterministic k-means clustering with Lloyd's iterations and
@@ -174,6 +176,7 @@ __all__ = [
     "KNeighborsClassifier",
     "DecisionTreeClassifier",
     "RandomForestClassifier",
+    "AdaBoostClassifier",
     "StandardScaler",
     "KMeans",
     "PCA",
@@ -640,6 +643,27 @@ def _check_label_vector(y, n):
     for value in y:
         if type(value) is not int:
             raise ValueError("y must contain only integers")
+
+
+def _check_signed_label_vector(y, n):
+    """Validate a +/-1 integer label vector with the same length as X.
+
+    Every element has type exactly ``int`` and equals ``-1`` or ``1``, and
+    both labels must occur.
+    """
+    if not isinstance(y, list) or len(y) != n:
+        raise ValueError("y must be a list with the same length as X")
+    seen_minus = False
+    seen_plus = False
+    for value in y:
+        if type(value) is not int or value not in (-1, 1):
+            raise ValueError("y must contain only the integers -1 and 1")
+        if value == -1:
+            seen_minus = True
+        else:
+            seen_plus = True
+    if not seen_minus or not seen_plus:
+        raise ValueError("y must contain both labels -1 and 1")
 
 
 def _squared_distance(query, row):
@@ -1126,6 +1150,180 @@ class RandomForestClassifier:
                     best_count = counts[label]
                     best_label = label
             results.append(best_label)
+        return results
+
+
+class AdaBoostClassifier:
+    """Deterministic discrete AdaBoost (SAMME sign form) of decision stumps.
+
+    Training maintains sample weights ``w_i`` with ``w_i = 1 / n`` initially.
+    At each round the weak classifier is a threshold rule on a single
+    feature: ``h = s`` when ``x <= t`` and ``-s`` otherwise. Candidates are
+    enumerated by feature index in ascending order, then by threshold ``t``
+    taken over all distinct ascending column values (the maximum yields a
+    constant prediction), then by sign ``s = -1`` before ``s = 1``. For
+    each candidate the weighted misclassification error ``e`` is the
+    ``math.fsum``, taken in sample order, of the weights of the
+    misclassified samples; the selected candidate is the first in ascending
+    lexicographic ``(e, feature, t, s)`` order.
+
+    If ``e >= 0.5`` training ends without adding that candidate; if no weak
+    classifier has been saved yet, ``fit`` raises ValueError. Otherwise the
+    candidate weight is ``a = 0.5 * log((1 - q) / q)`` where
+    ``q = min(max(e, 1e-15), 1 - 1e-15)``, the weights are updated
+    synchronously to ``w_i * exp(-a * y_i * h_i)`` and renormalized with
+    ``math.fsum`` in sample order, and the weak classifier together with
+    ``a`` is saved. When ``e == 0`` training ends after the save; otherwise
+    it runs for at most ``n_estimators`` rounds.
+
+    Prediction sums ``a * h`` over the saved weak classifiers in save order
+    using ``math.fsum`` and returns ``1`` for a strictly positive sum and
+    ``-1`` otherwise. No randomness is used.
+    """
+
+    def __init__(self, n_estimators=50):
+        if type(n_estimators) is not int or n_estimators <= 0:
+            raise ValueError("n_estimators must be a positive integer")
+        self.n_estimators = n_estimators
+        self._stumps = None
+        self._n_features = None
+
+    def fit(self, X, y):
+        self._stumps = None
+        self._n_features = None
+        width = _check_tree_matrix(X)
+        _check_signed_label_vector(y, len(X))
+
+        n = len(X)
+        weights = [1.0 / n for _ in range(n)]
+        stumps = []
+        for _ in range(self.n_estimators):
+            best = None  # (error, feature index, threshold, sign)
+            best_predictions = None
+            for j in range(width):
+                values = sorted(set(row[j] for row in X))
+                for t in values:
+                    for s in (-1, 1):
+                        predictions = [
+                            s if row[j] <= t else -s for row in X
+                        ]
+                        try:
+                            error = math.fsum(
+                                weights[i]
+                                for i in range(n)
+                                if predictions[i] != y[i]
+                            )
+                        except (OverflowError, ValueError) as exc:
+                            raise FloatingPointError(
+                                "non-finite value encountered during boosting"
+                            ) from exc
+                        if not math.isfinite(error):
+                            raise FloatingPointError(
+                                "non-finite value encountered during boosting"
+                            )
+                        candidate = (error, j, t, s)
+                        if best is None or candidate < best:
+                            best = candidate
+                            best_predictions = predictions
+
+            error, feature, threshold, sign = best
+            if error >= 0.5:
+                if not stumps:
+                    raise ValueError(
+                        "every weak classifier has error of at least 0.5"
+                    )
+                break
+
+            q = min(max(error, 1e-15), 1.0 - 1e-15)
+            try:
+                alpha = 0.5 * math.log((1.0 - q) / q)
+            except (OverflowError, ValueError) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during boosting"
+                ) from exc
+            if not math.isfinite(alpha):
+                raise FloatingPointError(
+                    "non-finite value encountered during boosting"
+                )
+            updated = []
+            for i in range(n):
+                try:
+                    value = weights[i] * math.exp(
+                        -alpha * y[i] * best_predictions[i]
+                    )
+                except (OverflowError, ValueError) as exc:
+                    raise FloatingPointError(
+                        "non-finite value encountered during boosting"
+                    ) from exc
+                if not math.isfinite(value):
+                    raise FloatingPointError(
+                        "non-finite value encountered during boosting"
+                    )
+                updated.append(value)
+            try:
+                total = math.fsum(updated)
+            except (OverflowError, ValueError) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during boosting"
+                ) from exc
+            if not math.isfinite(total) or total <= 0.0:
+                raise FloatingPointError(
+                    "non-finite value encountered during boosting"
+                )
+            normalized = []
+            for value in updated:
+                factor = value / total
+                if not math.isfinite(factor):
+                    raise FloatingPointError(
+                        "non-finite value encountered during boosting"
+                    )
+                normalized.append(factor)
+
+            stumps.append((feature, threshold, sign, alpha))
+            weights = normalized
+            if error == 0.0:
+                break
+
+        self._stumps = stumps
+        self._n_features = width
+        return self
+
+    def predict(self, X):
+        if self._stumps is None:
+            raise ValueError("model must be fitted before predict is called")
+        width = _check_tree_matrix(X)
+        if width != self._n_features:
+            raise ValueError(
+                "X must have the same number of features as the training data"
+            )
+
+        results = []
+        for row in X:
+            terms = []
+            for feature, threshold, sign, alpha in self._stumps:
+                vote = sign if row[feature] <= threshold else -sign
+                try:
+                    term = alpha * vote
+                except (OverflowError, ValueError) as exc:
+                    raise FloatingPointError(
+                        "non-finite value encountered during boosting"
+                    ) from exc
+                if isinstance(term, float) and not math.isfinite(term):
+                    raise FloatingPointError(
+                        "non-finite value encountered during boosting"
+                    )
+                terms.append(term)
+            try:
+                score = math.fsum(terms)
+            except (OverflowError, ValueError) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during boosting"
+                ) from exc
+            if not math.isfinite(score):
+                raise FloatingPointError(
+                    "non-finite value encountered during boosting"
+                )
+            results.append(1 if score > 0 else -1)
         return results
 
 
