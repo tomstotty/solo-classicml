@@ -20,7 +20,7 @@ Exports:
     DBSCAN -- deterministic density-based clustering with an epsilon
         neighborhood and a minimum core-point sample count.
     AgglomerativeClustering -- deterministic bottom-up clustering with
-        average linkage.
+        single, complete, or average linkage.
     GaussianMixture -- deterministic one-dimensional Gaussian mixture
         model fitted by expectation-maximization from sorted initial means.
     accuracy_score -- fraction of positions where two integer label
@@ -1868,17 +1868,18 @@ class DBSCAN:
 
 
 class AgglomerativeClustering:
-    """Deterministic agglomerative (bottom-up) clustering with average
-    linkage.
+    """Deterministic agglomerative (bottom-up) clustering with selectable
+    single, complete, or average linkage.
 
     Initially every input index is its own cluster, represented by a
     tuple of member indices in strictly ascending order. The pairwise
     distance is ``sqrt(math.fsum((X[i][k] - X[j][k]) ** 2))`` with the
     squared terms accumulated in ascending column order. The distance
-    ``D(A, B)`` between two clusters is the mean of all cross-cluster
-    pairwise distances, summed via ``math.fsum`` with members of ``A`` on
-    the outer loop and members of ``B`` on the inner loop, divided by
-    the number of pairs.
+    ``D(A, B)`` between two clusters enumerates every cross-cluster pair
+    with members of ``A`` on the outer loop and members of ``B`` on the
+    inner loop: single linkage takes the smallest pairwise distance,
+    complete linkage the largest, and average linkage their
+    ``math.fsum`` total divided by the number of pairs.
 
     Each round the surviving clusters are sorted by their member tuple,
     and the pair with the lexicographically smallest
@@ -1886,14 +1887,30 @@ class AgglomerativeClustering:
     tuples -- is merged; the merged members stay in ascending order.
     Merging repeats until ``n_clusters`` clusters remain. The final
     clusters are numbered from zero in ascending order of their smallest
-    member index, and ``fit_predict`` returns a fresh integer list in
-    input order. The input is never modified, and no randomness is used.
+    member index, and ``labels_`` is an integer list in input order. The
+    input is never modified, and no randomness is used.
+
+    ``fit`` clears ``labels_`` before validation, leaves it ``None`` if
+    fitting fails, and returns ``self``; ``fit_predict`` calls ``fit``
+    and returns a fresh copy of ``labels_``. Any subtraction, squaring,
+    ``math.fsum``, square root, or division that raises
+    ``OverflowError``/``ValueError`` or yields a non-finite value raises
+    ``FloatingPointError``.
     """
 
-    def __init__(self, n_clusters=2):
+    def __init__(self, n_clusters=2, linkage="average"):
         if type(n_clusters) is not int or n_clusters <= 0:
             raise ValueError("n_clusters must be a positive integer")
+        if type(linkage) is not str or linkage not in (
+            "single",
+            "complete",
+            "average",
+        ):
+            raise ValueError(
+                'linkage must be "single", "complete", or "average"'
+            )
         self.n_clusters = n_clusters
+        self.linkage = linkage
         self.labels_ = None
 
     @staticmethod
@@ -1942,35 +1959,57 @@ class AgglomerativeClustering:
         return result
 
     def _cluster_distance(self, members_a, members_b, X):
-        """Average-linkage distance: mean of all cross-cluster pairwise
-        distances, accumulated with A members on the outer loop."""
-        terms = []
+        """Linkage distance over all cross-cluster pairwise distances,
+        enumerated with A members on the outer loop and B members on the
+        inner loop. Single linkage takes the minimum, complete linkage
+        the maximum, and average linkage the ``math.fsum`` mean; any
+        arithmetic failure or non-finite result raises
+        FloatingPointError."""
+        if self.linkage == "average":
+            terms = []
+            for i in members_a:
+                for j in members_b:
+                    terms.append(self._distance(X[i], X[j]))
+            try:
+                total = math.fsum(terms)
+            except (OverflowError, ValueError) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during linkage computation"
+                ) from exc
+            if not math.isfinite(total):
+                raise FloatingPointError(
+                    "non-finite value encountered during linkage computation"
+                )
+            try:
+                result = total / len(terms)
+            except (OverflowError, ValueError, ZeroDivisionError) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during linkage computation"
+                ) from exc
+            if not math.isfinite(result):
+                raise FloatingPointError(
+                    "non-finite value encountered during linkage computation"
+                )
+            return result
+
+        best = None
         for i in members_a:
             for j in members_b:
-                terms.append(self._distance(X[i], X[j]))
-        try:
-            total = math.fsum(terms)
-        except (OverflowError, ValueError) as exc:
-            raise FloatingPointError(
-                "non-finite value encountered during linkage computation"
-            ) from exc
-        if not math.isfinite(total):
-            raise FloatingPointError(
-                "non-finite value encountered during linkage computation"
-            )
-        try:
-            mean = total / len(terms)
-        except (OverflowError, ValueError, ZeroDivisionError) as exc:
-            raise FloatingPointError(
-                "non-finite value encountered during linkage computation"
-            ) from exc
-        if not math.isfinite(mean):
-            raise FloatingPointError(
-                "non-finite value encountered during linkage computation"
-            )
-        return mean
+                distance = self._distance(X[i], X[j])
+                if best is None:
+                    best = distance
+                elif self.linkage == "single":
+                    if distance < best:
+                        best = distance
+                else:  # complete
+                    if distance > best:
+                        best = distance
+        return best
 
-    def fit_predict(self, X):
+    def fit(self, X):
+        # Clear before validation so a failed fit always leaves labels_
+        # as None.
+        self.labels_ = None
         _check_exact_matrix(X)
         n = len(X)
         if n < self.n_clusters:
@@ -2011,7 +2050,11 @@ class AgglomerativeClustering:
             for index in members:
                 labels[index] = label
         self.labels_ = labels
-        return list(labels)
+        return self
+
+    def fit_predict(self, X):
+        self.fit(X)
+        return list(self.labels_)
 
 
 class GaussianMixture:
