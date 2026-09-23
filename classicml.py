@@ -2129,6 +2129,125 @@ class GaussianMixture:
             labels.append(best_index)
         return labels, responsibilities
 
+    def score_samples(self, X) -> "list[float]":
+        """Return the log density of each input value in input order.
+
+        For every ``x`` and component index ``j`` (ascending), compute
+
+            ell_j = log(w_j)
+                - (log(2*pi*v_j) + (x - m_j)**2 / v_j) / 2,
+
+        let ``a = max_j ell_j`` and return
+        ``a + log(fsum_j exp(ell_j - a))``; ``log``, ``pi``, ``exp``,
+        and ``fsum`` all come from ``math`` and the sum follows
+        component order. An exact zero is written as positive ``0.0``.
+
+        The model must be fitted, and ``X`` must satisfy the same
+        validation rules as for ``predict``; otherwise ValueError is
+        raised (including the ``OverflowError`` from
+        ``math.isfinite``). After validation, any arithmetic
+        ``OverflowError``/``ValueError``/``ZeroDivisionError`` or any
+        non-finite intermediate value or result raises
+        FloatingPointError. ``X`` is not modified and the result is
+        deterministic.
+        """
+        if self.weights_ is None:
+            raise ValueError(
+                "model must be fitted before score_samples is called"
+            )
+        self._check_1d_vector(X)
+
+        k = self.n_components
+        weights = self.weights_
+        means = self.means_
+        variances = self.variances_
+        scores = []
+        for x in X:
+            log_components = []
+            for j in range(k):
+                try:
+                    ell = (
+                        math.log(weights[j])
+                        - (
+                            math.log(2.0 * math.pi * variances[j])
+                            + (x - means[j]) ** 2 / variances[j]
+                        )
+                        / 2.0
+                    )
+                except (
+                    OverflowError,
+                    ValueError,
+                    ZeroDivisionError,
+                ) as exc:
+                    raise FloatingPointError(
+                        "non-finite value encountered while scoring"
+                    ) from exc
+                if not math.isfinite(ell):
+                    raise FloatingPointError(
+                        "non-finite value encountered while scoring"
+                    )
+                log_components.append(ell)
+
+            largest = log_components[0]
+            for ell in log_components[1:]:
+                if ell > largest:
+                    largest = ell
+            try:
+                total = math.fsum(
+                    math.exp(ell - largest) for ell in log_components
+                )
+                score = largest + math.log(total)
+            except (
+                OverflowError,
+                ValueError,
+                ZeroDivisionError,
+            ) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered while scoring"
+                ) from exc
+            if not (
+                math.isfinite(largest)
+                and math.isfinite(total)
+                and math.isfinite(score)
+            ):
+                raise FloatingPointError(
+                    "non-finite value encountered while scoring"
+                )
+            if score == 0.0:
+                # An exact zero, including negative zero, is +0.0.
+                score = 0.0
+            scores.append(score)
+        return scores
+
+    def score(self, X) -> float:
+        """Return the mean log density over ``X``.
+
+        Equivalent to ``math.fsum(self.score_samples(X)) / len(X)``,
+        so it shares all validation and error behavior with
+        ``score_samples``: ValueError before fitting or for an invalid
+        ``X``, and FloatingPointError for any non-finite arithmetic after
+        validation. ``X`` is not modified and the result is
+        deterministic.
+        """
+        scores = self.score_samples(X)
+        try:
+            result = math.fsum(scores) / len(scores)
+        except (
+            OverflowError,
+            ValueError,
+            ZeroDivisionError,
+        ) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered while scoring"
+            ) from exc
+        if not math.isfinite(result):
+            raise FloatingPointError(
+                "non-finite value encountered while scoring"
+            )
+        if result == 0.0:
+            result = 0.0
+        return result
+
 
 def _check_metric_vectors(y_true, y_pred):
     """Validate that both metric inputs are non-empty lists of equal length."""
