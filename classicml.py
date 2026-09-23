@@ -12990,6 +12990,14 @@ _SERIAL_KEYS_BOOSTING = (
     "stumps",
 )
 _SERIAL_KEYS_BOOSTING_STUMP = ("feature", "threshold", "left", "right")
+_SERIAL_KEYS_KNN_REGRESSOR = (
+    "class",
+    "n_neighbors",
+    "weights",
+    "n_features_in",
+    "X",
+    "y",
+)
 
 
 def _quantize_fixed(value):
@@ -13080,7 +13088,7 @@ def dumps(model):
     """Serialize a fitted KMeans, PCA, LinearRegression,
     LogisticRegression, StandardScaler, DecisionTreeClassifier,
     RandomForestClassifier, AdaBoostClassifier, GradientBoostingRegressor,
-    or GaussianMixture model to compact JSON text.
+    GaussianMixture, or KNeighborsRegressor model to compact JSON text.
 
     The result contains no whitespace and no trailing newline. Integers
     (``n_clusters``, ``max_iter``, ``seed``, ``n_features_in``) are emitted
@@ -13137,6 +13145,18 @@ def dumps(model):
     ROUND_HALF_UP (negative zero becomes ``0.000000000000``); weights
     must be positive, means finite, and variances at least ``1e-12``,
     with neither weights nor variances quantizing to zero.
+
+    For KNeighborsRegressor the top-level keys are ``class``,
+    ``n_neighbors``, ``weights``, ``n_features_in``, ``X``, ``y`` in that
+    order; the two integers are positive JSON integers and ``weights`` is
+    the string ``"uniform"`` or ``"distance"``. ``X`` is a non-empty
+    rectangular list whose row count is at least ``n_neighbors`` and
+    whose row length equals ``n_features_in``; ``y`` is a list of the
+    same length. Every element of ``X`` and ``y`` must be an exact finite
+    ``float`` (booleans and ints rejected); each is formatted via
+    ``Decimal(str(v)).quantize(1E-10, ROUND_HALF_UP)`` (negative zero
+    becomes ``0.0000000000``), and the quantized text must convert back
+    with ``float`` to exactly the original value.
     """
     if isinstance(model, KMeans):
         try:
@@ -13212,11 +13232,22 @@ def dumps(model):
         except Exception as exc:
             raise ValueError("invalid GaussianMixture state") from exc
 
+    if isinstance(model, KNeighborsRegressor):
+        try:
+            return _dumps_knn_regressor(model)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError(
+                "invalid KNeighborsRegressor state"
+            ) from exc
+
     raise ValueError(
         "dumps only supports fitted KMeans, PCA, LinearRegression, "
         "LogisticRegression, StandardScaler, DecisionTreeClassifier, "
         "RandomForestClassifier, AdaBoostClassifier, "
-        "GradientBoostingRegressor, and GaussianMixture models"
+        "GradientBoostingRegressor, GaussianMixture, and "
+        "KNeighborsRegressor models"
     )
 
 
@@ -13892,6 +13923,102 @@ def _quantize_gaussian_value(value, name, positive=False):
     return token
 
 
+def _quantize_exact_float(value):
+    """Quantize an exact finite ``float`` to 10 fixed decimals.
+
+    The element must have type exactly ``float`` (booleans and ints are
+    rejected), be finite, and the result of
+    ``Decimal(str(v)).quantize(1E-10, ROUND_HALF_UP)`` must convert back
+    with ``float`` to exactly the original value; negative zero
+    normalizes to ``0.0000000000``.
+    """
+    if type(value) is not float or not math.isfinite(value):
+        raise ValueError("elements must be finite floats")
+    with localcontext() as ctx:
+        ctx.prec = 400
+        decimal_value = Decimal(str(value)).quantize(
+            _QUANTUM, rounding=ROUND_HALF_UP
+        )
+    if decimal_value == 0:
+        token = "0.0000000000"
+    else:
+        token = format(decimal_value, "f")
+    if float(token) != value:
+        raise ValueError(
+            "values must round-trip exactly after quantization to 10 "
+            "decimals"
+        )
+    return token
+
+
+def _dumps_knn_regressor(model):
+    """Serialize a fitted KNeighborsRegressor.
+
+    The top-level keys are class, n_neighbors, weights, n_features_in, X,
+    y in that order; ``n_neighbors`` and ``n_features_in`` are positive
+    JSON integers, ``weights`` is ``"uniform"`` or ``"distance"``, ``X``
+    is a non-empty rectangular matrix with at least ``n_neighbors`` rows
+    of length ``n_features_in`` and ``y`` a vector of the same length.
+    Every element of ``X`` and ``y`` must be an exact finite float and
+    must round-trip exactly after 10-decimal ROUND_HALF_UP quantization.
+    """
+    X = model._X
+    y = model._y
+    n_features = model._width
+    if X is None or y is None or n_features is None:
+        raise ValueError(
+            "KNeighborsRegressor must be fitted before dumps is called"
+        )
+    n_neighbors = model.n_neighbors
+    weights = model.weights
+    if type(n_neighbors) is not int or n_neighbors <= 0:
+        raise ValueError("n_neighbors must be a positive integer")
+    if weights not in ("uniform", "distance"):
+        raise ValueError('weights must be "uniform" or "distance"')
+    if type(n_features) is not int or n_features <= 0:
+        raise ValueError("n_features_in must be a positive integer")
+    if not isinstance(X, list) or len(X) == 0:
+        raise ValueError("X must be a non-empty list of rows")
+    if len(X) < n_neighbors:
+        raise ValueError(
+            "number of X rows must be at least n_neighbors"
+        )
+    for row in X:
+        if not isinstance(row, list) or len(row) != n_features:
+            raise ValueError(
+                "X must be rectangular with rows of length n_features_in"
+            )
+    if not isinstance(y, list) or len(y) != len(X):
+        raise ValueError("y must be a list with the same length as X")
+
+    encoded_rows = []
+    for row in X:
+        encoded_rows.append(
+            "["
+            + ",".join(_quantize_exact_float(value) for value in row)
+            + "]"
+        )
+    X_text = "[" + ",".join(encoded_rows) + "]"
+    y_text = (
+        "["
+        + ",".join(_quantize_exact_float(value) for value in y)
+        + "]"
+    )
+    return (
+        '{"class":"KNeighborsRegressor","n_neighbors":'
+        + str(n_neighbors)
+        + ',"weights":"'
+        + weights
+        + '","n_features_in":'
+        + str(n_features)
+        + ',"X":'
+        + X_text
+        + ',"y":'
+        + y_text
+        + "}"
+    )
+
+
 _JSON_INT_RE = re.compile(r"^(0|-?[1-9][0-9]*)$")
 _JSON_FLOAT_RE = re.compile(r"^-?(0|[1-9][0-9]*)\.[0-9]{10}$")
 _JSON_FLOAT12_RE = re.compile(r"^-?(0|[1-9][0-9]*)\.[0-9]{12}$")
@@ -14534,12 +14661,59 @@ def _load_gaussian(pairs):
     return model
 
 
+def _load_knn_regressor(pairs):
+    keys = tuple(key for key, _ in pairs)
+    if keys != _SERIAL_KEYS_KNN_REGRESSOR:
+        raise ValueError(
+            "KNeighborsRegressor JSON must have exactly the serialized "
+            "keys in the serialized order"
+        )
+    data = _convert(pairs)
+
+    class_name = data["class"]
+    if not isinstance(class_name, str) or class_name != "KNeighborsRegressor":
+        raise ValueError('class must be "KNeighborsRegressor"')
+
+    n_neighbors = _expect_int(data["n_neighbors"], "n_neighbors")
+    if n_neighbors <= 0:
+        raise ValueError("n_neighbors must be greater than 0")
+    weights = data["weights"]
+    if not isinstance(weights, str) or weights not in ("uniform", "distance"):
+        raise ValueError('weights must be "uniform" or "distance"')
+    n_features = _expect_int(data["n_features_in"], "n_features_in")
+    if n_features <= 0:
+        raise ValueError("n_features_in must be greater than 0")
+
+    X_node = data["X"]
+    if not isinstance(X_node, list) or len(X_node) == 0:
+        raise ValueError("X must be a non-empty array")
+    if len(X_node) < n_neighbors:
+        raise ValueError("X must have at least n_neighbors rows")
+    X = []
+    for row in X_node:
+        if not isinstance(row, list):
+            raise ValueError("X rows must be arrays")
+        X.append(
+            _expect_fixed_vector(row, n_features, "X row")
+        )
+
+    y = _expect_fixed_vector(data["y"], len(X), "y")
+
+    model = KNeighborsRegressor(
+        n_neighbors=n_neighbors, weights=weights
+    )
+    model._X = [list(row) for row in X]
+    model._y = list(y)
+    model._width = n_features
+    return model
+
+
 def loads(text):
     """Reconstruct a fitted KMeans, PCA, LinearRegression,
     LogisticRegression, StandardScaler, DecisionTreeClassifier,
     RandomForestClassifier, AdaBoostClassifier,
-    GradientBoostingRegressor, or GaussianMixture from text produced by
-    dumps.
+    GradientBoostingRegressor, GaussianMixture, or
+    KNeighborsRegressor from text produced by dumps.
 
     Only the exact byte format emitted by :func:`dumps` is accepted: a
     ``str`` holding compact JSON with no whitespace, no duplicate keys,
@@ -14553,8 +14727,9 @@ def loads(text):
     count from centroid width, the linear models from the length of
     ``w``, StandardScaler/DecisionTreeClassifier/RandomForestClassifier
     from ``n_features_in``, AdaBoostClassifier from ``n_features_in``,
-    GradientBoostingRegressor from ``n_features_in``, and
-    GaussianMixture from ``n_components``.
+    GradientBoostingRegressor from ``n_features_in``,
+    GaussianMixture from ``n_components``, and KNeighborsRegressor from
+    ``n_features_in``.
     The argument is not modified.
     """
     if type(text) is not str or len(text) == 0:
@@ -14646,6 +14821,13 @@ def loads(text):
     if class_entry == "GaussianMixture":
         try:
             return _load_gaussian(pairs)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("malformed serialized model") from exc
+    if class_entry == "KNeighborsRegressor":
+        try:
+            return _load_knn_regressor(pairs)
         except ValueError:
             raise
         except Exception as exc:
