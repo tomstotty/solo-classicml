@@ -153,9 +153,9 @@ Exports:
         reciprocal rank of the first positive label among the k
         highest-scoring columns of a binary label matrix.
     dumps -- serialize a fitted KMeans/PCA/linear/scaler/tree/forest
-        model (including MultinomialLogisticRegression) to
-        whitespace-free JSON text (quantized to 10 decimal places with
-        ROUND_HALF_UP).
+        model (including MultinomialLogisticRegression and
+        AgglomerativeClustering) to whitespace-free JSON text
+        (quantized to 10 decimal places with ROUND_HALF_UP).
     loads -- reconstruct an independent fitted model from text produced
         by dumps; anything outside that byte format raises ValueError.
 
@@ -14122,6 +14122,15 @@ _SERIAL_KEYS_KNN_CLASSIFIER = (
     "y",
 )
 
+_SERIAL_KEYS_AGGLOMERATIVE = (
+    "class",
+    "n_clusters",
+    "linkage",
+    "labels",
+    "children",
+    "distances",
+)
+
 
 def _quantize_fixed(value):
     """Quantize a finite non-boolean real to 10 decimal places (HALF_UP)
@@ -14347,14 +14356,233 @@ def _dumps_knn_classifier(model):
     )
 
 
+def _agglomerative_members(n, children):
+    """Replay ``children`` of an agglomerative clustering and return the
+    final surviving clusters as ascending member tuples.
+
+    Leaves are the singleton clusters ``0`` ... ``n - 1``; merge ``r``
+    references two clusters still alive at that round, ordered so the
+    first id's member tuple is strictly smaller than the second's, and
+    creates node ``n + r``. Every referenced id must name an existing
+    live node. Raises ValueError on any inconsistency.
+    """
+    members = {i: (i,) for i in range(n)}
+    alive = set(range(n))
+    for r, pair in enumerate(children):
+        merged_id = n + r
+        if len(pair) != 2:
+            raise ValueError("each children entry must be an integer pair")
+        left_id, right_id = pair
+        if left_id not in alive or right_id not in alive:
+            raise ValueError(
+                "each merge must reference two different surviving clusters"
+            )
+        if left_id < 0 or left_id >= merged_id or right_id < 0 or right_id >= merged_id:
+            raise ValueError("children entries must reference existing nodes")
+        left_members = members[left_id]
+        right_members = members[right_id]
+        if not left_members < right_members:
+            raise ValueError(
+                "each merge must reference its two clusters in ascending "
+                "member-tuple order"
+            )
+        merged = tuple(sorted(left_members + right_members))
+        alive.discard(left_id)
+        alive.discard(right_id)
+        members[merged_id] = merged
+        alive.add(merged_id)
+    return sorted(members[node_id] for node_id in alive)
+
+
+def _validate_agglomerative_state(model):
+    """Validate a fitted AgglomerativeClustering's parameters and state.
+
+    Confirms the construction parameters exactly as ``__init__`` does
+    (positive exact-int ``n_clusters``, linkage one of
+    ``single``/``complete``/``average``), that the model is fitted with
+    non-empty integer ``labels_`` of length ``n`` (``n_clusters <= n``),
+    that ``children_`` has exactly ``n - n_clusters`` integer pairs which
+    replay as valid merges over leaves ``0`` ... ``n - 1`` (the r-th pair
+    references two distinct surviving clusters and creates node
+    ``n + r``), that ``distances_`` has the same length with finite
+    non-negative exact int/float entries, and that ``labels_`` equals the
+    clusters numbered by ascending smallest member in input order.
+    Returns ``(n_clusters, labels, children, distances)``.
+    """
+    n_clusters = model.n_clusters
+    linkage = model.linkage
+    if type(n_clusters) is not int or n_clusters <= 0:
+        raise ValueError("n_clusters must be a positive integer")
+    if type(linkage) is not str or linkage not in (
+        "single",
+        "complete",
+        "average",
+    ):
+        raise ValueError(
+            'linkage must be "single", "complete", or "average"'
+        )
+
+    labels = model.labels_
+    children = model.children_
+    distances = model.distances_
+    if labels is None or children is None or distances is None:
+        raise ValueError(
+            "AgglomerativeClustering must be fitted before dumps is called"
+        )
+    if not isinstance(labels, list) or len(labels) == 0:
+        raise ValueError("labels_ must be a non-empty integer list")
+    n = len(labels)
+    for value in labels:
+        if type(value) is not int:
+            raise ValueError("labels_ must contain only integers")
+    if n_clusters > n:
+        raise ValueError(
+            "n_clusters must not exceed the number of labeled samples"
+        )
+
+    if not isinstance(children, list) or len(children) != n - n_clusters:
+        raise ValueError(
+            "children_ must have length n - n_clusters"
+        )
+    for pair in children:
+        if (
+            not isinstance(pair, list)
+            or len(pair) != 2
+            or type(pair[0]) is not int
+            or type(pair[1]) is not int
+        ):
+            raise ValueError(
+                "every children_ entry must be a pair of integers"
+            )
+
+    clusters = _agglomerative_members(n, children)
+    if len(clusters) != n_clusters:
+        raise ValueError(
+            "the merges must leave exactly n_clusters clusters"
+        )
+    expected_labels = [0] * n
+    for label, cluster_members in enumerate(clusters):
+        for index in cluster_members:
+            expected_labels[index] = label
+    if labels != expected_labels:
+        raise ValueError(
+            "labels_ must number the clusters by ascending smallest member"
+        )
+
+    if not isinstance(distances, list) or len(distances) != len(children):
+        raise ValueError(
+            "distances_ must have the same length as children_"
+        )
+    for value in distances:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(
+                "distances_ must contain only finite non-negative numbers"
+            )
+        try:
+            finite = math.isfinite(value)
+        except OverflowError:
+            finite = False
+        if not finite or value < 0:
+            raise ValueError(
+                "distances_ must contain only finite non-negative numbers"
+            )
+    return n_clusters, labels, children, distances
+
+
+def _quantize_agglomerative_distance(value):
+    """Quantize one agglomerative merge distance to its canonical text.
+
+    The value must be a finite non-negative exact ``int`` or ``float``
+    (booleans rejected); quantization is
+    ``Decimal(str(v)).quantize(1E-10, ROUND_HALF_UP)`` -- deliberately
+    ``str(v)`` directly, so an exact integer keeps its exact decimal
+    spelling rather than a float-rounded one. Negative zero normalizes to
+    ``0.0000000000``.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(
+            "distances_ must contain only finite non-negative numbers"
+        )
+    try:
+        finite = math.isfinite(value)
+    except OverflowError as exc:
+        raise ValueError(
+            "distances_ must contain only finite non-negative numbers"
+        ) from exc
+    if not finite or value < 0:
+        raise ValueError(
+            "distances_ must contain only finite non-negative numbers"
+        )
+    token = str(value)
+    with localcontext() as ctx:
+        ctx.prec = max(400, len(token.lstrip("-")) + 20)
+        decimal_value = Decimal(token).quantize(
+            _QUANTUM, rounding=ROUND_HALF_UP
+        )
+    if decimal_value == 0:
+        return "0.0000000000"
+    return format(decimal_value, "f")
+
+
+def _dumps_agglomerative(model):
+    """Serialize a fitted AgglomerativeClustering.
+
+    The top-level keys are ``class``, ``n_clusters``, ``linkage``,
+    ``labels``, ``children``, ``distances`` in that order; ``class`` is
+    ``"AgglomerativeClustering"``, ``n_clusters`` is a positive JSON
+    integer no larger than the label count, and ``linkage`` is
+    ``"single"``, ``"complete"``, or ``"average"``. ``labels`` is a
+    non-empty JSON integer array; ``children`` has ``n - n_clusters``
+    integer pairs replaying the merges with leaves ``0`` ... ``n - 1``
+    (the r-th pair merges two distinct surviving clusters into node
+    ``n + r``); ``distances`` is an array of the same length whose finite
+    non-negative exact int/float entries are quantized to 10 decimal
+    places via ``Decimal(str(v))`` with ROUND_HALF_UP (negative zero
+    becomes ``0.0000000000``).
+    """
+    n_clusters, labels, children, distances = (
+        _validate_agglomerative_state(model)
+    )
+    labels_text = "[" + ",".join(str(value) for value in labels) + "]"
+    children_text = (
+        "["
+        + ",".join(
+            "[" + str(pair[0]) + "," + str(pair[1]) + "]"
+            for pair in children
+        )
+        + "]"
+    )
+    distances_text = (
+        "["
+        + ",".join(
+            _quantize_agglomerative_distance(value) for value in distances
+        )
+        + "]"
+    )
+    return (
+        '{"class":"AgglomerativeClustering","n_clusters":'
+        + str(n_clusters)
+        + ',"linkage":'
+        + json.dumps(model.linkage)
+        + ',"labels":'
+        + labels_text
+        + ',"children":'
+        + children_text
+        + ',"distances":'
+        + distances_text
+        + "}"
+    )
+
+
 def dumps(model):
     """Serialize a fitted KMeans, PCA, LinearRegression,
     LogisticRegression, MultinomialLogisticRegression, StandardScaler,
     DecisionTreeClassifier, DecisionTreeRegressor,
     RandomForestClassifier, RandomForestRegressor, AdaBoostClassifier,
     GradientBoostingRegressor, GradientBoostingClassifier,
-    GaussianMixture, KNeighborsRegressor, or
-    KNeighborsClassifier model to compact JSON text.
+    GaussianMixture, KNeighborsRegressor,
+    KNeighborsClassifier, or AgglomerativeClustering model to compact
+    JSON text.
 
     The result contains no whitespace and no trailing newline. Integers
     (``n_clusters``, ``max_iter``, ``seed``, ``n_features_in``) are emitted
@@ -14484,6 +14712,22 @@ def dumps(model):
     ``y`` is a 1-D array of the same length as ``X`` whose elements
     have type exactly ``int`` (booleans rejected) and are emitted as
     JSON integers with no leading zeros.
+
+    For AgglomerativeClustering the top-level keys are ``class``,
+    ``n_clusters``, ``linkage``, ``labels``, ``children``,
+    ``distances`` in that order; ``class`` is
+    ``"AgglomerativeClustering"``, ``n_clusters`` is a positive JSON
+    integer no larger than the label count, and ``linkage`` is
+    ``"single"``, ``"complete"``, or ``"average"``. ``labels`` is a
+    non-empty JSON integer array of length ``n``. ``children`` has
+    ``n - n_clusters`` integer pairs: leaves are ``0`` ... ``n - 1``,
+    the r-th pair must reference two distinct surviving clusters by
+    ascending member tuple and creates merge node ``n + r``. ``labels``
+    must equal the clusters numbered from zero by ascending smallest
+    member in input order. ``distances`` has the same length as
+    ``children``; each entry is a finite non-negative exact int/float
+    quantized to 10 decimal places via ``Decimal(str(v))`` with
+    ROUND_HALF_UP (negative zero becomes ``0.0000000000``).
     """
     if isinstance(model, KMeans):
         try:
@@ -14615,6 +14859,16 @@ def dumps(model):
                 "invalid KNeighborsClassifier state"
             ) from exc
 
+    if isinstance(model, AgglomerativeClustering):
+        try:
+            return _dumps_agglomerative(model)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError(
+                "invalid AgglomerativeClustering state"
+            ) from exc
+
     raise ValueError(
         "dumps only supports fitted KMeans, PCA, LinearRegression, "
         "LogisticRegression, MultinomialLogisticRegression, "
@@ -14622,8 +14876,8 @@ def dumps(model):
         "RandomForestClassifier, RandomForestRegressor, "
         "AdaBoostClassifier, GradientBoostingRegressor, "
         "GradientBoostingClassifier, "
-        "GaussianMixture, KNeighborsRegressor, and "
-        "KNeighborsClassifier models"
+        "GaussianMixture, KNeighborsRegressor, "
+        "KNeighborsClassifier, and AgglomerativeClustering models"
     )
 
 
@@ -16563,14 +16817,101 @@ def _load_knn_classifier(pairs):
     return model
 
 
+def _load_agglomerative(pairs):
+    keys = tuple(key for key, _ in pairs)
+    if keys != _SERIAL_KEYS_AGGLOMERATIVE:
+        raise ValueError(
+            "AgglomerativeClustering JSON must have exactly the serialized "
+            "keys in the serialized order"
+        )
+    data = _convert(pairs)
+
+    class_name = data["class"]
+    if not isinstance(class_name, str) or class_name != "AgglomerativeClustering":
+        raise ValueError('class must be "AgglomerativeClustering"')
+
+    n_clusters = _expect_int(data["n_clusters"], "n_clusters")
+    if n_clusters <= 0:
+        raise ValueError("n_clusters must be a positive integer")
+
+    linkage = data["linkage"]
+    if not isinstance(linkage, str) or linkage not in (
+        "single",
+        "complete",
+        "average",
+    ):
+        raise ValueError(
+            'linkage must be "single", "complete", or "average"'
+        )
+
+    labels_node = data["labels"]
+    if not isinstance(labels_node, list) or len(labels_node) == 0:
+        raise ValueError("labels must be a non-empty array")
+    n = len(labels_node)
+    if n_clusters > n:
+        raise ValueError("n_clusters must not exceed the number of labels")
+    labels = [_expect_int(value, "labels element") for value in labels_node]
+
+    children_node = data["children"]
+    merge_count = n - n_clusters
+    if not isinstance(children_node, list) or len(children_node) != merge_count:
+        raise ValueError("children must have length n - n_clusters")
+    children = []
+    for pair in children_node:
+        if not isinstance(pair, list) or len(pair) != 2:
+            raise ValueError("every children entry must be an integer pair")
+        children.append(
+            [
+                _expect_int(pair[0], "children element"),
+                _expect_int(pair[1], "children element"),
+            ]
+        )
+
+    # Replay the merges: the r-th pair must reference two distinct
+    # surviving clusters over leaves 0..n-1, creating node n+r.
+    clusters = _agglomerative_members(n, children)
+    if len(clusters) != n_clusters:
+        raise ValueError(
+            "the merges must leave exactly n_clusters clusters"
+        )
+    expected_labels = [0] * n
+    for label, cluster_members in enumerate(clusters):
+        for index in cluster_members:
+            expected_labels[index] = label
+    if labels != expected_labels:
+        raise ValueError(
+            "labels must number the clusters by ascending smallest member"
+        )
+
+    distances_node = data["distances"]
+    if not isinstance(distances_node, list) or len(distances_node) != merge_count:
+        raise ValueError("distances must have the same length as children")
+    distances = []
+    for value in distances_node:
+        distance = _expect_fixed(value, "distances element")
+        if distance < 0.0:
+            raise ValueError("distances must be non-negative")
+        distances.append(distance)
+
+    model = AgglomerativeClustering(
+        n_clusters=n_clusters, linkage=linkage
+    )
+    # Fresh lists (including fresh inner pairs) so the fitted state never
+    # shares storage with the parsed payload.
+    model.labels_ = list(labels)
+    model.children_ = [list(pair) for pair in children]
+    model.distances_ = list(distances)
+    return model
+
+
 def loads(text):
     """Reconstruct a fitted KMeans, PCA, LinearRegression,
     LogisticRegression, MultinomialLogisticRegression, StandardScaler,
     DecisionTreeClassifier, DecisionTreeRegressor,
     RandomForestClassifier, RandomForestRegressor, AdaBoostClassifier,
     GradientBoostingRegressor, GradientBoostingClassifier,
-    GaussianMixture, KNeighborsRegressor, or
-    KNeighborsClassifier from text produced by dumps.
+    GaussianMixture, KNeighborsRegressor, KNeighborsClassifier, or
+    AgglomerativeClustering from text produced by dumps.
 
     Only the exact byte format emitted by :func:`dumps` is accepted: a
     ``str`` holding compact JSON with no whitespace, no duplicate keys,
@@ -16591,10 +16932,14 @@ def loads(text):
     ``n_features_in``,
     GaussianMixture from ``n_components``, KNeighborsRegressor from
     ``n_features_in`` with its stored ``X``/``y`` arrays copied rather
-    than shared, and KNeighborsClassifier from ``n_features_in`` with
-    its stored ``X``/``y`` arrays copied rather than shared (``X``
+    than shared, KNeighborsClassifier from ``n_features_in`` with its
+    stored ``X``/``y`` arrays copied rather than shared (``X``
     elements are finite fixed 10-decimal numbers and ``y`` elements are
-    JSON integers).
+    JSON integers), and AgglomerativeClustering from the length of
+    ``labels`` with its ``labels``, ``children`` (inner pairs included),
+    and ``distances`` lists copied rather than shared; the children
+    merges are replayed and ``labels`` must number the resulting
+    clusters by ascending smallest member.
     The argument is not modified.
     """
     if type(text) is not str or len(text) == 0:
@@ -16728,6 +17073,13 @@ def loads(text):
     if class_entry == "KNeighborsClassifier":
         try:
             return _load_knn_classifier(pairs)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("malformed serialized model") from exc
+    if class_entry == "AgglomerativeClustering":
+        try:
+            return _load_agglomerative(pairs)
         except ValueError:
             raise
         except Exception as exc:
