@@ -7,6 +7,9 @@ Exports:
         optional L2 penalty, trained by full-batch gradient descent.
     KNeighborsClassifier -- deterministic k-nearest-neighbors classifier
         using squared Euclidean distances.
+    KNeighborsRegressor -- deterministic k-nearest-neighbors regressor
+        using squared Euclidean distances with uniform or inverse-distance
+        weights.
     DecisionTreeClassifier -- deterministic binary decision tree classifier
         using Gini impurity splits.
     RandomForestClassifier -- deterministic bagged forest of Gini decision
@@ -177,6 +180,7 @@ __all__ = [
     "LinearRegression",
     "LogisticRegression",
     "KNeighborsClassifier",
+    "KNeighborsRegressor",
     "DecisionTreeClassifier",
     "RandomForestClassifier",
     "AdaBoostClassifier",
@@ -820,6 +824,163 @@ class KNeighborsClassifier:
             )
             all_indices.append([int(pair[2]) for pair in pairs[:k]])
         return all_distances, all_indices
+
+
+class KNeighborsRegressor:
+    """Deterministic k-nearest-neighbors regressor.
+
+    Distances are squared Euclidean distances accumulated with
+    ``math.fsum`` in feature order. Neighbors are selected by ascending
+    ``(distance, training row index)``. With ``weights="uniform"`` a
+    prediction is the ``math.fsum`` of the neighbor targets divided by
+    the neighbor count; with ``weights="distance"``, when one or more
+    neighbors have zero distance only those neighbors are averaged with
+    equal weight, and otherwise each neighbor contributes with weight
+    ``1 / sqrt(distance)``, the numerator and denominator each
+    accumulated with ``math.fsum`` in neighbor order. Exact-zero
+    predictions are returned as positive ``0.0``. No randomness is used.
+    """
+
+    def __init__(self, n_neighbors=5, weights="uniform"):
+        if type(n_neighbors) is not int or n_neighbors < 1:
+            raise ValueError("n_neighbors must be a positive integer")
+        if type(weights) is not str or weights not in ("uniform", "distance"):
+            raise ValueError('weights must be "uniform" or "distance"')
+        self.n_neighbors = n_neighbors
+        self.weights = weights
+        self._X = None
+        self._y = None
+        self._width = None
+
+    def fit(self, X, y):
+        # Clear the previous fit up front so that a failed validation
+        # leaves the model unfitted.
+        self._X = None
+        self._y = None
+        self._width = None
+        try:
+            width = _check_gradient_matrix(X)
+            _check_gradient_target(y, len(X))
+        except OverflowError as exc:
+            # An int too large to convert to float failed its finiteness
+            # check: still a rejected input, hence ValueError.
+            raise ValueError(
+                "X and y must contain only finite non-boolean numbers"
+            ) from exc
+        if self.n_neighbors > len(X):
+            raise ValueError(
+                "n_neighbors must not exceed the number of training samples"
+            )
+        self._X = X
+        self._y = y
+        self._width = width
+        return self
+
+    def predict(self, X) -> list[float]:
+        if self._X is None:
+            raise ValueError("model must be fitted before predict is called")
+        try:
+            width = _check_gradient_matrix(X)
+        except OverflowError as exc:
+            raise ValueError(
+                "X must contain only finite non-boolean numbers"
+            ) from exc
+        if width != self._width:
+            raise ValueError(
+                "X must have the same number of features as the training data"
+            )
+
+        results = []
+        for query in X:
+            distances = [
+                _squared_distance(query, train_row) for train_row in self._X
+            ]
+            order = sorted(
+                range(len(self._X)), key=lambda i: (distances[i], i)
+            )
+            neighbors = order[: self.n_neighbors]
+            if self.weights == "uniform":
+                results.append(self._uniform_prediction(neighbors))
+            else:
+                results.append(self._distance_prediction(distances, neighbors))
+        return results
+
+    @staticmethod
+    def _finite_prediction(total, count):
+        """Divide an fsum total by a count and normalize the zero sign."""
+        try:
+            prediction = total / count
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during prediction"
+            ) from exc
+        if not math.isfinite(prediction):
+            raise FloatingPointError(
+                "non-finite value encountered during prediction"
+            )
+        return _positive_zero(prediction)
+
+    def _uniform_prediction(self, neighbors):
+        """fsum of the neighbor targets divided by the neighbor count."""
+        try:
+            total = math.fsum(self._y[i] for i in neighbors)
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during prediction"
+            ) from exc
+        return self._finite_prediction(total, len(neighbors))
+
+    def _distance_prediction(self, distances, neighbors):
+        """Equal-weighted mean of all zero-distance neighbors, or else the
+        inverse-distance-weighted mean with fsum sums in neighbor order."""
+        zero_neighbors = [i for i in neighbors if distances[i] == 0]
+        if zero_neighbors:
+            try:
+                total = math.fsum(self._y[i] for i in zero_neighbors)
+            except (OverflowError, ValueError) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during prediction"
+                ) from exc
+            return self._finite_prediction(total, len(zero_neighbors))
+
+        weights = []
+        terms = []
+        for i in neighbors:
+            try:
+                distance = math.sqrt(distances[i])
+                weight = 1.0 / distance
+                term = weight * self._y[i]
+            except (
+                OverflowError,
+                ValueError,
+                ZeroDivisionError,
+            ) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during prediction"
+                ) from exc
+            if not (
+                math.isfinite(distance)
+                and math.isfinite(weight)
+                and math.isfinite(term)
+            ):
+                raise FloatingPointError(
+                    "non-finite value encountered during prediction"
+                )
+            weights.append(weight)
+            terms.append(term)
+        try:
+            numerator = math.fsum(terms)
+            denominator = math.fsum(weights)
+            prediction = numerator / denominator
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during prediction"
+            ) from exc
+        if not math.isfinite(prediction):
+            raise FloatingPointError(
+                "non-finite value encountered during prediction"
+            )
+        return _positive_zero(prediction)
 
 
 def _check_tree_matrix(X):
