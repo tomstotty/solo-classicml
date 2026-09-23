@@ -1794,6 +1794,62 @@ class GradientBoostingRegressor:
             results.append(prediction)
         return results
 
+    def staged_predict(self, X) -> list[list[float]]:
+        """Return the predictions after every prefix of the saved stumps.
+
+        Validation matches ``predict``: the model must be fitted and ``X``
+        must be a non-empty rectangular matrix of finite non-boolean exact
+        int/float values with as many columns as the training data. The
+        result is a fresh list of ``len(_stumps) + 1`` fresh lists, one per
+        input row each: index 0 holds the initial constant for every row
+        and index r holds the predictions after accumulating the first r
+        stumps in save order. Each addition follows ``predict`` exactly,
+        including the positive-zero normalization and FloatingPointError
+        for overflow or non-finite results. Neither the argument nor the
+        model is modified.
+        """
+        if self._stumps is None:
+            raise ValueError(
+                "model must be fitted before staged_predict is called"
+            )
+        try:
+            width = _check_gradient_matrix(X)
+        except OverflowError as exc:
+            raise ValueError(
+                "X must contain only finite non-boolean numbers"
+            ) from exc
+        if width != self._n_features:
+            raise ValueError(
+                "X must have the same number of features as the training data"
+            )
+
+        current = [self._constant for _ in X]
+        stages = [current]
+        for feature, threshold, increment_left, increment_right in (
+            self._stumps
+        ):
+            updated = []
+            for i, row in enumerate(X):
+                increment = (
+                    increment_left
+                    if row[feature] <= threshold
+                    else increment_right
+                )
+                try:
+                    prediction = current[i] + increment
+                except (OverflowError, ValueError) as exc:
+                    raise FloatingPointError(
+                        "non-finite value encountered during gradient boosting"
+                    ) from exc
+                if not _is_finite_or_int(prediction):
+                    raise FloatingPointError(
+                        "non-finite value encountered during gradient boosting"
+                    )
+                updated.append(_positive_zero(prediction))
+            current = updated
+            stages.append(current)
+        return stages
+
 
 class StandardScaler:
     """Standardize columns by their mean and population standard deviation.
@@ -12916,11 +12972,14 @@ def dumps(model):
     positive finite exact int/float values quantized to 10 decimal
     places that must remain positive after quantization, and
     ``constant`` is a finite exact int/float quantized the same way
-    (negative zero becomes ``0.0000000000``). ``stumps`` is an array of
-    zero to ``n_estimators`` stumps, each an object with the keys
-    ``feature``, ``threshold``, ``left``, ``right`` in that order: an
-    integer ``feature`` in ``[0, n_features_in)`` and three finite
-    exact int/float values quantized to 10 decimal places.
+    (negative zero becomes ``0.0000000000``); the quantized text must
+    convert back with ``float`` to exactly the original value.
+    ``stumps`` is an array of zero to ``n_estimators`` stumps, each an
+    object with the keys ``feature``, ``threshold``, ``left``, ``right``
+    in that order: an integer ``feature`` in ``[0, n_features_in)`` and
+    three finite exact int/float values quantized to 10 decimal places,
+    each of which must convert back with ``float`` to exactly the
+    original value so a reloaded model predicts identically.
 
     For GaussianMixture the top-level keys are ``class``,
     ``n_components``, ``weights``, ``means``, ``variances`` in that
@@ -13465,6 +13524,21 @@ def _quantize_stump_number(value, name):
     return token
 
 
+def _quantize_boosting_number(value, name):
+    """Quantize an exact int/float boosting coordinate to 10 fixed
+    decimals via ``Decimal(str(v))`` with ROUND_HALF_UP (negative zero
+    becomes ``0.0000000000``). The quantized text must convert back with
+    ``float`` to exactly the original value, otherwise ValueError is
+    raised because a model reloaded from the text would not predict
+    identically."""
+    token = _quantize_state_number(value)
+    if float(token) != value:
+        raise ValueError(
+            "boosting %s must equal its 10-decimal quantization" % name
+        )
+    return token
+
+
 def _dumps_boosting(model):
     """Serialize a fitted GradientBoostingRegressor.
 
@@ -13473,13 +13547,16 @@ def _dumps_boosting(model):
     ``n_features_in`` are positive JSON integers, ``learning_rate`` and
     ``tol`` are strictly positive finite exact int/float values quantized
     to 10 decimals (they must remain positive after quantization), and
-    ``constant`` is a finite exact int/float quantized the same way.
-    ``stumps`` is a list of zero to ``n_estimators`` four-tuples encoded
-    as objects with the keys feature, threshold, left, right in that
-    order; ``feature`` is an exact integer in ``[0, n_features_in)`` and
-    the other three are finite exact int/float values (booleans
-    rejected), each quantized to 10 decimals with negative zero
-    normalized to ``0.0000000000``.
+    ``constant`` is a finite exact int/float quantized the same way whose
+    quantized text must convert back with ``float`` to exactly the
+    original value. ``stumps`` is a list of zero to ``n_estimators``
+    four-tuples encoded as objects with the keys feature, threshold,
+    left, right in that order; ``feature`` is an exact integer in
+    ``[0, n_features_in)`` and the other three are finite exact int/float
+    values (booleans rejected), each quantized to 10 decimals with
+    negative zero normalized to ``0.0000000000`` and each required to
+    survive the ``float`` round trip exactly so a reloaded model predicts
+    identically.
     """
     constant = model._constant
     stumps = model._stumps
@@ -13515,7 +13592,7 @@ def _dumps_boosting(model):
         raise ValueError(
             "tol must remain positive after quantization to 10 decimals"
         )
-    constant_text = _quantize_state_number(constant)
+    constant_text = _quantize_boosting_number(constant, "constant")
     stumps_text = "[" + ",".join(
         _encode_boosting_stump(stump, n_features) for stump in stumps
     ) + "]"
@@ -13543,7 +13620,9 @@ def _encode_boosting_stump(stump, n_features):
     ``feature`` is an exact integer in ``[0, n_features)``; the
     threshold and the two side increments are finite exact int/float
     values (booleans rejected), quantized to 10 decimals with negative
-    zero normalized to ``0.0000000000``.
+    zero normalized to ``0.0000000000`` and each required to survive the
+    ``float`` round trip exactly so a reloaded model predicts
+    identically.
     """
     if type(stump) is not tuple or len(stump) != 4:
         raise ValueError(
@@ -13559,11 +13638,11 @@ def _encode_boosting_stump(stump, n_features):
         '{"feature":'
         + str(feature)
         + ',"threshold":'
-        + _quantize_state_number(threshold)
+        + _quantize_boosting_number(threshold, "stump threshold")
         + ',"left":'
-        + _quantize_state_number(left)
+        + _quantize_boosting_number(left, "stump left increment")
         + ',"right":'
-        + _quantize_state_number(right)
+        + _quantize_boosting_number(right, "stump right increment")
         + "}"
     )
 
