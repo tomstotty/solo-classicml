@@ -153,9 +153,9 @@ Exports:
         reciprocal rank of the first positive label among the k
         highest-scoring columns of a binary label matrix.
     dumps -- serialize a fitted KMeans/PCA/linear/scaler/tree/forest
-        model (including MultinomialLogisticRegression and
-        AgglomerativeClustering) to whitespace-free JSON text
-        (quantized to 10 decimal places with ROUND_HALF_UP).
+        model (including MultinomialLogisticRegression,
+        AgglomerativeClustering, and DBSCAN) to whitespace-free JSON
+        text (quantized to 10 decimal places with ROUND_HALF_UP).
     loads -- reconstruct an independent fitted model from text produced
         by dumps; anything outside that byte format raises ValueError.
 
@@ -14131,6 +14131,13 @@ _SERIAL_KEYS_AGGLOMERATIVE = (
     "distances",
 )
 
+_SERIAL_KEYS_DBSCAN = (
+    "class",
+    "eps",
+    "min_samples",
+    "labels",
+)
+
 
 def _quantize_fixed(value):
     """Quantize a finite non-boolean real to 10 decimal places (HALF_UP)
@@ -14404,8 +14411,10 @@ def _validate_agglomerative_state(model):
     that ``children_`` has exactly ``n - n_clusters`` integer pairs which
     replay as valid merges over leaves ``0`` ... ``n - 1`` (the r-th pair
     references two distinct surviving clusters and creates node
-    ``n + r``), that ``distances_`` has the same length with finite
-    non-negative exact int/float entries, and that ``labels_`` equals the
+    ``n + r``), that ``distances_`` has the same length with entries of
+    type exactly ``int`` or ``float`` (booleans and subclasses rejected):
+    non-negative ints of arbitrary size, never converted through float,
+    or finite non-negative floats, and that ``labels_`` equals the
     clusters numbered by ascending smallest member in input order.
     Returns ``(n_clusters, labels, children, distances)``.
     """
@@ -14474,48 +14483,85 @@ def _validate_agglomerative_state(model):
             "distances_ must have the same length as children_"
         )
     for value in distances:
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise ValueError(
-                "distances_ must contain only finite non-negative numbers"
-            )
-        try:
-            finite = math.isfinite(value)
-        except OverflowError:
-            finite = False
-        if not finite or value < 0:
-            raise ValueError(
-                "distances_ must contain only finite non-negative numbers"
-            )
+        # Exact types only -- bool and any int/float subclass are rejected
+        # (bool is a subclass of int). Arbitrarily large non-negative ints
+        # are accepted without ever passing through float.
+        if type(value) is int:
+            if value < 0:
+                raise ValueError(
+                    "distances_ must contain only finite non-negative numbers"
+                )
+            continue
+        if type(value) is float:
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(
+                    "distances_ must contain only finite non-negative numbers"
+                )
+            continue
+        raise ValueError(
+            "distances_ must contain only finite non-negative numbers"
+        )
     return n_clusters, labels, children, distances
+
+
+def _int_to_exact_str(value):
+    """Exact decimal spelling of a non-negative ``int`` of any size.
+
+    Chunked formatting bypasses CPython's 4300-digit ``str(int)`` safety
+    limit; the value is never converted through ``float``.
+    """
+    if value == 0:
+        return "0"
+    base = 1000000000
+    parts = []
+    while value:
+        parts.append(str(value % base))
+        value //= base
+    parts.reverse()
+    return parts[0] + "".join(part.zfill(9) for part in parts[1:])
+
+
+def _int_from_decimal_text(token):
+    """Parse a non-negative ASCII digit string into an ``int`` of any
+    size, chunked to bypass CPython's 4300-digit ``int(str)`` limit."""
+    value = 0
+    for start in range(0, len(token), 9):
+        chunk = token[start:start + 9]
+        value = value * (10 ** len(chunk)) + int(chunk)
+    return value
 
 
 def _quantize_agglomerative_distance(value):
     """Quantize one agglomerative merge distance to its canonical text.
 
-    The value must be a finite non-negative exact ``int`` or ``float``
-    (booleans rejected); quantization is
+    The value must have type exactly ``int`` or ``float`` (booleans and
+    any subclasses are rejected). A non-negative exact ``int`` may be
+    arbitrarily large and is never converted to ``float`` (its decimal
+    spelling is built chunkwise to bypass CPython's integer digit
+    limit); a ``float`` must be finite and non-negative. Quantization is
     ``Decimal(str(v)).quantize(1E-10, ROUND_HALF_UP)`` -- deliberately
     ``str(v)`` directly, so an exact integer keeps its exact decimal
     spelling rather than a float-rounded one. Negative zero normalizes to
     ``0.0000000000``.
     """
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if type(value) is int:
+        if value < 0:
+            raise ValueError(
+                "distances_ must contain only finite non-negative numbers"
+            )
+        token = _int_to_exact_str(value)
+    elif type(value) is float:
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(
+                "distances_ must contain only finite non-negative numbers"
+            )
+        token = str(value)
+    else:
         raise ValueError(
             "distances_ must contain only finite non-negative numbers"
         )
-    try:
-        finite = math.isfinite(value)
-    except OverflowError as exc:
-        raise ValueError(
-            "distances_ must contain only finite non-negative numbers"
-        ) from exc
-    if not finite or value < 0:
-        raise ValueError(
-            "distances_ must contain only finite non-negative numbers"
-        )
-    token = str(value)
     with localcontext() as ctx:
-        ctx.prec = max(400, len(token.lstrip("-")) + 20)
+        ctx.prec = max(400, len(token) + 20)
         decimal_value = Decimal(token).quantize(
             _QUANTUM, rounding=ROUND_HALF_UP
         )
@@ -14535,10 +14581,12 @@ def _dumps_agglomerative(model):
     non-empty JSON integer array; ``children`` has ``n - n_clusters``
     integer pairs replaying the merges with leaves ``0`` ... ``n - 1``
     (the r-th pair merges two distinct surviving clusters into node
-    ``n + r``); ``distances`` is an array of the same length whose finite
-    non-negative exact int/float entries are quantized to 10 decimal
-    places via ``Decimal(str(v))`` with ROUND_HALF_UP (negative zero
-    becomes ``0.0000000000``).
+    ``n + r``); ``distances`` is an array of the same length whose
+    entries have type exactly ``int`` or ``float`` (booleans and
+    subclasses rejected): non-negative ints of arbitrary size -- never
+    converted through float -- or finite non-negative floats, quantized
+    to 10 decimal places via ``Decimal(str(v))`` with ROUND_HALF_UP
+    (negative zero becomes ``0.0000000000``).
     """
     n_clusters, labels, children, distances = (
         _validate_agglomerative_state(model)
@@ -14574,6 +14622,134 @@ def _dumps_agglomerative(model):
     )
 
 
+def _validate_dbscan_state(model):
+    """Validate a fitted DBSCAN's construction parameters and state.
+
+    Confirms ``eps`` exactly as ``__init__`` does (a value of type
+    exactly ``int`` or ``float``, booleans rejected, finite, strictly
+    positive -- exact ints keep their exact decimal spelling), that
+    ``min_samples`` is a positive exact int, and that ``labels_`` is a
+    non-empty exact-int list containing only -1 and cluster labels
+    numbered consecutively from zero in first-appearance order. Returns
+    ``(eps, min_samples, labels)``.
+    """
+    eps = model.eps
+    min_samples = model.min_samples
+    labels = model.labels_
+    if type(eps) is int:
+        if eps <= 0:
+            raise ValueError(
+                "eps must be a finite non-boolean int or float greater than 0"
+            )
+    elif type(eps) is float:
+        if not math.isfinite(eps) or eps <= 0.0:
+            raise ValueError(
+                "eps must be a finite non-boolean int or float greater than 0"
+            )
+    else:
+        raise ValueError(
+            "eps must be a finite non-boolean int or float greater than 0"
+        )
+    if type(min_samples) is not int or min_samples <= 0:
+        raise ValueError("min_samples must be a positive integer")
+
+    if not isinstance(labels, list) or len(labels) == 0:
+        raise ValueError("labels_ must be a non-empty integer list")
+    next_label = 0
+    seen = set()
+    for value in labels:
+        if type(value) is not int:
+            raise ValueError("labels_ must contain only integers")
+        if value == -1:
+            continue
+        if value < 0:
+            raise ValueError(
+                "labels_ must contain only -1 or consecutive cluster labels"
+            )
+        if value not in seen:
+            if value != next_label:
+                raise ValueError(
+                    "non-negative labels must first appear in order "
+                    "0, 1, 2, ..."
+                )
+            seen.add(value)
+            next_label += 1
+    return eps, min_samples, labels
+
+
+def _quantize_dbscan_eps(value):
+    """Quantize a DBSCAN ``eps`` to its canonical fixed 10-decimal text.
+
+    The value has type exactly ``int`` or ``float`` (booleans and
+    subclasses rejected), is finite and strictly positive, and is
+    quantized via ``Decimal(str(v))`` with ROUND_HALF_UP. The quantized
+    text must stay strictly positive and convert back with ``float`` to
+    exactly the original value.
+    """
+    if type(value) is int:
+        if value <= 0:
+            raise ValueError(
+                "eps must be a finite non-boolean int or float greater than 0"
+            )
+        token = _int_to_exact_str(value)
+    elif type(value) is float:
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(
+                "eps must be a finite non-boolean int or float greater than 0"
+            )
+        token = str(value)
+    else:
+        raise ValueError(
+            "eps must be a finite non-boolean int or float greater than 0"
+        )
+    with localcontext() as ctx:
+        ctx.prec = max(400, len(token) + 20)
+        decimal_value = Decimal(token).quantize(
+            _QUANTUM, rounding=ROUND_HALF_UP
+        )
+    if decimal_value <= 0:
+        raise ValueError("eps must remain positive after quantization")
+    text = format(decimal_value, "f")
+    try:
+        roundtrip = float(text)
+    except OverflowError as exc:
+        raise ValueError(
+            "eps must survive 10-decimal quantization unchanged"
+        ) from exc
+    if roundtrip != value:
+        raise ValueError(
+            "eps must survive 10-decimal quantization unchanged"
+        )
+    return text
+
+
+def _dumps_dbscan(model):
+    """Serialize a fitted DBSCAN.
+
+    The top-level keys are ``class``, ``eps``, ``min_samples``,
+    ``labels`` in that order; ``class`` is ``"DBSCAN"``, ``eps`` is a
+    strictly positive finite exact int/float (booleans rejected)
+    quantized to 10 decimal places via ``Decimal(str(v))`` with
+    ROUND_HALF_UP -- the quantized text stays positive and converts back
+    with ``float`` to exactly the original value -- ``min_samples`` is a
+    positive JSON integer, and ``labels`` is a non-empty JSON integer
+    array containing only -1 and cluster labels numbered consecutively
+    from zero in first-appearance order.
+    """
+    eps, min_samples, labels = _validate_dbscan_state(model)
+    eps_text = _quantize_dbscan_eps(eps)
+    labels_text = "[" + ",".join(str(value) for value in labels) + "]"
+    return (
+        '{"class":"DBSCAN","eps":'
+        + eps_text
+        + ',"min_samples":'
+        + str(min_samples)
+        + ',"labels":'
+        + labels_text
+        + "}"
+    )
+
+
 def dumps(model):
     """Serialize a fitted KMeans, PCA, LinearRegression,
     LogisticRegression, MultinomialLogisticRegression, StandardScaler,
@@ -14581,8 +14757,8 @@ def dumps(model):
     RandomForestClassifier, RandomForestRegressor, AdaBoostClassifier,
     GradientBoostingRegressor, GradientBoostingClassifier,
     GaussianMixture, KNeighborsRegressor,
-    KNeighborsClassifier, or AgglomerativeClustering model to compact
-    JSON text.
+    KNeighborsClassifier, AgglomerativeClustering, or DBSCAN model to
+    compact JSON text.
 
     The result contains no whitespace and no trailing newline. Integers
     (``n_clusters``, ``max_iter``, ``seed``, ``n_features_in``) are emitted
@@ -14725,9 +14901,22 @@ def dumps(model):
     ascending member tuple and creates merge node ``n + r``. ``labels``
     must equal the clusters numbered from zero by ascending smallest
     member in input order. ``distances`` has the same length as
-    ``children``; each entry is a finite non-negative exact int/float
-    quantized to 10 decimal places via ``Decimal(str(v))`` with
-    ROUND_HALF_UP (negative zero becomes ``0.0000000000``).
+    ``children``; each entry has type exactly ``int`` or ``float``
+    (booleans and subclasses rejected) -- a non-negative int of
+    arbitrary size, never converted through float, or a finite
+    non-negative float -- quantized to 10 decimal places via
+    ``Decimal(str(v))`` with ROUND_HALF_UP (negative zero becomes
+    ``0.0000000000``).
+
+    For DBSCAN the top-level keys are ``class``, ``eps``,
+    ``min_samples``, ``labels`` in that order; ``class`` is
+    ``"DBSCAN"``, ``eps`` is a strictly positive finite exact int/float
+    (booleans rejected) quantized to 10 decimal places via
+    ``Decimal(str(v))`` with ROUND_HALF_UP, staying positive and
+    converting back with ``float`` to exactly the original value,
+    ``min_samples`` is a positive JSON integer, and ``labels`` is a
+    non-empty JSON integer array containing only -1 and cluster labels
+    numbered consecutively from zero in first-appearance order.
     """
     if isinstance(model, KMeans):
         try:
@@ -14869,6 +15058,14 @@ def dumps(model):
                 "invalid AgglomerativeClustering state"
             ) from exc
 
+    if isinstance(model, DBSCAN):
+        try:
+            return _dumps_dbscan(model)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("invalid DBSCAN state") from exc
+
     raise ValueError(
         "dumps only supports fitted KMeans, PCA, LinearRegression, "
         "LogisticRegression, MultinomialLogisticRegression, "
@@ -14877,7 +15074,7 @@ def dumps(model):
         "AdaBoostClassifier, GradientBoostingRegressor, "
         "GradientBoostingClassifier, "
         "GaussianMixture, KNeighborsRegressor, "
-        "KNeighborsClassifier, and AgglomerativeClustering models"
+        "KNeighborsClassifier, AgglomerativeClustering, and DBSCAN models"
     )
 
 
@@ -16077,6 +16274,39 @@ def _expect_fixed_vector(node, length, name):
     return [_expect_fixed(item, name + " element") for item in node]
 
 
+def _expect_agglomerative_distance(entry):
+    """Parse one AgglomerativeClustering ``distances`` element.
+
+    Accepts a non-negative fixed 10-decimal number. Values whose
+    conversion to ``float`` is non-finite are kept as an exact ``int``
+    only when their fraction is all zero (a huge integer distance, which
+    dumps never converts through float); finite values and fractional
+    values are returned as ``float``. Negative tokens are rejected.
+    """
+    if not (
+        isinstance(entry, tuple)
+        and entry[0] == "fixed"
+        and _JSON_FLOAT_RE.match(entry[1])
+    ):
+        raise ValueError(
+            "distances element must be a fixed 10-decimal JSON number"
+        )
+    token = entry[1]
+    if token[0] == "-":
+        raise ValueError("distances must be non-negative")
+    value = float(token)
+    if math.isfinite(value):
+        return value
+    integer_part, fraction = token.split(".")
+    if set(fraction) == {"0"}:
+        # Chunked parsing keeps the value exact even beyond CPython's
+        # 4300-digit integer string-conversion limit.
+        return _int_from_decimal_text(integer_part)
+    raise ValueError(
+        "out-of-range distances must have an all-zero fraction"
+    )
+
+
 def _expect_fixed12(entry, name):
     if not (
         isinstance(entry, tuple)
@@ -16888,10 +17118,7 @@ def _load_agglomerative(pairs):
         raise ValueError("distances must have the same length as children")
     distances = []
     for value in distances_node:
-        distance = _expect_fixed(value, "distances element")
-        if distance < 0.0:
-            raise ValueError("distances must be non-negative")
-        distances.append(distance)
+        distances.append(_expect_agglomerative_distance(value))
 
     model = AgglomerativeClustering(
         n_clusters=n_clusters, linkage=linkage
@@ -16904,14 +17131,74 @@ def _load_agglomerative(pairs):
     return model
 
 
+def _load_dbscan(pairs):
+    keys = tuple(key for key, _ in pairs)
+    if keys != _SERIAL_KEYS_DBSCAN:
+        raise ValueError(
+            "DBSCAN JSON must have exactly the serialized keys in the "
+            "serialized order"
+        )
+    data = _convert(pairs)
+
+    class_name = data["class"]
+    if not isinstance(class_name, str) or class_name != "DBSCAN":
+        raise ValueError('class must be "DBSCAN"')
+
+    eps_entry = data["eps"]
+    if not (
+        isinstance(eps_entry, tuple)
+        and eps_entry[0] == "fixed"
+        and _JSON_FLOAT_RE.match(eps_entry[1])
+    ):
+        raise ValueError("eps must be a fixed 10-decimal JSON number")
+    eps_token = eps_entry[1]
+    if eps_token[0] == "-":
+        raise ValueError("eps must be greater than 0")
+    eps = float(eps_token)
+    if not math.isfinite(eps) or eps <= 0.0:
+        raise ValueError("eps must be a finite number greater than 0")
+
+    min_samples = _expect_int(data["min_samples"], "min_samples")
+    if min_samples <= 0:
+        raise ValueError("min_samples must be a positive integer")
+
+    labels_node = data["labels"]
+    if not isinstance(labels_node, list) or len(labels_node) == 0:
+        raise ValueError("labels must be a non-empty array")
+    labels = [_expect_int(value, "labels element") for value in labels_node]
+    next_label = 0
+    seen = set()
+    for value in labels:
+        if value == -1:
+            continue
+        if value < 0:
+            raise ValueError(
+                "labels must contain only -1 or consecutive cluster labels"
+            )
+        if value not in seen:
+            if value != next_label:
+                raise ValueError(
+                    "non-negative labels must first appear in order "
+                    "0, 1, 2, ..."
+                )
+            seen.add(value)
+            next_label += 1
+
+    model = DBSCAN(eps=eps, min_samples=min_samples)
+    # A fresh list so the fitted state never shares storage with the
+    # parsed payload.
+    model.labels_ = list(labels)
+    return model
+
+
 def loads(text):
     """Reconstruct a fitted KMeans, PCA, LinearRegression,
     LogisticRegression, MultinomialLogisticRegression, StandardScaler,
     DecisionTreeClassifier, DecisionTreeRegressor,
     RandomForestClassifier, RandomForestRegressor, AdaBoostClassifier,
     GradientBoostingRegressor, GradientBoostingClassifier,
-    GaussianMixture, KNeighborsRegressor, KNeighborsClassifier, or
-    AgglomerativeClustering from text produced by dumps.
+    GaussianMixture, KNeighborsRegressor, KNeighborsClassifier,
+    AgglomerativeClustering, or DBSCAN from text produced by dumps.
 
     Only the exact byte format emitted by :func:`dumps` is accepted: a
     ``str`` holding compact JSON with no whitespace, no duplicate keys,
@@ -16939,7 +17226,13 @@ def loads(text):
     ``labels`` with its ``labels``, ``children`` (inner pairs included),
     and ``distances`` lists copied rather than shared; the children
     merges are replayed and ``labels`` must number the resulting
-    clusters by ascending smallest member.
+    clusters by ascending smallest member. Distances that are finite as
+    ``float`` come back as ``float``; a distance whose magnitude is
+    outside the finite float range comes back as an exact ``int`` only
+    when its fraction is all zero. DBSCAN is reconstructed from
+    ``eps`` (a fixed 10-decimal number), ``min_samples`` (a positive
+    JSON integer), and a fresh copy of ``labels`` containing only -1
+    and labels consecutive from zero in first-appearance order.
     The argument is not modified.
     """
     if type(text) is not str or len(text) == 0:
@@ -17080,6 +17373,13 @@ def loads(text):
     if class_entry == "AgglomerativeClustering":
         try:
             return _load_agglomerative(pairs)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("malformed serialized model") from exc
+    if class_entry == "DBSCAN":
+        try:
+            return _load_dbscan(pairs)
         except ValueError:
             raise
         except Exception as exc:
