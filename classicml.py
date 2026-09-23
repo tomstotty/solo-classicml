@@ -152,8 +152,9 @@ Exports:
     mean_reciprocal_rank_score -- weighted mean, over samples, of the
         reciprocal rank of the first positive label among the k
         highest-scoring columns of a binary label matrix.
-    dumps -- serialize a fitted KMeans/PCA/linear/scaler/tree/forest model
-        to whitespace-free JSON text (quantized to 10 decimal places with
+    dumps -- serialize a fitted KMeans/PCA/linear/scaler/tree/forest
+        model (including MultinomialLogisticRegression) to
+        whitespace-free JSON text (quantized to 10 decimal places with
         ROUND_HALF_UP).
     loads -- reconstruct an independent fitted model from text produced
         by dumps; anything outside that byte format raises ValueError.
@@ -13661,6 +13662,16 @@ _SERIAL_KEYS_KMEANS = (
 )
 _SERIAL_KEYS_PCA = ("class", "mean", "components")
 _SERIAL_KEYS_LINEAR = ("class", "lr", "l2", "max_iter", "tol", "w", "b")
+_SERIAL_KEYS_MULTINOMIAL = (
+    "class",
+    "lr",
+    "l2",
+    "max_iter",
+    "tol",
+    "classes",
+    "W",
+    "b",
+)
 _SERIAL_KEYS_SCALER = ("class", "n_features_in", "mean", "scale")
 _SERIAL_KEYS_TREE = ("class", "max_depth", "n_features_in", "tree")
 _SERIAL_KEYS_TREE_NODE = ("label", "feature", "threshold", "left", "right")
@@ -13864,9 +13875,10 @@ def _dumps_knn_regressor(model):
 
 def dumps(model):
     """Serialize a fitted KMeans, PCA, LinearRegression,
-    LogisticRegression, StandardScaler, DecisionTreeClassifier,
-    RandomForestClassifier, AdaBoostClassifier, GradientBoostingRegressor,
-    GaussianMixture, or KNeighborsRegressor model to compact JSON text.
+    LogisticRegression, MultinomialLogisticRegression, StandardScaler,
+    DecisionTreeClassifier, RandomForestClassifier, AdaBoostClassifier,
+    GradientBoostingRegressor, GaussianMixture, or KNeighborsRegressor
+    model to compact JSON text.
 
     The result contains no whitespace and no trailing newline. Integers
     (``n_clusters``, ``max_iter``, ``seed``, ``n_features_in``) are emitted
@@ -13936,6 +13948,19 @@ def dumps(model):
     ROUND_HALF_UP via ``Decimal(str(v))`` (negative zero becomes
     ``0.0000000000``), and the quantized text must convert back with
     ``float`` to exactly the original value or dumps raises ValueError.
+
+    For MultinomialLogisticRegression the top-level keys are ``class``,
+    ``lr``, ``l2``, ``max_iter``, ``tol``, ``classes``, ``W``, ``b`` in
+    that order; ``class`` is ``"MultinomialLogisticRegression"``.
+    ``lr`` and ``tol`` are strictly positive and ``l2`` non-negative
+    finite values (all quantized to 10 decimal places, with ``lr`` and
+    ``tol`` remaining positive after quantization), and ``max_iter`` is a
+    positive JSON integer. ``classes`` is an ascending list of at least
+    two distinct JSON integers; ``W`` is a non-empty rectangular 2-D
+    array with one row per class (its column count is the feature count)
+    and ``b`` is an array of the same length. Every coordinate of ``W``
+    and ``b`` is quantized to 10 decimal places with ROUND_HALF_UP
+    (negative zero becomes ``0.0000000000``).
     """
     if isinstance(model, KMeans):
         try:
@@ -13960,6 +13985,16 @@ def dumps(model):
             raise
         except Exception as exc:
             raise ValueError("invalid linear model state") from exc
+
+    if isinstance(model, MultinomialLogisticRegression):
+        try:
+            return _dumps_multinomial(model)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError(
+                "invalid MultinomialLogisticRegression state"
+            ) from exc
 
     if isinstance(model, StandardScaler):
         try:
@@ -14023,7 +14058,8 @@ def dumps(model):
 
     raise ValueError(
         "dumps only supports fitted KMeans, PCA, LinearRegression, "
-        "LogisticRegression, StandardScaler, DecisionTreeClassifier, "
+        "LogisticRegression, MultinomialLogisticRegression, "
+        "StandardScaler, DecisionTreeClassifier, "
         "RandomForestClassifier, AdaBoostClassifier, "
         "GradientBoostingRegressor, GaussianMixture, and "
         "KNeighborsRegressor models"
@@ -14160,6 +14196,113 @@ def _dumps_linear(model):
         + ',"tol":'
         + tol_text
         + ',"w":'
+        + w_text
+        + ',"b":'
+        + b_text
+        + "}"
+    )
+
+
+def _dumps_multinomial(model):
+    """Serialize a fitted MultinomialLogisticRegression.
+
+    The top-level keys are ``class``, ``lr``, ``l2``, ``max_iter``,
+    ``tol``, ``classes``, ``W``, ``b`` in that order; ``class`` is
+    ``"MultinomialLogisticRegression"``. The construction parameters are
+    re-validated exactly as ``__init__`` does (strictly positive finite
+    ``lr``/``tol``, non-negative finite ``l2``, positive exact-int
+    ``max_iter``). ``classes`` is an ascending list of at least two
+    distinct JSON integers; ``W`` is a non-empty rectangular matrix with
+    one row per class and at least one feature column, and ``b`` a vector
+    of the same length. Every coordinate is a finite non-boolean number
+    quantized via ``_quantize_fixed`` -- ``Decimal(str(float(v)))`` with
+    ROUND_HALF_UP to 10 decimal places (negative zero becomes
+    ``0.0000000000``).
+    """
+    classes = model.classes
+    W = model.W
+    b = model.b
+    if classes is None or W is None or b is None:
+        raise ValueError(
+            "MultinomialLogisticRegression must be fitted before dumps "
+            "is called"
+        )
+    lr = model.lr
+    l2 = model.l2
+    max_iter = model.max_iter
+    tol = model.tol
+    # Re-validate the construction parameters exactly as __init__ does.
+    if (
+        not _is_finite_number(lr)
+        or lr <= 0
+        or not _is_finite_number(l2)
+        or l2 < 0
+        or isinstance(max_iter, bool)
+        or type(max_iter) is not int
+        or max_iter < 1
+        or not _is_finite_number(tol)
+        or tol <= 0
+    ):
+        raise ValueError("model has invalid construction parameters")
+    lr_text = _quantize_fixed(lr)
+    if Decimal(lr_text) == 0:
+        raise ValueError(
+            "lr must remain positive after quantization to 10 decimals"
+        )
+    l2_text = _quantize_fixed(l2)
+    tol_text = _quantize_fixed(tol)
+    if Decimal(tol_text) == 0:
+        raise ValueError(
+            "tol must remain positive after quantization to 10 decimals"
+        )
+
+    if not isinstance(classes, list) or len(classes) < 2:
+        raise ValueError(
+            "classes must be a list of at least two distinct integers"
+        )
+    previous = None
+    for label in classes:
+        if type(label) is not int:
+            raise ValueError("classes must contain only integers")
+        if previous is not None and label <= previous:
+            raise ValueError("classes must be strictly ascending and unique")
+        previous = label
+
+    if not isinstance(W, list) or len(W) == 0:
+        raise ValueError("W must be a non-empty list of rows")
+    if len(W) != len(classes):
+        raise ValueError("W must have one row per class")
+    width = None
+    encoded_rows = []
+    for row in W:
+        if not isinstance(row, list) or len(row) == 0:
+            raise ValueError("W rows must be non-empty lists")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError("W must be rectangular")
+        encoded_rows.append(
+            "[" + ",".join(_quantize_fixed(v) for v in row) + "]"
+        )
+    if not isinstance(b, list) or len(b) != len(classes):
+        raise ValueError("b must be a list with one entry per class")
+    b_encoded = [_quantize_fixed(v) for v in b]
+
+    classes_text = "[" + ",".join(str(label) for label in classes) + "]"
+    w_text = "[" + ",".join(encoded_rows) + "]"
+    b_text = "[" + ",".join(b_encoded) + "]"
+    return (
+        '{"class":"MultinomialLogisticRegression","lr":'
+        + lr_text
+        + ',"l2":'
+        + l2_text
+        + ',"max_iter":'
+        + str(max_iter)
+        + ',"tol":'
+        + tol_text
+        + ',"classes":'
+        + classes_text
+        + ',"W":'
         + w_text
         + ',"b":'
         + b_text
@@ -15059,6 +15202,75 @@ def _load_linear(pairs, model_class, class_name):
     return model
 
 
+def _load_multinomial(pairs):
+    keys = tuple(key for key, _ in pairs)
+    if keys != _SERIAL_KEYS_MULTINOMIAL:
+        raise ValueError(
+            "MultinomialLogisticRegression JSON must have exactly the "
+            "serialized keys in the serialized order"
+        )
+    data = _convert(pairs)
+
+    class_name = data["class"]
+    if not isinstance(class_name, str):
+        raise ValueError('class must be "MultinomialLogisticRegression"')
+    if class_name != "MultinomialLogisticRegression":
+        raise ValueError('class must be "MultinomialLogisticRegression"')
+
+    lr = _expect_fixed(data["lr"], "lr")
+    if lr <= 0.0:
+        raise ValueError("lr must be greater than 0")
+    l2 = _expect_fixed(data["l2"], "l2")
+    if l2 < 0.0:
+        raise ValueError("l2 must be non-negative")
+    max_iter = _expect_int(data["max_iter"], "max_iter")
+    if max_iter < 1:
+        raise ValueError("max_iter must be at least 1")
+    tol = _expect_fixed(data["tol"], "tol")
+    if tol <= 0.0:
+        raise ValueError("tol must be greater than 0")
+
+    classes_node = data["classes"]
+    if not isinstance(classes_node, list) or len(classes_node) < 2:
+        raise ValueError(
+            "classes must be an array of at least two JSON integers"
+        )
+    classes = []
+    previous = None
+    for entry in classes_node:
+        label = _expect_int(entry, "classes element")
+        if previous is not None and label <= previous:
+            raise ValueError(
+                "classes must be strictly ascending and unique"
+            )
+        classes.append(label)
+        previous = label
+
+    w_node = data["W"]
+    if not isinstance(w_node, list) or len(w_node) != len(classes):
+        raise ValueError("W must have one row per class")
+    W = []
+    width = None
+    for row in w_node:
+        if not isinstance(row, list) or len(row) == 0:
+            raise ValueError("W rows must be non-empty arrays")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError("W must be rectangular")
+        W.append([_expect_fixed(v, "W coordinate") for v in row])
+
+    b = _expect_fixed_vector(data["b"], len(classes), "b")
+
+    model = MultinomialLogisticRegression(
+        lr=lr, l2=l2, max_iter=max_iter, tol=tol
+    )
+    model.classes = list(classes)
+    model.W = [list(row) for row in W]
+    model.b = list(b)
+    return model
+
+
 def _load_scaler(pairs):
     keys = tuple(key for key, _ in pairs)
     if keys != _SERIAL_KEYS_SCALER:
@@ -15424,8 +15636,8 @@ def _load_knn_regressor(pairs):
 
 def loads(text):
     """Reconstruct a fitted KMeans, PCA, LinearRegression,
-    LogisticRegression, StandardScaler, DecisionTreeClassifier,
-    RandomForestClassifier, AdaBoostClassifier,
+    LogisticRegression, MultinomialLogisticRegression, StandardScaler,
+    DecisionTreeClassifier, RandomForestClassifier, AdaBoostClassifier,
     GradientBoostingRegressor, GaussianMixture, or
     KNeighborsRegressor from text produced by dumps.
 
@@ -15439,7 +15651,9 @@ def loads(text):
     illegal parameters -- raises ValueError. The returned model is
     independent of the input and fitted; KMeans recovers its column
     count from centroid width, the linear models from the length of
-    ``w``, StandardScaler/DecisionTreeClassifier/RandomForestClassifier
+    ``w``, MultinomialLogisticRegression from the column count of ``W``
+    (with its ``classes``/``W``/``b`` arrays copied rather than shared),
+    StandardScaler/DecisionTreeClassifier/RandomForestClassifier
     from ``n_features_in``, AdaBoostClassifier from ``n_features_in``,
     GradientBoostingRegressor from ``n_features_in``,
     GaussianMixture from ``n_components``, and KNeighborsRegressor
@@ -15494,6 +15708,13 @@ def loads(text):
     if class_entry == "LogisticRegression":
         try:
             return _load_linear(pairs, LogisticRegression, "LogisticRegression")
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("malformed serialized model") from exc
+    if class_entry == "MultinomialLogisticRegression":
+        try:
+            return _load_multinomial(pairs)
         except ValueError:
             raise
         except Exception as exc:
