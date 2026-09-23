@@ -14064,6 +14064,22 @@ _SERIAL_KEYS_FOREST = (
     "n_features_in",
     "trees",
 )
+_SERIAL_KEYS_FOREST_REGRESSOR = (
+    "class",
+    "n_estimators",
+    "max_depth",
+    "max_features",
+    "seed",
+    "n_features_in",
+    "trees",
+)
+_SERIAL_KEYS_FOREST_REGRESSOR_NODE = (
+    "value",
+    "feature",
+    "threshold",
+    "left",
+    "right",
+)
 _SERIAL_KEYS_ADABOOST = (
     "class",
     "n_estimators",
@@ -14250,7 +14266,8 @@ def _dumps_knn_regressor(model):
 def dumps(model):
     """Serialize a fitted KMeans, PCA, LinearRegression,
     LogisticRegression, MultinomialLogisticRegression, StandardScaler,
-    DecisionTreeClassifier, RandomForestClassifier, AdaBoostClassifier,
+    DecisionTreeClassifier, RandomForestClassifier,
+    RandomForestRegressor, AdaBoostClassifier,
     GradientBoostingRegressor, GaussianMixture, or KNeighborsRegressor
     model to compact JSON text.
 
@@ -14273,6 +14290,23 @@ def dumps(model):
     ``n_estimators``, ``max_features``, ``seed``, ``n_features_in``,
     ``trees`` in that order, with exactly ``n_estimators`` trees whose
     nodes use the same node encoding as DecisionTreeClassifier.
+
+    For RandomForestRegressor the top-level keys are ``class``,
+    ``n_estimators``, ``max_depth``, ``max_features``, ``seed``,
+    ``n_features_in``, ``trees`` in that order; ``class`` is
+    ``"RandomForestRegressor"``, ``seed`` is a JSON integer,
+    ``max_depth`` is a positive JSON integer or ``"none"``, and the
+    remaining numeric fields are positive JSON integers with
+    ``max_features <= n_features_in`` and exactly ``n_estimators`` trees.
+    Each tree node carries the keys ``value``, ``feature``,
+    ``threshold``, ``left``, ``right`` in that order; leaves are encoded
+    as ``feature`` -1, ``threshold`` 0.0000000000 and empty
+    ``left``/``right`` arrays, and internal nodes carry a feature in
+    ``[0, n_features_in)`` and node children. Every node ``value`` and
+    internal ``threshold`` is a finite exact int/float quantized to 10
+    decimal places via ``Decimal(str(v))`` with ROUND_HALF_UP (negative
+    zero becomes ``0.0000000000``); the quantized text must convert back
+    with ``float`` to exactly the original value.
 
     For AdaBoostClassifier the top-level keys are ``class``,
     ``n_estimators``, ``n_features_in``, ``stumps`` in that order;
@@ -14394,6 +14428,14 @@ def dumps(model):
         except Exception as exc:
             raise ValueError("invalid RandomForestClassifier state") from exc
 
+    if isinstance(model, RandomForestRegressor):
+        try:
+            return _dumps_forest_regressor(model)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("invalid RandomForestRegressor state") from exc
+
     if isinstance(model, AdaBoostClassifier):
         try:
             return _dumps_adaboost(model)
@@ -14434,9 +14476,9 @@ def dumps(model):
         "dumps only supports fitted KMeans, PCA, LinearRegression, "
         "LogisticRegression, MultinomialLogisticRegression, "
         "StandardScaler, DecisionTreeClassifier, "
-        "RandomForestClassifier, AdaBoostClassifier, "
-        "GradientBoostingRegressor, GaussianMixture, and "
-        "KNeighborsRegressor models"
+        "RandomForestClassifier, RandomForestRegressor, "
+        "AdaBoostClassifier, GradientBoostingRegressor, "
+        "GaussianMixture, and KNeighborsRegressor models"
     )
 
 
@@ -14928,6 +14970,151 @@ def _dumps_forest(model):
         + trees_text
         + "}"
     )
+
+
+def _dumps_forest_regressor(model):
+    """Serialize a fitted RandomForestRegressor.
+
+    The top-level keys are class, n_estimators, max_depth, max_features,
+    seed, n_features_in, trees in that order; class is
+    ``"RandomForestRegressor"``, seed is a JSON integer, max_depth is a
+    positive JSON integer or the string ``"none"``, and the remaining
+    numeric fields (n_estimators, max_features, n_features_in) are
+    positive JSON integers with ``max_features <= n_features_in``. The
+    ``trees`` array holds exactly n_estimators node trees encoded by
+    ``_encode_forest_regressor_node``. The construction parameters are
+    re-validated exactly as ``__init__`` performs the checks, and the
+    fitted state must match them in shape.
+    """
+    trees = model._trees
+    n_features = model._n_features
+    if trees is None or n_features is None:
+        raise ValueError(
+            "RandomForestRegressor must be fitted before dumps is called"
+        )
+    n_estimators = model.n_estimators
+    max_depth = model.max_depth
+    max_features = model.max_features
+    seed = model.seed
+    if (
+        type(n_estimators) is not int
+        or n_estimators <= 0
+        or type(max_features) is not int
+        or max_features <= 0
+        or type(seed) is not int
+    ):
+        raise ValueError(
+            "RandomForestRegressor has invalid construction parameters"
+        )
+    if max_depth is not None and (
+        type(max_depth) is not int or max_depth < 1
+    ):
+        raise ValueError("max_depth must be None or a positive integer")
+    if type(n_features) is not int or n_features <= 0:
+        raise ValueError("n_features_in must be a positive integer")
+    if max_features > n_features:
+        raise ValueError(
+            "max_features must not exceed n_features_in"
+        )
+    if not isinstance(trees, list) or len(trees) != n_estimators:
+        raise ValueError("trees must have length n_estimators")
+    if max_depth is None:
+        max_depth_text = '"none"'
+    else:
+        max_depth_text = str(max_depth)
+    trees_text = "[" + ",".join(
+        _encode_forest_regressor_node(tree, n_features) for tree in trees
+    ) + "]"
+    return (
+        '{"class":"RandomForestRegressor","n_estimators":'
+        + str(n_estimators)
+        + ',"max_depth":'
+        + max_depth_text
+        + ',"max_features":'
+        + str(max_features)
+        + ',"seed":'
+        + str(seed)
+        + ',"n_features_in":'
+        + str(n_features)
+        + ',"trees":'
+        + trees_text
+        + "}"
+    )
+
+
+def _encode_forest_regressor_node(node, n_features):
+    """Encode one regressor tree node with the keys value, feature,
+    threshold, left, right in that order.
+
+    Leaves (``feature is None``) are emitted as ``"feature":-1``,
+    ``"threshold":0.0000000000``, ``"left":[]``, ``"right":[]`` and must
+    carry no threshold or children. Internal nodes need an exact integer
+    feature in ``[0, n_features)``, an exact finite int/float threshold,
+    and node children. Every node ``value`` and every internal
+    ``threshold`` is quantized to 10 decimals via
+    ``Decimal(str(v))`` with ROUND_HALF_UP (negative zero becomes
+    ``0.0000000000``); the quantized text must convert back with
+    ``float`` to exactly the original value so a reloaded forest predicts
+    each value identically.
+    """
+    if not isinstance(node, _DecisionTreeRegressorNode):
+        raise ValueError(
+            "tree nodes must be _DecisionTreeRegressorNode instances"
+        )
+    value = node.value
+    _require_scaler_number(value, "node value")
+    value_text = _quantize_forest_regressor_number(value, "node value")
+    feature = node.feature
+    if feature is None:
+        if (
+            node.threshold is not None
+            or node.left is not None
+            or node.right is not None
+        ):
+            raise ValueError(
+                "leaf nodes must have no threshold or children"
+            )
+        return (
+            '{"value":'
+            + value_text
+            + ',"feature":-1,"threshold":0.0000000000,"left":[],"right":[]}'
+        )
+    if type(feature) is not int or not 0 <= feature < n_features:
+        raise ValueError("internal node feature must be in [0, n_features_in)")
+    _require_scaler_number(node.threshold, "threshold")
+    threshold_text = _quantize_forest_regressor_number(
+        node.threshold, "threshold"
+    )
+    left_text = _encode_forest_regressor_node(node.left, n_features)
+    right_text = _encode_forest_regressor_node(node.right, n_features)
+    return (
+        '{"value":'
+        + value_text
+        + ',"feature":'
+        + str(feature)
+        + ',"threshold":'
+        + threshold_text
+        + ',"left":'
+        + left_text
+        + ',"right":'
+        + right_text
+        + "}"
+    )
+
+
+def _quantize_forest_regressor_number(value, name):
+    """Quantize an exact finite int/float regressor node coordinate to
+    10 fixed decimals via ``Decimal(str(v))`` with ROUND_HALF_UP (negative
+    zero becomes ``0.0000000000``). The quantized text must convert back
+    with ``float`` to exactly the original value, otherwise ValueError is
+    raised because a loaded forest would not predict that value
+    identically."""
+    token = _quantize_state_number(value)
+    if float(token) != value:
+        raise ValueError(
+            "%s must equal its 10-decimal quantization" % name
+        )
+    return token
 
 
 def _dumps_adaboost(model):
@@ -15784,6 +15971,98 @@ def _load_forest(pairs):
     return model
 
 
+def _load_forest_regressor(pairs):
+    keys = tuple(key for key, _ in pairs)
+    if keys != _SERIAL_KEYS_FOREST_REGRESSOR:
+        raise ValueError(
+            "RandomForestRegressor JSON must have exactly the serialized "
+            "keys in the serialized order"
+        )
+    data = _convert(pairs)
+
+    class_name = data["class"]
+    if not isinstance(class_name, str) or class_name != "RandomForestRegressor":
+        raise ValueError('class must be "RandomForestRegressor"')
+
+    n_estimators = _expect_int(data["n_estimators"], "n_estimators")
+    if n_estimators <= 0:
+        raise ValueError("n_estimators must be greater than 0")
+
+    max_depth_entry = data["max_depth"]
+    if isinstance(max_depth_entry, str):
+        if max_depth_entry != "none":
+            raise ValueError('max_depth must be a positive integer or "none"')
+        max_depth = None
+    else:
+        max_depth = _expect_int(max_depth_entry, "max_depth")
+        if max_depth < 1:
+            raise ValueError("max_depth must be a positive integer")
+
+    max_features = _expect_int(data["max_features"], "max_features")
+    seed = _expect_int(data["seed"], "seed")
+    n_features = _expect_int(data["n_features_in"], "n_features_in")
+    if n_features <= 0:
+        raise ValueError("n_features_in must be greater than 0")
+    if max_features < 1 or max_features > n_features:
+        raise ValueError(
+            "max_features must satisfy 1 <= max_features <= n_features_in"
+        )
+
+    trees_node = data["trees"]
+    if not isinstance(trees_node, list) or len(trees_node) != n_estimators:
+        raise ValueError("trees must have length n_estimators")
+    trees = [
+        _load_forest_regressor_node(tree, n_features) for tree in trees_node
+    ]
+
+    model = RandomForestRegressor(
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        max_features=max_features,
+        seed=seed,
+    )
+    model._trees = trees
+    model._n_features = n_features
+    return model
+
+
+def _load_forest_regressor_node(node, n_features):
+    """Rebuild one regressor tree node from its converted JSON object.
+
+    The node must have exactly the keys value, feature, threshold, left,
+    right in that order. A leaf has ``feature`` -1, ``threshold``
+    0.0000000000 and empty ``left``/``right`` arrays; an internal node
+    has a feature in ``[0, n_features)`` and node children. Node values
+    and internal thresholds are finite fixed 10-decimal numbers.
+    """
+    if (
+        not isinstance(node, dict)
+        or tuple(node.keys()) != _SERIAL_KEYS_FOREST_REGRESSOR_NODE
+    ):
+        raise ValueError(
+            "tree nodes must have exactly the keys "
+            "value, feature, threshold, left, right in that order"
+        )
+    value = _expect_fixed(node["value"], "node value")
+    feature = _expect_int(node["feature"], "node feature")
+    if feature == -1:
+        threshold = _expect_fixed(node["threshold"], "leaf threshold")
+        if threshold != 0.0:
+            raise ValueError("leaf threshold must be 0.0000000000")
+        if node["left"] != [] or node["right"] != []:
+            raise ValueError("leaf children must be empty arrays")
+        return _DecisionTreeRegressorNode(value)
+    if feature < 0 or feature >= n_features:
+        raise ValueError("node feature must be in [0, n_features_in)")
+    threshold = _expect_fixed(node["threshold"], "node threshold")
+    result = _DecisionTreeRegressorNode(value)
+    result.feature = feature
+    result.threshold = threshold
+    result.left = _load_forest_regressor_node(node["left"], n_features)
+    result.right = _load_forest_regressor_node(node["right"], n_features)
+    return result
+
+
 def _load_adaboost(pairs):
     keys = tuple(key for key, _ in pairs)
     if keys != _SERIAL_KEYS_ADABOOST:
@@ -16011,9 +16290,9 @@ def _load_knn_regressor(pairs):
 def loads(text):
     """Reconstruct a fitted KMeans, PCA, LinearRegression,
     LogisticRegression, MultinomialLogisticRegression, StandardScaler,
-    DecisionTreeClassifier, RandomForestClassifier, AdaBoostClassifier,
-    GradientBoostingRegressor, GaussianMixture, or
-    KNeighborsRegressor from text produced by dumps.
+    DecisionTreeClassifier, RandomForestClassifier,
+    RandomForestRegressor, AdaBoostClassifier, GradientBoostingRegressor,
+    GaussianMixture, or KNeighborsRegressor from text produced by dumps.
 
     Only the exact byte format emitted by :func:`dumps` is accepted: a
     ``str`` holding compact JSON with no whitespace, no duplicate keys,
@@ -16027,8 +16306,9 @@ def loads(text):
     count from centroid width, the linear models from the length of
     ``w``, MultinomialLogisticRegression from the column count of ``W``
     (with its ``classes``/``W``/``b`` arrays copied rather than shared),
-    StandardScaler/DecisionTreeClassifier/RandomForestClassifier
-    from ``n_features_in``, AdaBoostClassifier from ``n_features_in``,
+    StandardScaler/DecisionTreeClassifier/RandomForestClassifier/
+    RandomForestRegressor from ``n_features_in``, AdaBoostClassifier from
+    ``n_features_in``,
     GradientBoostingRegressor from ``n_features_in``,
     GaussianMixture from ``n_components``, and KNeighborsRegressor
     from ``n_features_in`` with its stored ``X``/``y`` arrays copied
@@ -16110,6 +16390,13 @@ def loads(text):
     if class_entry == "RandomForestClassifier":
         try:
             return _load_forest(pairs)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("malformed serialized model") from exc
+    if class_entry == "RandomForestRegressor":
+        try:
+            return _load_forest_regressor(pairs)
         except ValueError:
             raise
         except Exception as exc:
