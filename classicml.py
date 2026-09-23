@@ -2269,6 +2269,117 @@ class GradientBoostingClassifier:
             results.append(1 if score >= 0 else 0)
         return results
 
+    def decision_function(self, X) -> list[float]:
+        """Return the score of each row of X in input order.
+
+        X must satisfy the same validation as in predict: a non-empty
+        rectangular matrix of finite non-boolean numbers with the same
+        number of columns as the training data, and the model must be
+        fitted. Each score starts at ``_constant`` and accumulates, in
+        the order the stumps were saved, the left increment when
+        ``row[feature] <= threshold`` and the right increment
+        otherwise. An OverflowError, ValueError, or ZeroDivisionError
+        from an addition, or any non-finite intermediate score, raises
+        FloatingPointError. A non-negative score predicts class ``1``.
+        An exact zero score is returned as positive 0.0. The input and
+        the model are not modified and repeated calls return identical
+        values.
+        """
+        if self._stumps is None:
+            raise ValueError(
+                "model must be fitted before decision_function is called"
+            )
+        try:
+            width = _check_gradient_matrix(X)
+        except OverflowError as exc:
+            raise ValueError(
+                "X must contain only finite non-boolean numbers"
+            ) from exc
+        if width != self._n_features:
+            raise ValueError(
+                "X must have the same number of features as the training data"
+            )
+
+        results = []
+        for row in X:
+            score = self._constant
+            for feature, threshold, increment_left, increment_right in (
+                self._stumps
+            ):
+                increment = (
+                    increment_left
+                    if row[feature] <= threshold
+                    else increment_right
+                )
+                try:
+                    score = score + increment
+                except (
+                    OverflowError,
+                    ValueError,
+                    ZeroDivisionError,
+                ) as exc:
+                    raise FloatingPointError(
+                        "non-finite value encountered during gradient boosting"
+                    ) from exc
+                if not _is_finite_or_int(score):
+                    raise FloatingPointError(
+                        "non-finite value encountered during gradient boosting"
+                    )
+                score = _positive_zero(score)
+            results.append(score)
+        return results
+
+    def predict_proba(self, X) -> list[list[float]]:
+        """Return the class probabilities of each row of X in input
+        order.
+
+        X must satisfy the same validation as in predict (validation is
+        delegated to :meth:`decision_function`). For the score ``s`` the
+        value ``z = 2.0 * s`` is mapped through the numerically stable
+        sigmoid (the ``z >= 0`` branch uses ``1 / (1 + exp(-z))``,
+        otherwise ``e = exp(z); e / (1 + e)``); each row returns
+        ``[1.0 - p, p]`` whose columns correspond to classes 0 and 1 in
+        that order. An OverflowError, ValueError, or ZeroDivisionError
+        from the multiplication, exp, addition, subtraction, or
+        division, or any non-finite intermediate or result, raises
+        FloatingPointError. An exact zero probability is returned as
+        positive 0.0. The input and the model are not modified and
+        repeated calls return identical values.
+        """
+        scores = self.decision_function(X)
+        results = []
+        for score in scores:
+            try:
+                z = 2.0 * score
+                if not math.isfinite(z):
+                    raise FloatingPointError(
+                        "non-finite value encountered during gradient boosting"
+                    )
+                if z >= 0:
+                    p = 1.0 / (1.0 + math.exp(-z))
+                else:
+                    e = math.exp(z)
+                    p = e / (1.0 + e)
+                negative = 1.0 - p
+            except (
+                OverflowError,
+                ValueError,
+                ZeroDivisionError,
+            ) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during gradient boosting"
+                ) from exc
+            if not math.isfinite(p) or not math.isfinite(negative):
+                raise FloatingPointError(
+                    "non-finite value encountered during gradient boosting"
+                )
+            if p == 0:
+                p = 0.0
+            if negative == 0:
+                negative = 0.0
+            results.append([negative, p])
+        return results
+
 
 class StandardScaler:
     """Standardize columns by their mean and population standard deviation.
