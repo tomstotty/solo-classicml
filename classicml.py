@@ -13,6 +13,8 @@ Exports:
         trees with per-node random feature subsampling.
     AdaBoostClassifier -- deterministic discrete AdaBoost of decision
         stumps over +/-1 labels.
+    GradientBoostingRegressor -- deterministic gradient boosting of squared
+        error with decision stumps.
     StandardScaler -- deterministic standardization by column mean and
         population standard deviation.
     KMeans -- deterministic k-means clustering with Lloyd's iterations and
@@ -177,6 +179,7 @@ __all__ = [
     "DecisionTreeClassifier",
     "RandomForestClassifier",
     "AdaBoostClassifier",
+    "GradientBoostingRegressor",
     "StandardScaler",
     "KMeans",
     "PCA",
@@ -1439,6 +1442,242 @@ class AdaBoostClassifier:
             if negative == 0:
                 negative = 0.0
             results.append([negative, p])
+        return results
+
+
+def _check_exact_vector(y, n):
+    """Validate a target vector with the same length as X whose elements
+    have type exactly ``int`` (any size) or are finite values of type
+    exactly ``float`` (booleans and subclasses are rejected)."""
+    if not isinstance(y, list) or len(y) != n:
+        raise ValueError("y must be a list with the same length as X")
+    for value in y:
+        if type(value) is int:
+            continue
+        if type(value) is float and math.isfinite(value):
+            continue
+        raise ValueError("y must contain only finite non-boolean numbers")
+
+
+class GradientBoostingRegressor:
+    """Deterministic gradient boosting of decision stumps for squared
+    error.
+
+    The initial prediction is the constant ``c = math.fsum(y) / n`` and
+    every sample prediction ``v_i`` starts at ``c``. Each round computes
+    the residuals ``r_i = y_i - v_i`` and enumerates candidate stumps by
+    feature index in ascending order and, within a feature, by threshold
+    ``t`` over the distinct ascending column values excluding the maximum
+    (a stump predicts on ``x <= t``). For a candidate, ``a`` and ``b``
+    are the means of the left and right residuals (each a ``math.fsum``
+    in sample order divided by the side's count) and its score is the
+    ``math.fsum``, in sample order, of ``(r_i - m) ** 2`` where ``m`` is
+    the mean of the side sample ``i`` belongs to. The selected candidate
+    is the first in ascending lexicographic ``(score, feature, t)``
+    order; ``(feature, t, learning_rate * a, learning_rate * b)`` is
+    saved and every ``v_i`` is synchronously incremented by the saved
+    increment of its side. When the larger absolute saved increment is
+    at most ``tol`` training stops after the save; otherwise it runs for
+    at most ``n_estimators`` rounds. If no threshold exists the constant
+    model is kept.
+
+    Prediction starts at ``c`` and accumulates, in save order, the saved
+    increment of the side each row falls on. No randomness is used.
+    """
+
+    def __init__(self, n_estimators=100, learning_rate=0.1, tol=1e-8):
+        if type(n_estimators) is not int or n_estimators <= 0:
+            raise ValueError("n_estimators must be a positive integer")
+        for name, value in (
+            ("learning_rate", learning_rate),
+            ("tol", tol),
+        ):
+            if type(value) is int:
+                valid = value > 0
+            elif type(value) is float:
+                valid = math.isfinite(value) and value > 0
+            else:
+                valid = False
+            if not valid:
+                raise ValueError(
+                    "%s must be a positive finite non-boolean number" % name
+                )
+
+        self.n_estimators = n_estimators
+        self.learning_rate = learning_rate
+        self.tol = tol
+        self._stumps = None
+        self._constant = None
+        self._n_features = None
+
+    def fit(self, X, y):
+        self._stumps = None
+        self._constant = None
+        self._n_features = None
+        width = _check_tree_matrix(X)
+        _check_exact_vector(y, len(X))
+
+        n = len(X)
+        eta = self.learning_rate
+        try:
+            total = math.fsum(y)
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during boosting"
+            ) from exc
+        if not math.isfinite(total):
+            raise FloatingPointError(
+                "non-finite value encountered during boosting"
+            )
+        c = total / n
+        if not math.isfinite(c):
+            raise FloatingPointError(
+                "non-finite value encountered during boosting"
+            )
+        if c == 0:
+            c = 0.0
+
+        v = [c] * n
+        stumps = []
+        for _ in range(self.n_estimators):
+            residuals = []
+            for i in range(n):
+                try:
+                    r = y[i] - v[i]
+                except (OverflowError, ValueError) as exc:
+                    raise FloatingPointError(
+                        "non-finite value encountered during boosting"
+                    ) from exc
+                if not math.isfinite(r):
+                    raise FloatingPointError(
+                        "non-finite value encountered during boosting"
+                    )
+                residuals.append(r)
+
+            best = None  # (score, feature index, threshold)
+            best_means = None  # (left mean, right mean)
+            for j in range(width):
+                values = sorted(set(row[j] for row in X))
+                for t in values[:-1]:
+                    left = []
+                    right = []
+                    for i in range(n):
+                        if X[i][j] <= t:
+                            left.append(residuals[i])
+                        else:
+                            right.append(residuals[i])
+                    try:
+                        a = math.fsum(left) / len(left)
+                        b = math.fsum(right) / len(right)
+                    except (OverflowError, ValueError) as exc:
+                        raise FloatingPointError(
+                            "non-finite value encountered during boosting"
+                        ) from exc
+                    if not math.isfinite(a) or not math.isfinite(b):
+                        raise FloatingPointError(
+                            "non-finite value encountered during boosting"
+                        )
+                    terms = []
+                    for i in range(n):
+                        mean = a if X[i][j] <= t else b
+                        try:
+                            term = (residuals[i] - mean) ** 2
+                        except (OverflowError, ValueError) as exc:
+                            raise FloatingPointError(
+                                "non-finite value encountered during boosting"
+                            ) from exc
+                        if not math.isfinite(term):
+                            raise FloatingPointError(
+                                "non-finite value encountered during boosting"
+                            )
+                        terms.append(term)
+                    try:
+                        score = math.fsum(terms)
+                    except (OverflowError, ValueError) as exc:
+                        raise FloatingPointError(
+                            "non-finite value encountered during boosting"
+                        ) from exc
+                    if not math.isfinite(score):
+                        raise FloatingPointError(
+                            "non-finite value encountered during boosting"
+                        )
+                    candidate = (score, j, t)
+                    if best is None or candidate < best:
+                        best = candidate
+                        best_means = (a, b)
+
+            if best is None:
+                break
+            _, feature, threshold = best
+            a, b = best_means
+            try:
+                inc_left = eta * a
+                inc_right = eta * b
+            except (OverflowError, ValueError) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during boosting"
+                ) from exc
+            if not math.isfinite(inc_left) or not math.isfinite(inc_right):
+                raise FloatingPointError(
+                    "non-finite value encountered during boosting"
+                )
+            if inc_left == 0:
+                inc_left = 0.0
+            if inc_right == 0:
+                inc_right = 0.0
+            stumps.append((feature, threshold, inc_left, inc_right))
+
+            updated = []
+            for i in range(n):
+                inc = inc_left if X[i][feature] <= threshold else inc_right
+                try:
+                    value = v[i] + inc
+                except (OverflowError, ValueError) as exc:
+                    raise FloatingPointError(
+                        "non-finite value encountered during boosting"
+                    ) from exc
+                if not math.isfinite(value):
+                    raise FloatingPointError(
+                        "non-finite value encountered during boosting"
+                    )
+                updated.append(value)
+            v = updated
+
+            if max(abs(inc_left), abs(inc_right)) <= self.tol:
+                break
+
+        self._stumps = stumps
+        self._constant = c
+        self._n_features = width
+        return self
+
+    def predict(self, X) -> list[float]:
+        if self._stumps is None:
+            raise ValueError("model must be fitted before predict is called")
+        width = _check_tree_matrix(X)
+        if width != self._n_features:
+            raise ValueError(
+                "X must have the same number of features as the training data"
+            )
+
+        results = []
+        for row in X:
+            p = self._constant
+            for feature, threshold, inc_left, inc_right in self._stumps:
+                inc = inc_left if row[feature] <= threshold else inc_right
+                try:
+                    p = p + inc
+                except (OverflowError, ValueError) as exc:
+                    raise FloatingPointError(
+                        "non-finite value encountered during prediction"
+                    ) from exc
+                if not math.isfinite(p):
+                    raise FloatingPointError(
+                        "non-finite value encountered during prediction"
+                    )
+            if p == 0:
+                p = 0.0
+            results.append(p)
         return results
 
 
