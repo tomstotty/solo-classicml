@@ -1443,7 +1443,12 @@ class PCA:
     ``[mu_0, mu_1]`` and ``components_`` is ``[v]``; both are ``None``
     initially and after a failed fit. ``transform`` returns, per row,
     ``[F((x_j - mu_j) * v_j)]`` with an exact zero normalized to ``0.0``.
-    Neither method modifies its input. No randomness is used.
+    ``inverse_transform`` maps a one-column score back to a two-column
+    reconstruction, per row and coordinate ``x_j = F(mu_j, z * v_j)``,
+    with an exact zero normalized to ``0.0``. ``reconstruction_error``
+    returns ``F((x_ij - r_ij) ** 2) / (2 * n)`` for the reconstruction
+    ``R`` of ``transform(X)`` through ``inverse_transform``. Neither
+    method modifies its input. No randomness is used.
     """
 
     def __init__(self):
@@ -1470,6 +1475,27 @@ class PCA:
                 raise ValueError(
                     "X must contain only finite non-boolean numbers"
                 )
+
+    @staticmethod
+    def _validate_z(Z):
+        # Non-empty list[list] with exactly one column whose elements have
+        # type exactly int (any size) or finite float; booleans and
+        # subclasses are rejected.
+        if not isinstance(Z, list) or len(Z) == 0:
+            raise ValueError("Z must be a non-empty list of rows")
+        for row in Z:
+            if not isinstance(row, list):
+                raise ValueError("Z rows must be lists")
+            if len(row) != 1:
+                raise ValueError("Z must have exactly one column")
+            value = row[0]
+            if type(value) is int:
+                continue
+            if type(value) is float and math.isfinite(value):
+                continue
+            raise ValueError(
+                "Z must contain only finite non-boolean numbers"
+            )
 
     def fit(self, X):
         self.mean_ = None
@@ -1548,6 +1574,87 @@ class PCA:
     def fit_transform(self, X):
         self.fit(X)
         return self.transform(X)
+
+    def inverse_transform(self, Z):
+        if self.mean_ is None or self.components_ is None:
+            raise ValueError(
+                "PCA must be fitted before inverse_transform is called"
+            )
+        self._validate_z(Z)
+
+        mean = self.mean_
+        v = self.components_[0]
+
+        results = []
+        for row in Z:
+            z = row[0]
+            reconstructed = []
+            for j in range(2):
+                try:
+                    q = z * v[j]
+                    value = math.fsum([mean[j], q])
+                except (OverflowError, ValueError, ZeroDivisionError) as exc:
+                    raise FloatingPointError(
+                        "non-finite value encountered "
+                        "during inverse_transform"
+                    ) from exc
+                if not math.isfinite(value):
+                    raise FloatingPointError(
+                        "non-finite value encountered "
+                        "during inverse_transform"
+                    )
+                if value == 0:
+                    value = 0.0
+                reconstructed.append(value)
+            results.append(reconstructed)
+        return results
+
+    def reconstruction_error(self, X):
+        if self.mean_ is None or self.components_ is None:
+            raise ValueError(
+                "PCA must be fitted before reconstruction_error is called"
+            )
+        self._validate(X)
+
+        Z = self.transform(X)
+        R = self.inverse_transform(Z)
+
+        terms = []
+        for i in range(len(X)):
+            for j in range(2):
+                try:
+                    diff = X[i][j] - R[i][j]
+                    square = diff ** 2
+                except (
+                    OverflowError,
+                    ValueError,
+                    ZeroDivisionError,
+                ) as exc:
+                    raise FloatingPointError(
+                        "non-finite value encountered "
+                        "during reconstruction_error"
+                    ) from exc
+                if isinstance(square, float) and not math.isfinite(square):
+                    raise FloatingPointError(
+                        "non-finite value encountered "
+                        "during reconstruction_error"
+                    )
+                terms.append(square)
+
+        try:
+            total = math.fsum(terms)
+            error = total / (2 * len(X))
+        except (OverflowError, ValueError, ZeroDivisionError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during reconstruction_error"
+            ) from exc
+        if not math.isfinite(error):
+            raise FloatingPointError(
+                "non-finite value encountered during reconstruction_error"
+            )
+        if error == 0:
+            error = 0.0
+        return float(error)
 
 
 class DBSCAN:
