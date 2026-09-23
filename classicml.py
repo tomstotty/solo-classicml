@@ -1326,6 +1326,94 @@ class AdaBoostClassifier:
             results.append(1 if score > 0 else -1)
         return results
 
+    def decision_function(self, X):
+        """Return the per-row signed margin ``fsum(alpha * h)`` as floats.
+
+        Each weak classifier contributes ``sign`` when
+        ``x[feature] <= threshold`` and ``-sign`` otherwise; the terms are
+        summed in save order with ``math.fsum``. An exact zero is written
+        as positive ``0.0``. Any overflow or non-finite result in the
+        multiplications or summation raises FloatingPointError.
+        """
+        if self._stumps is None:
+            raise ValueError(
+                "model must be fitted before decision_function is called"
+            )
+        width = _check_tree_matrix(X)
+        if width != self._n_features:
+            raise ValueError(
+                "X must have the same number of features as the training data"
+            )
+
+        scores = []
+        for row in X:
+            terms = []
+            for feature, threshold, sign, alpha in self._stumps:
+                vote = sign if row[feature] <= threshold else -sign
+                try:
+                    term = alpha * vote
+                except (OverflowError, ValueError) as exc:
+                    raise FloatingPointError(
+                        "non-finite value encountered during boosting"
+                    ) from exc
+                if isinstance(term, float) and not math.isfinite(term):
+                    raise FloatingPointError(
+                        "non-finite value encountered during boosting"
+                    )
+                terms.append(term)
+            try:
+                score = math.fsum(terms)
+            except (OverflowError, ValueError) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during boosting"
+                ) from exc
+            if not math.isfinite(score):
+                raise FloatingPointError(
+                    "non-finite value encountered during boosting"
+                )
+            scores.append(0.0 if score == 0.0 else float(score))
+        return scores
+
+    def predict_proba(self, X):
+        """Return per-row probabilities ``[P(-1), P(1)]``.
+
+        Given the decision score ``s`` and ``z = 2.0 * s``, the positive
+        probability is the logistic sigmoid ``1 / (1 + exp(-z))`` computed
+        without overflow; the two columns correspond to labels ``-1`` and
+        ``1``. An exact zero score gives ``[0.5, 0.5]`` written with
+        positive zeros. Any overflow, division error, or non-finite result
+        raises FloatingPointError.
+        """
+        scores = self.decision_function(X)
+        probabilities = []
+        for s in scores:
+            try:
+                z = 2.0 * s
+                if z >= 0.0:
+                    p = 1.0 / (1.0 + math.exp(-z))
+                else:
+                    e = math.exp(z)
+                    p = e / (1.0 + e)
+            except (
+                OverflowError,
+                ValueError,
+                ZeroDivisionError,
+            ) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during boosting"
+                ) from exc
+            if not math.isfinite(z) or not math.isfinite(p):
+                raise FloatingPointError(
+                    "non-finite value encountered during boosting"
+                )
+            negative = 1.0 - p
+            if negative == 0.0:
+                negative = 0.0
+            if p == 0.0:
+                p = 0.0
+            probabilities.append([negative, p])
+        return probabilities
+
 
 class StandardScaler:
     """Standardize columns by their mean and population standard deviation.
@@ -12922,7 +13010,7 @@ def _encode_stump(stump, n_features):
     must convert back with ``float`` to exactly the original value so a
     loaded model predicts identically.
     """
-    if not isinstance(stump, (tuple, list)) or len(stump) != 4:
+    if type(stump) is not tuple or len(stump) != 4:
         raise ValueError(
             "stumps must be (feature, threshold, sign, alpha) 4-tuples"
         )
