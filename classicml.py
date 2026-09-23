@@ -12302,6 +12302,13 @@ _SERIAL_KEYS_FOREST = (
     "n_features_in",
     "trees",
 )
+_SERIAL_KEYS_ADABOOST = (
+    "class",
+    "n_estimators",
+    "n_features_in",
+    "stumps",
+)
+_SERIAL_KEYS_STUMP = ("feature", "threshold", "sign", "alpha")
 
 
 def _quantize_fixed(value):
@@ -12391,8 +12398,8 @@ def _encode_vector(vector, length):
 def dumps(model):
     """Serialize a fitted KMeans, PCA, LinearRegression,
     LogisticRegression, StandardScaler, DecisionTreeClassifier,
-    RandomForestClassifier, or GaussianMixture model to compact JSON
-    text.
+    RandomForestClassifier, AdaBoostClassifier, or GaussianMixture model
+    to compact JSON text.
 
     The result contains no whitespace and no trailing newline. Integers
     (``n_clusters``, ``max_iter``, ``seed``, ``n_features_in``) are emitted
@@ -12413,6 +12420,16 @@ def dumps(model):
     ``n_estimators``, ``max_features``, ``seed``, ``n_features_in``,
     ``trees`` in that order, with exactly ``n_estimators`` trees whose
     nodes use the same node encoding as DecisionTreeClassifier.
+
+    For AdaBoostClassifier the top-level keys are ``class``,
+    ``n_estimators``, ``n_features_in``, ``stumps`` in that order;
+    ``stumps`` is a non-empty array of at most ``n_estimators`` stumps,
+    each with the keys ``feature``, ``threshold``, ``sign``, ``alpha``
+    in that order. ``feature`` is an integer in ``[0, n_features_in)``,
+    ``sign`` is -1 or 1, and ``threshold``/``alpha`` are exact finite
+    int/float values with ``alpha`` strictly positive, quantized to 10
+    decimal places; the quantized text must convert back with ``float``
+    to exactly the original value.
 
     For GaussianMixture the top-level keys are ``class``,
     ``n_components``, ``weights``, ``means``, ``variances`` in that
@@ -12472,6 +12489,14 @@ def dumps(model):
         except Exception as exc:
             raise ValueError("invalid RandomForestClassifier state") from exc
 
+    if isinstance(model, AdaBoostClassifier):
+        try:
+            return _dumps_adaboost(model)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("invalid AdaBoostClassifier state") from exc
+
     if isinstance(model, GaussianMixture):
         try:
             return _dumps_gaussian(model)
@@ -12483,7 +12508,8 @@ def dumps(model):
     raise ValueError(
         "dumps only supports fitted KMeans, PCA, LinearRegression, "
         "LogisticRegression, StandardScaler, DecisionTreeClassifier, "
-        "RandomForestClassifier, and GaussianMixture models"
+        "RandomForestClassifier, AdaBoostClassifier, and GaussianMixture "
+        "models"
     )
 
 
@@ -12838,6 +12864,104 @@ def _dumps_forest(model):
         + trees_text
         + "}"
     )
+
+
+def _dumps_adaboost(model):
+    """Serialize a fitted AdaBoostClassifier.
+
+    The top-level keys are class, n_estimators, n_features_in, stumps in
+    that order; ``n_estimators`` and ``n_features_in`` are positive JSON
+    integers and ``stumps`` is a non-empty array of at most
+    ``n_estimators`` stumps encoded by ``_encode_stump``. The
+    construction parameter is re-validated exactly as ``__init__``
+    performs the check, and the fitted state must match it in shape.
+    """
+    stumps = model._stumps
+    n_features = model._n_features
+    if stumps is None or n_features is None:
+        raise ValueError(
+            "AdaBoostClassifier must be fitted before dumps is called"
+        )
+    n_estimators = model.n_estimators
+    # Re-validate the construction parameter exactly as __init__ does.
+    if type(n_estimators) is not int or n_estimators <= 0:
+        raise ValueError("n_estimators must be a positive integer")
+    if type(n_features) is not int or n_features <= 0:
+        raise ValueError("n_features_in must be a positive integer")
+    if (
+        not isinstance(stumps, list)
+        or len(stumps) == 0
+        or len(stumps) > n_estimators
+    ):
+        raise ValueError(
+            "stumps must be a non-empty list of at most n_estimators "
+            "stumps"
+        )
+    stumps_text = "[" + ",".join(
+        _encode_stump(stump, n_features) for stump in stumps
+    ) + "]"
+    return (
+        '{"class":"AdaBoostClassifier","n_estimators":'
+        + str(n_estimators)
+        + ',"n_features_in":'
+        + str(n_features)
+        + ',"stumps":'
+        + stumps_text
+        + "}"
+    )
+
+
+def _encode_stump(stump, n_features):
+    """Encode one decision stump with the keys feature, threshold, sign,
+    alpha in that order.
+
+    ``feature`` is an exact integer in ``[0, n_features)`` and ``sign``
+    is -1 or 1. ``threshold`` and ``alpha`` must be exact finite
+    int/float values (booleans rejected) with ``alpha`` strictly
+    positive; both are quantized to 10 decimals and the quantized text
+    must convert back with ``float`` to exactly the original value so a
+    loaded model predicts identically.
+    """
+    if not isinstance(stump, (tuple, list)) or len(stump) != 4:
+        raise ValueError(
+            "stumps must be (feature, threshold, sign, alpha) 4-tuples"
+        )
+    feature, threshold, sign, alpha = stump
+    if type(feature) is not int or not 0 <= feature < n_features:
+        raise ValueError("stump feature must be in [0, n_features_in)")
+    if type(sign) is not int or sign not in (-1, 1):
+        raise ValueError("stump sign must be -1 or 1")
+    _require_scaler_number(threshold, "threshold")
+    _require_scaler_number(alpha, "alpha")
+    if alpha <= 0:
+        raise ValueError("stump alpha must be strictly positive")
+    threshold_text = _quantize_stump_number(threshold, "threshold")
+    alpha_text = _quantize_stump_number(alpha, "alpha")
+    return (
+        '{"feature":'
+        + str(feature)
+        + ',"threshold":'
+        + threshold_text
+        + ',"sign":'
+        + str(sign)
+        + ',"alpha":'
+        + alpha_text
+        + "}"
+    )
+
+
+def _quantize_stump_number(value, name):
+    """Quantize an exact int/float stump coordinate to 10 fixed decimals
+    via ``Decimal(str(v))`` with ROUND_HALF_UP (negative zero becomes
+    ``0.0000000000``). The quantized text must convert back with
+    ``float`` to exactly the original value, otherwise ValueError is
+    raised because a loaded stump would not predict identically."""
+    token = _quantize_state_number(value)
+    if float(token) != value:
+        raise ValueError(
+            "stump %s must equal its 10-decimal quantization" % name
+        )
+    return token
 
 
 def _dumps_gaussian(model):
@@ -13404,6 +13528,70 @@ def _load_forest(pairs):
     return model
 
 
+def _load_adaboost(pairs):
+    keys = tuple(key for key, _ in pairs)
+    if keys != _SERIAL_KEYS_ADABOOST:
+        raise ValueError(
+            "AdaBoostClassifier JSON must have exactly the serialized "
+            "keys in the serialized order"
+        )
+    data = _convert(pairs)
+
+    class_name = data["class"]
+    if not isinstance(class_name, str) or class_name != "AdaBoostClassifier":
+        raise ValueError('class must be "AdaBoostClassifier"')
+
+    n_estimators = _expect_int(data["n_estimators"], "n_estimators")
+    if n_estimators <= 0:
+        raise ValueError("n_estimators must be greater than 0")
+    n_features = _expect_int(data["n_features_in"], "n_features_in")
+    if n_features <= 0:
+        raise ValueError("n_features_in must be greater than 0")
+
+    stumps_node = data["stumps"]
+    if (
+        not isinstance(stumps_node, list)
+        or len(stumps_node) == 0
+        or len(stumps_node) > n_estimators
+    ):
+        raise ValueError(
+            "stumps must be a non-empty array of at most n_estimators "
+            "stumps"
+        )
+    stumps = [_load_stump(stump, n_features) for stump in stumps_node]
+
+    model = AdaBoostClassifier(n_estimators=n_estimators)
+    model._stumps = stumps
+    model._n_features = n_features
+    return model
+
+
+def _load_stump(node, n_features):
+    """Rebuild one decision stump from its converted JSON object.
+
+    The stump must have exactly the keys feature, threshold, sign, alpha
+    in that order: an integer feature in ``[0, n_features)``, a fixed
+    10-decimal threshold, a sign of -1 or 1, and a strictly positive
+    fixed 10-decimal alpha.
+    """
+    if not isinstance(node, dict) or tuple(node.keys()) != _SERIAL_KEYS_STUMP:
+        raise ValueError(
+            "stumps must have exactly the keys "
+            "feature, threshold, sign, alpha in that order"
+        )
+    feature = _expect_int(node["feature"], "stump feature")
+    if feature < 0 or feature >= n_features:
+        raise ValueError("stump feature must be in [0, n_features_in)")
+    threshold = _expect_fixed(node["threshold"], "stump threshold")
+    sign = _expect_int(node["sign"], "stump sign")
+    if sign not in (-1, 1):
+        raise ValueError("stump sign must be -1 or 1")
+    alpha = _expect_fixed(node["alpha"], "stump alpha")
+    if alpha <= 0.0:
+        raise ValueError("stump alpha must be greater than 0")
+    return (feature, threshold, sign, alpha)
+
+
 def _load_gaussian(pairs):
     keys = tuple(key for key, _ in pairs)
     if keys != _SERIAL_KEYS_GAUSSIAN:
@@ -13447,8 +13635,8 @@ def _load_gaussian(pairs):
 def loads(text):
     """Reconstruct a fitted KMeans, PCA, LinearRegression,
     LogisticRegression, StandardScaler, DecisionTreeClassifier,
-    RandomForestClassifier, or GaussianMixture from text produced by
-    dumps.
+    RandomForestClassifier, AdaBoostClassifier, or GaussianMixture from
+    text produced by dumps.
 
     Only the exact byte format emitted by :func:`dumps` is accepted: a
     ``str`` holding compact JSON with no whitespace, no duplicate keys,
@@ -13461,8 +13649,8 @@ def loads(text):
     independent of the input and fitted; KMeans recovers its column
     count from centroid width, the linear models from the length of
     ``w``, StandardScaler/DecisionTreeClassifier/RandomForestClassifier
-    from ``n_features_in``, and GaussianMixture from
-    ``n_components``.
+    from ``n_features_in``, AdaBoostClassifier from ``n_features_in``,
+    and GaussianMixture from ``n_components``.
     The argument is not modified.
     """
     if type(text) is not str or len(text) == 0:
@@ -13533,6 +13721,13 @@ def loads(text):
     if class_entry == "RandomForestClassifier":
         try:
             return _load_forest(pairs)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("malformed serialized model") from exc
+    if class_entry == "AdaBoostClassifier":
+        try:
+            return _load_adaboost(pairs)
         except ValueError:
             raise
         except Exception as exc:
