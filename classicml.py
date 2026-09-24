@@ -2661,17 +2661,43 @@ class IsolationForest:
         # conversion try below.
         baseline = self.score_samples(X)
 
+        def permuted_matrix(j, idx, column):
+            # Build the column-permuted copy. These are not score_samples
+            # steps, so any OverflowError, ValueError or ZeroDivisionError
+            # they raise is reported as FloatingPointError.
+            try:
+                permuted = [list(row) for row in X]
+                for i in range(n):
+                    permuted[i][j] = column[idx[i]]
+                return permuted
+            except FloatingPointError:
+                raise
+            except (OverflowError, ValueError, ZeroDivisionError) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during isolation forest"
+                    " scoring"
+                ) from exc
+
         rng = random.Random(seed)
         permuted_scores = []
         for j in range(width):
-            column = [row[j] for row in X]
+            try:
+                column = [row[j] for row in X]
+            except FloatingPointError:
+                raise
+            except (OverflowError, ValueError, ZeroDivisionError) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during isolation forest"
+                    " scoring"
+                ) from exc
             repeats = []
             for _ in range(n_repeats):
                 idx = list(range(n))
                 rng.shuffle(idx)
-                permuted = [list(row) for row in X]
-                for i in range(n):
-                    permuted[i][j] = column[idx[i]]
+                permuted = permuted_matrix(j, idx, column)
+                # Exceptions from score_samples (including
+                # FloatingPointError) propagate unchanged, so this call
+                # deliberately stays outside the conversion handler.
                 repeats.append(self.score_samples(permuted))
             permuted_scores.append(repeats)
 
@@ -19732,6 +19758,23 @@ _SERIAL_KEYS_FOREST_REGRESSOR_NODE = (
     "left",
     "right",
 )
+_SERIAL_KEYS_ISOLATION_FOREST = (
+    "class",
+    "n_estimators",
+    "max_samples",
+    "contamination",
+    "seed",
+    "n_features_in",
+    "threshold",
+    "trees",
+)
+_SERIAL_KEYS_ISOLATION_NODE = (
+    "count",
+    "feature",
+    "threshold",
+    "left",
+    "right",
+)
 _SERIAL_KEYS_ADABOOST = (
     "class",
     "n_estimators",
@@ -20402,8 +20445,8 @@ def dumps(model):
     RandomForestClassifier, RandomForestRegressor, AdaBoostClassifier,
     GradientBoostingRegressor, GradientBoostingClassifier,
     GaussianMixture, KNeighborsRegressor,
-    KNeighborsClassifier, AgglomerativeClustering, or DBSCAN model to
-    compact JSON text.
+    KNeighborsClassifier, AgglomerativeClustering, DBSCAN, or
+    IsolationForest model to compact JSON text.
 
     The result contains no whitespace and no trailing newline. Integers
     (``n_clusters``, ``max_iter``, ``seed``, ``n_features_in``) are emitted
@@ -20591,6 +20634,30 @@ def dumps(model):
     ``min_samples`` is a positive JSON integer, and ``labels`` is a
     non-empty JSON integer array containing only -1 and cluster labels
     numbered consecutively from zero in first-appearance order.
+
+    For IsolationForest the top-level keys are ``class``,
+    ``n_estimators``, ``max_samples``, ``contamination``, ``seed``,
+    ``n_features_in``, ``threshold``, ``trees`` in that order; ``class``
+    is ``"IsolationForest"``, the construction fields are re-validated
+    exactly as ``__init__`` performs the checks (``n_estimators`` a
+    positive JSON integer, ``max_samples`` a JSON integer of at least
+    2, ``contamination`` the string ``"auto"`` or a finite exact
+    int/float in ``(0, 0.5]`` quantized to 10 decimal places, and
+    ``seed`` a JSON integer), ``n_features_in`` is a positive JSON
+    integer, and the decision ``threshold`` is a finite float
+    quantized to 10 decimal places via ``Decimal(str(v))`` with
+    ROUND_HALF_UP (negative zero becomes ``0.0000000000``); the
+    quantized threshold text must convert back with ``float`` to
+    exactly the original value. The ``trees`` array holds exactly
+    ``n_estimators`` trees. Each node carries the keys ``count``,
+    ``feature``, ``threshold``, ``left``, ``right`` in that order:
+    ``count`` is a JSON integer in ``[1, max_samples]``; leaves are
+    encoded as ``feature`` -1, ``threshold`` ``0.0000000000`` and
+    empty ``left``/``right`` arrays; internal nodes carry a feature in
+    ``[0, n_features_in)``, a finite exact int/float threshold
+    quantized the same way (its quantized text converting back
+    exactly), node children, and a count equal to the sum of the
+    children's counts. Every tree root has count ``max_samples``.
     """
     if isinstance(model, KMeans):
         try:
@@ -20756,6 +20823,14 @@ def dumps(model):
         except Exception as exc:
             raise ValueError("invalid DBSCAN state") from exc
 
+    if isinstance(model, IsolationForest):
+        try:
+            return _dumps_isolation_forest(model)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("invalid IsolationForest state") from exc
+
     raise ValueError(
         "dumps only supports fitted KMeans, PCA, LinearRegression, "
         "LogisticRegression, LassoRegression, ElasticNetRegression, "
@@ -20765,7 +20840,8 @@ def dumps(model):
         "AdaBoostClassifier, GradientBoostingRegressor, "
         "GradientBoostingClassifier, "
         "GaussianMixture, KNeighborsRegressor, "
-        "KNeighborsClassifier, AgglomerativeClustering, and DBSCAN models"
+        "KNeighborsClassifier, AgglomerativeClustering, DBSCAN, and "
+        "IsolationForest models"
     )
 
 
@@ -21649,6 +21725,163 @@ def _quantize_forest_regressor_number(value, name):
             "%s must equal its 10-decimal quantization" % name
         )
     return token
+
+
+def _dumps_isolation_forest(model):
+    """Serialize a fitted IsolationForest.
+
+    The top-level keys are class, n_estimators, max_samples,
+    contamination, seed, n_features_in, threshold, trees in that order;
+    class is ``"IsolationForest"``, the four construction fields
+    (``n_estimators``, ``max_samples``, ``contamination``, ``seed``) are
+    re-validated exactly as ``__init__`` performs the checks,
+    ``n_features_in`` is a positive JSON integer, the decision
+    ``threshold`` is a finite float quantized to 10 decimals, and the
+    ``trees`` array holds exactly n_estimators node trees encoded by
+    ``_encode_isolation_node``. The fitted state must match the
+    construction parameters in shape.
+    """
+    trees = model._trees
+    n_features = model._width
+    if trees is None or n_features is None or model.threshold_ is None:
+        raise ValueError(
+            "IsolationForest must be fitted before dumps is called"
+        )
+    n_estimators = model.n_estimators
+    max_samples = model.max_samples
+    contamination = model.contamination
+    seed = model.seed
+    if (
+        type(n_estimators) is not int
+        or n_estimators <= 0
+        or type(max_samples) is not int
+        or max_samples < 2
+        or type(seed) is not int
+    ):
+        raise ValueError(
+            "IsolationForest has invalid construction parameters"
+        )
+    if type(contamination) is str:
+        if contamination != "auto":
+            raise ValueError(
+                'contamination must be "auto" or a finite number in'
+                " (0, 0.5]"
+            )
+        contamination_text = '"auto"'
+    elif type(contamination) in (int, float) and (
+        0.0 < contamination <= 0.5
+    ):
+        contamination_text = _quantize_state_number(
+            contamination
+        )
+        quantized_contamination = float(contamination_text)
+        if not 0.0 < quantized_contamination <= 0.5:
+            raise ValueError(
+                "contamination must remain in (0, 0.5] after quantization"
+                " to 10 decimals"
+            )
+    else:
+        raise ValueError(
+            'contamination must be "auto" or a finite number in (0, 0.5]'
+        )
+    if type(n_features) is not int or n_features <= 0:
+        raise ValueError("n_features_in must be a positive integer")
+    threshold = model.threshold_
+    if type(threshold) is not float or not math.isfinite(threshold):
+        raise ValueError("threshold must be a finite float")
+    threshold_text = _quantize_state_number(threshold)
+    if float(threshold_text) != threshold:
+        raise ValueError(
+            "threshold must equal its 10-decimal quantization"
+        )
+    if not isinstance(trees, list) or len(trees) != n_estimators:
+        raise ValueError("trees must have length n_estimators")
+    trees_text = "[" + ",".join(
+        _encode_isolation_node(tree, n_features, max_samples)
+        for tree in trees
+    ) + "]"
+    for tree in trees:
+        if tree.count != max_samples:
+            raise ValueError("tree root count must equal max_samples")
+    return (
+        '{"class":"IsolationForest","n_estimators":'
+        + str(n_estimators)
+        + ',"max_samples":'
+        + str(max_samples)
+        + ',"contamination":'
+        + contamination_text
+        + ',"seed":'
+        + str(seed)
+        + ',"n_features_in":'
+        + str(n_features)
+        + ',"threshold":'
+        + threshold_text
+        + ',"trees":'
+        + trees_text
+        + "}"
+    )
+
+
+def _encode_isolation_node(node, n_features, max_samples):
+    """Encode one isolation tree node with the keys count, feature,
+    threshold, left, right in that order.
+
+    ``count`` is an exact integer in ``[1, max_samples]``. Leaves
+    (``feature is None``) are emitted as ``feature`` -1, ``threshold``
+    ``0.0000000000`` and empty ``left``/``right`` arrays. Internal nodes
+    need an exact integer feature in ``[0, n_features)``, node children
+    whose counts sum to ``count``, and a finite exact int/float threshold
+    quantized to 10 decimals via ``Decimal(str(v))`` with ROUND_HALF_UP
+    (negative zero becomes ``0.0000000000``); the quantized text must
+    convert back with ``float`` to exactly the original threshold so a
+    reloaded forest predicts identically.
+    """
+    if not isinstance(node, _IsolationTreeNode):
+        raise ValueError(
+            "tree nodes must be _IsolationTreeNode instances"
+        )
+    count = node.count
+    if type(count) is not int or not 1 <= count <= max_samples:
+        raise ValueError("node count must be an integer in [1, max_samples]")
+    feature = node.feature
+    if feature is None:
+        if (
+            node.threshold is not None
+            or node.left is not None
+            or node.right is not None
+        ):
+            raise ValueError(
+                "leaf nodes must have no threshold or children"
+            )
+        return (
+            '{"count":'
+            + str(count)
+            + ',"feature":-1,"threshold":0.0000000000,"left":[],"right":[]}'
+        )
+    if type(feature) is not int or not 0 <= feature < n_features:
+        raise ValueError("internal node feature must be in [0, n_features_in)")
+    threshold_text = _quantize_forest_regressor_number(
+        node.threshold, "threshold"
+    )
+    left_text = _encode_isolation_node(node.left, n_features, max_samples)
+    right_text = _encode_isolation_node(node.right, n_features, max_samples)
+    if node.left.count + node.right.count != count:
+        raise ValueError(
+            "internal node count must equal the sum of its children"
+        )
+    return (
+        '{"count":'
+        + str(count)
+        + ',"feature":'
+        + str(feature)
+        + ',"threshold":'
+        + threshold_text
+        + ',"left":'
+        + left_text
+        + ',"right":'
+        + right_text
+        + "}"
+    )
 
 
 def _dumps_adaboost(model):
@@ -22750,6 +22983,123 @@ def _load_forest_regressor_node(node, n_features):
     return result
 
 
+def _load_isolation_forest(pairs):
+    keys = tuple(key for key, _ in pairs)
+    if keys != _SERIAL_KEYS_ISOLATION_FOREST:
+        raise ValueError(
+            "IsolationForest JSON must have exactly the serialized keys "
+            "in the serialized order"
+        )
+    data = _convert(pairs)
+
+    class_name = data["class"]
+    if not isinstance(class_name, str) or class_name != "IsolationForest":
+        raise ValueError('class must be "IsolationForest"')
+
+    n_estimators = _expect_int(data["n_estimators"], "n_estimators")
+    if n_estimators <= 0:
+        raise ValueError("n_estimators must be greater than 0")
+    max_samples = _expect_int(data["max_samples"], "max_samples")
+    if max_samples < 2:
+        raise ValueError("max_samples must be at least 2")
+
+    contamination_entry = data["contamination"]
+    if isinstance(contamination_entry, str):
+        if contamination_entry != "auto":
+            raise ValueError(
+                'contamination must be "auto" or a finite number in'
+                " (0, 0.5]"
+            )
+        contamination = "auto"
+    else:
+        contamination = _expect_fixed(
+            contamination_entry, "contamination"
+        )
+        if not 0.0 < contamination <= 0.5:
+            raise ValueError("contamination must be in (0, 0.5]")
+
+    seed = _expect_int(data["seed"], "seed")
+    n_features = _expect_int(data["n_features_in"], "n_features_in")
+    if n_features <= 0:
+        raise ValueError("n_features_in must be greater than 0")
+    threshold = _expect_fixed(data["threshold"], "threshold")
+
+    trees_node = data["trees"]
+    if not isinstance(trees_node, list) or len(trees_node) != n_estimators:
+        raise ValueError("trees must have length n_estimators")
+    trees = [
+        _load_isolation_node(tree, n_features, max_samples)
+        for tree in trees_node
+    ]
+    for tree in trees:
+        if tree.count != max_samples:
+            raise ValueError("tree root count must equal max_samples")
+
+    model = IsolationForest(
+        n_estimators=n_estimators,
+        max_samples=max_samples,
+        contamination=contamination,
+        seed=seed,
+    )
+    c_values = [0.0] + [
+        _isolation_c(s) for s in range(1, max_samples + 1)
+    ]
+    model._trees = trees
+    model._c_values = c_values
+    model._c_psi = c_values[max_samples]
+    model._width = n_features
+    model.threshold_ = threshold
+    return model
+
+
+def _load_isolation_node(node, n_features, max_samples):
+    """Rebuild one isolation tree node from its converted JSON object.
+
+    The node must have exactly the keys count, feature, threshold, left,
+    right in that order. ``count`` is a JSON integer in
+    ``[1, max_samples]``. A leaf has ``feature`` -1, ``threshold``
+    ``0.0000000000`` and empty ``left``/``right`` arrays; an internal
+    node has a feature in ``[0, n_features)``, node children whose
+    counts sum to ``count``, and a finite fixed 10-decimal threshold.
+    """
+    if (
+        not isinstance(node, dict)
+        or tuple(node.keys()) != _SERIAL_KEYS_ISOLATION_NODE
+    ):
+        raise ValueError(
+            "tree nodes must have exactly the keys "
+            "count, feature, threshold, left, right in that order"
+        )
+    count = _expect_int(node["count"], "node count")
+    if not 1 <= count <= max_samples:
+        raise ValueError("node count must be in [1, max_samples]")
+    feature = _expect_int(node["feature"], "node feature")
+    if feature == -1:
+        threshold = _expect_fixed(node["threshold"], "leaf threshold")
+        if threshold != 0.0:
+            raise ValueError("leaf threshold must be 0.0000000000")
+        if node["left"] != [] or node["right"] != []:
+            raise ValueError("leaf children must be empty arrays")
+        return _IsolationTreeNode(count)
+    if feature < 0 or feature >= n_features:
+        raise ValueError("node feature must be in [0, n_features_in)")
+    threshold = _expect_fixed(node["threshold"], "node threshold")
+    result = _IsolationTreeNode(count)
+    result.feature = feature
+    result.threshold = threshold
+    result.left = _load_isolation_node(
+        node["left"], n_features, max_samples
+    )
+    result.right = _load_isolation_node(
+        node["right"], n_features, max_samples
+    )
+    if result.left.count + result.right.count != count:
+        raise ValueError(
+            "internal node count must equal the sum of its children"
+        )
+    return result
+
+
 def _load_adaboost(pairs):
     keys = tuple(key for key, _ in pairs)
     if keys != _SERIAL_KEYS_ADABOOST:
@@ -23174,7 +23524,8 @@ def loads(text):
     RandomForestClassifier, RandomForestRegressor, AdaBoostClassifier,
     GradientBoostingRegressor, GradientBoostingClassifier,
     GaussianMixture, KNeighborsRegressor, KNeighborsClassifier,
-    AgglomerativeClustering, or DBSCAN from text produced by dumps.
+    AgglomerativeClustering, DBSCAN, or IsolationForest from text
+    produced by dumps.
 
     Only the exact byte format emitted by :func:`dumps` is accepted: a
     ``str`` holding compact JSON with no whitespace, no duplicate keys,
@@ -23216,6 +23567,17 @@ def loads(text):
     ``eps`` (a fixed 10-decimal number), ``min_samples`` (a positive
     JSON integer), and a fresh copy of ``labels`` containing only -1
     and labels consecutive from zero in first-appearance order.
+    IsolationForest is reconstructed from ``n_features_in`` with the
+    four construction fields (``n_estimators``, ``max_samples``,
+    ``contamination`` as ``"auto"`` or a fixed 10-decimal number, and
+    ``seed``), the fixed 10-decimal decision ``threshold``, and
+    exactly ``n_estimators`` trees rebuilt from fresh
+    ``_IsolationTreeNode`` instances (no shared structure); each node
+    count is a JSON integer in ``[1, max_samples]``, leaves carry
+    ``feature`` -1, a zero threshold and empty children, internal
+    nodes carry a feature in ``[0, n_features)``, fixed 10-decimal
+    threshold and children whose counts sum to the node count, and
+    every tree root has count ``max_samples``.
     The argument is not modified.
     """
     if type(text) is not str or len(text) == 0:
@@ -23377,6 +23739,13 @@ def loads(text):
     if class_entry == "DBSCAN":
         try:
             return _load_dbscan(pairs)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("malformed serialized model") from exc
+    if class_entry == "IsolationForest":
+        try:
+            return _load_isolation_forest(pairs)
         except ValueError:
             raise
         except Exception as exc:
