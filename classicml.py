@@ -20929,6 +20929,16 @@ _SERIAL_KEYS_KMEDOIDS = (
     "cluster_centers",
 )
 
+_SERIAL_KEYS_NMF = (
+    "class",
+    "n_components",
+    "max_iter",
+    "tol",
+    "seed",
+    "n_features_in",
+    "components",
+)
+
 
 def _quantize_fixed(value):
     """Quantize a finite non-boolean real to 10 decimal places (HALF_UP)
@@ -21551,7 +21561,7 @@ def dumps(model):
     GradientBoostingRegressor, GradientBoostingClassifier,
     GaussianMixture, KNeighborsRegressor,
     KNeighborsClassifier, AgglomerativeClustering, DBSCAN,
-    IsolationForest, or KMedoids model to compact JSON text.
+    IsolationForest, KMedoids, or NMF model to compact JSON text.
 
     The result contains no whitespace and no trailing newline. Integers
     (``n_clusters``, ``max_iter``, ``seed``, ``n_features_in``) are emitted
@@ -21783,6 +21793,18 @@ def dumps(model):
     ``Decimal(str(v))`` with ROUND_HALF_UP (never through ``float``
     first; negative zero becomes ``0.0000000000``), and the fixed text
     must convert back with ``float`` to exactly the original value.
+
+    For NMF the top-level keys are ``class``, ``n_components``,
+    ``max_iter``, ``tol``, ``seed``, ``n_features_in``, ``components``
+    in that order; ``class`` is ``"NMF"`` and ``n_components``,
+    ``max_iter`` and ``n_features_in`` are positive JSON integers while
+    ``seed`` is a JSON integer. ``tol`` is a finite non-boolean positive
+    int/float and ``components`` a rectangular ``n_components`` by
+    ``n_features_in`` array of finite non-boolean non-negative
+    int/float values; ``tol`` and every matrix coordinate are quantized
+    to 12 decimal places via ``Decimal(str(v))`` with ROUND_HALF_UP
+    (negative zero becomes ``0.000000000000``), and ``tol`` must remain
+    positive after quantization.
     """
     if isinstance(model, KMeans):
         try:
@@ -21984,6 +22006,14 @@ def dumps(model):
         except Exception as exc:
             raise ValueError("invalid KMedoids state") from exc
 
+    if isinstance(model, NMF):
+        try:
+            return _dumps_nmf(model)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("invalid NMF state") from exc
+
     raise ValueError(
         "dumps only supports fitted KMeans, PCA, LinearRegression, "
         "LogisticRegression, LassoRegression, ElasticNetRegression, "
@@ -21995,7 +22025,7 @@ def dumps(model):
         "GradientBoostingClassifier, "
         "GaussianMixture, KNeighborsRegressor, "
         "KNeighborsClassifier, AgglomerativeClustering, DBSCAN, "
-        "IsolationForest, and KMedoids models"
+        "IsolationForest, KMedoids, and NMF models"
     )
 
 
@@ -22134,6 +22164,93 @@ def _dumps_kmedoids(model):
         + indices_text
         + ',"cluster_centers":'
         + centers_text
+        + "}"
+    )
+
+
+def _dumps_nmf(model):
+    """Serialize a fitted NMF.
+
+    The top-level keys are ``class``, ``n_components``, ``max_iter``,
+    ``tol``, ``seed``, ``n_features_in``, ``components`` in that order;
+    ``class`` is ``"NMF"``. ``n_components``, ``max_iter`` and
+    ``n_features_in`` are positive exact JSON integers and ``seed`` is
+    an exact JSON integer. ``tol`` is a finite non-boolean positive
+    int/float and every ``components_`` element a finite non-boolean
+    non-negative int/float; both are quantized to 12 decimal places via
+    ``Decimal(str(v))`` with ROUND_HALF_UP (negative zero becomes
+    ``0.000000000000``), and ``tol`` must remain positive after
+    quantization. ``components_`` is a rectangular ``n_components`` by
+    ``n_features_in`` list of rows.
+    """
+    components = model.components_
+    n_features = model.n_features_in_
+    if components is None or n_features is None:
+        raise ValueError("NMF must be fitted before dumps is called")
+    n_components = model.n_components
+    max_iter = model.max_iter
+    tol = model.tol
+    seed = model.seed
+    # Re-validate the construction parameters exactly as __init__ does.
+    if (
+        type(n_components) is not int
+        or n_components <= 0
+        or type(max_iter) is not int
+        or max_iter <= 0
+        or not _is_valid_tol(tol)
+        or type(seed) is not int
+    ):
+        raise ValueError("NMF has invalid construction parameters")
+    if type(n_features) is not int or n_features <= 0:
+        raise ValueError("n_features_in must be a positive integer")
+
+    if not isinstance(components, list) or len(components) != n_components:
+        raise ValueError("components_ must be a list of n_components rows")
+    encoded_rows = []
+    for row in components:
+        if not isinstance(row, list) or len(row) != n_features:
+            raise ValueError(
+                "components_ must be a rectangular n_components by "
+                "n_features_in matrix"
+            )
+        encoded_values = []
+        for value in row:
+            if isinstance(value, bool) or type(value) not in (int, float):
+                raise ValueError(
+                    "components_ elements must be int or float"
+                )
+            try:
+                number = float(value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(
+                    "components_ elements must be finite numbers"
+                ) from exc
+            if not math.isfinite(number) or number < 0:
+                raise ValueError(
+                    "components_ elements must be finite and non-negative"
+                )
+            encoded_values.append(_quantize_fixed12(value))
+        encoded_rows.append("[" + ",".join(encoded_values) + "]")
+
+    tol_text = _quantize_fixed12(tol)
+    if Decimal(tol_text) == 0:
+        raise ValueError(
+            "tol must remain positive after quantization to 12 decimals"
+        )
+    components_text = "[" + ",".join(encoded_rows) + "]"
+    return (
+        '{"class":"NMF","n_components":'
+        + str(n_components)
+        + ',"max_iter":'
+        + str(max_iter)
+        + ',"tol":'
+        + tol_text
+        + ',"seed":'
+        + str(seed)
+        + ',"n_features_in":'
+        + str(n_features)
+        + ',"components":'
+        + components_text
         + "}"
     )
 
@@ -23816,6 +23933,63 @@ def _load_kmedoids(pairs):
     return model
 
 
+def _load_nmf(pairs):
+    keys = tuple(key for key, _ in pairs)
+    if keys != _SERIAL_KEYS_NMF:
+        raise ValueError(
+            "NMF JSON must have exactly the serialized keys "
+            "in the serialized order"
+        )
+    data = _convert(pairs)
+
+    class_name = data["class"]
+    if not isinstance(class_name, str) or class_name != "NMF":
+        raise ValueError('class must be "NMF"')
+
+    n_components = _expect_int(data["n_components"], "n_components")
+    max_iter = _expect_int(data["max_iter"], "max_iter")
+    tol = _expect_fixed12(data["tol"], "tol")
+    seed = _expect_int(data["seed"], "seed")
+    n_features = _expect_int(data["n_features_in"], "n_features_in")
+    if n_components <= 0:
+        raise ValueError("n_components must be greater than 0")
+    if max_iter <= 0:
+        raise ValueError("max_iter must be greater than 0")
+    if tol <= 0.0:
+        raise ValueError("tol must be greater than 0")
+    if n_features <= 0:
+        raise ValueError("n_features_in must be greater than 0")
+
+    components_node = data["components"]
+    if not isinstance(components_node, list) or len(components_node) != (
+        n_components
+    ):
+        raise ValueError("components must have n_components rows")
+    components = []
+    for row in components_node:
+        if not isinstance(row, list) or len(row) != n_features:
+            raise ValueError(
+                "components must be a rectangular n_components by "
+                "n_features_in array"
+            )
+        parsed_row = [
+            _expect_fixed12(value, "components element") for value in row
+        ]
+        for value in parsed_row:
+            if value < 0.0:
+                raise ValueError("components elements must be non-negative")
+        components.append(parsed_row)
+
+    model = NMF(
+        n_components=n_components, max_iter=max_iter, tol=tol, seed=seed
+    )
+    # Fresh lists so the fitted state never shares storage with the
+    # parsed payload.
+    model.components_ = [list(row) for row in components]
+    model.n_features_in_ = n_features
+    return model
+
+
 def _load_pca(pairs):
     keys = tuple(key for key, _ in pairs)
     if keys != _SERIAL_KEYS_PCA:
@@ -24848,14 +25022,14 @@ def loads(text):
     RandomForestRegressor, ExtraTreesRegressor, AdaBoostClassifier,
     GradientBoostingRegressor, GradientBoostingClassifier,
     GaussianMixture, KNeighborsRegressor, KNeighborsClassifier,
-    AgglomerativeClustering, DBSCAN, IsolationForest, or KMedoids
+    AgglomerativeClustering, DBSCAN, IsolationForest, KMedoids, or NMF
     from text produced by dumps.
 
     Only the exact byte format emitted by :func:`dumps` is accepted: a
     ``str`` holding compact JSON with no whitespace, no duplicate keys,
     the exact key sets in order, JSON integers for integer parameters,
     10-decimal fixed-point numbers for floats (12-decimal for
-    GaussianMixture), and consistent array shapes. Anything else --
+    GaussianMixture and NMF), and consistent array shapes. Anything else --
     including non-str input (str subclasses included), empty strings,
     parse failures, booleans, exponent notation, non-finite values, or
     illegal parameters -- raises ValueError. The returned model is
@@ -24908,7 +25082,13 @@ def loads(text):
     ``medoid_indices`` (length ``n_clusters``, pairwise distinct
     non-negative JSON integers) and a fresh rectangular
     ``n_clusters`` by ``n_features_in`` ``cluster_centers`` matrix of
-    finite fixed 10-decimal numbers.
+    finite fixed 10-decimal numbers. NMF is reconstructed from its four
+    construction fields (``n_components``, ``max_iter`` and
+    ``n_features_in`` positive JSON integers, ``seed`` a JSON integer),
+    a strictly positive fixed 12-decimal ``tol``, and a fresh
+    rectangular ``n_components`` by ``n_features_in`` ``components``
+    matrix of non-negative fixed 12-decimal numbers (copied rather than
+    shared), leaving the model fitted so ``transform`` works.
     The argument is not modified.
     """
     if type(text) is not str or len(text) == 0:
@@ -25102,6 +25282,13 @@ def loads(text):
     if class_entry == "KMedoids":
         try:
             return _load_kmedoids(pairs)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("malformed serialized model") from exc
+    if class_entry == "NMF":
+        try:
+            return _load_nmf(pairs)
         except ValueError:
             raise
         except Exception as exc:
