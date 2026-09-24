@@ -202,6 +202,9 @@ Exports:
         estimates at each evaluation time, using the
         inverse-probability-of-censoring weighting with the Kaplan-Meier
         estimator of the censoring distribution.
+    isolation_forest_score -- deterministic isolation-forest anomaly
+        score of each row of a finite real matrix, averaged over a
+        seeded forest of random isolation trees.
     dumps -- serialize a fitted KMeans/PCA/linear/scaler/tree/forest
         model (including MultinomialLogisticRegression,
         AgglomerativeClustering, and DBSCAN) to whitespace-free JSON
@@ -337,6 +340,7 @@ __all__ = [
     "integrated_brier_score",
     "cumulative_dynamic_auc",
     "survival_brier_score",
+    "isolation_forest_score",
     "dumps",
     "loads",
 ]
@@ -2177,6 +2181,146 @@ class RandomForestClassifier:
                     best_label = label
             results.append(best_label)
         return results
+
+
+class _IsolationTreeNode:
+    """Node of an isolation tree; leaves store only the sample count."""
+
+    __slots__ = ("count", "feature", "threshold", "left", "right")
+
+    def __init__(self, count):
+        self.count = count
+        self.feature = None
+        self.threshold = None
+        self.left = None
+        self.right = None
+
+
+def _isolation_c(s):
+    """Return the average path length of an unsuccessful binary search
+    tree lookup over ``s`` samples: ``c(1) = 0`` and, for ``s >= 2``,
+    ``c(s) = 2*H(s-1) - 2*(s-1)/s`` where ``H(m)`` is the ``math.fsum``
+    of ``1/k`` for ``k = 1..m``."""
+    if s == 1:
+        return 0.0
+    harmonic = math.fsum(1.0 / k for k in range(1, s))
+    return 2.0 * harmonic - 2.0 * (s - 1) / s
+
+
+def _isolation_tree_build(X, indices, depth, max_depth, width, rng):
+    node = _IsolationTreeNode(len(indices))
+    if depth >= max_depth or len(indices) == 1:
+        return node
+    features = []
+    for j in range(width):
+        first = X[indices[0]][j]
+        for i in indices[1:]:
+            if X[i][j] != first:
+                features.append(j)
+                break
+    if not features:
+        return node
+    feature = rng.choice(features)
+    values = sorted(set(X[i][feature] for i in indices))
+    threshold = rng.choice(values[:-1])
+    left = [i for i in indices if X[i][feature] <= threshold]
+    right = [i for i in indices if X[i][feature] > threshold]
+    node.feature = feature
+    node.threshold = threshold
+    node.left = _isolation_tree_build(
+        X, left, depth + 1, max_depth, width, rng
+    )
+    node.right = _isolation_tree_build(
+        X, right, depth + 1, max_depth, width, rng
+    )
+    return node
+
+
+def _isolation_path(node, row, c_values):
+    """Return the path length of ``row``: the depth of the leaf it
+    reaches plus ``c`` of the leaf's sample count."""
+    depth = 0
+    while node.feature is not None:
+        depth += 1
+        if row[node.feature] <= node.threshold:
+            node = node.left
+        else:
+            node = node.right
+    return depth + c_values[node.count]
+
+
+def isolation_forest_score(X, n_estimators=100, max_samples=256, seed=0):
+    """Return the isolation-forest anomaly score of each row of ``X``.
+
+    ``n_estimators`` and ``max_samples`` must be exact integers with
+    ``n_estimators > 0`` and ``max_samples >= 2``, and ``seed`` must be
+    an exact integer. ``X`` is validated like ``RandomForestClassifier``
+    training data and must have at least ``max_samples`` rows; any
+    violation raises ValueError.
+
+    Let ``T = n_estimators``, ``psi = max_samples``, ``F = math.fsum``
+    and ``rng = random.Random(seed)``. Each of the ``T`` trees draws its
+    subsample as ``rng.sample(range(n), psi)`` and is grown from depth 0:
+    a node becomes a leaf (storing its sample count) when it reaches
+    depth ``ceil(log2(psi))``, holds a single sample, or every column is
+    constant; otherwise ``rng.choice`` first picks a feature from the
+    ascending list of non-constant features and then a threshold from
+    that column's distinct ascending values except the maximum, with
+    ``x <= t`` going left and the rest right, recursing left before
+    right. The path length of a sample is the depth of the leaf it
+    reaches plus ``c`` of the leaf's sample count, and its score is
+    ``2 ** (-F(paths in tree order) / T / c(psi))``. Scores come back as
+    floats in input order with zero written as ``+0.0``; any
+    OverflowError, ValueError, ZeroDivisionError or non-finite result
+    after validation raises FloatingPointError. ``X`` is not modified
+    and the same arguments always give the same result.
+    """
+    if type(n_estimators) is not int:
+        raise ValueError("n_estimators must be an integer")
+    if n_estimators <= 0:
+        raise ValueError("n_estimators must be greater than 0")
+    if type(max_samples) is not int:
+        raise ValueError("max_samples must be an integer")
+    if max_samples < 2:
+        raise ValueError("max_samples must be at least 2")
+    if type(seed) is not int:
+        raise ValueError("seed must be an integer")
+    width = _check_tree_matrix(X)
+    if len(X) < max_samples:
+        raise ValueError("X must have at least max_samples rows")
+
+    try:
+        n = len(X)
+        rng = random.Random(seed)
+        max_depth = math.ceil(math.log2(max_samples))
+        c_values = [0.0] + [
+            _isolation_c(s) for s in range(1, max_samples + 1)
+        ]
+        c_psi = c_values[max_samples]
+        paths = [[] for _ in range(n)]
+        for _ in range(n_estimators):
+            indices = rng.sample(range(n), max_samples)
+            tree = _isolation_tree_build(
+                X, indices, 0, max_depth, width, rng
+            )
+            for i in range(n):
+                paths[i].append(_isolation_path(tree, X[i], c_values))
+        scores = []
+        for sample_paths in paths:
+            score = 2.0 ** (
+                -math.fsum(sample_paths) / n_estimators / c_psi
+            )
+            if not math.isfinite(score):
+                raise FloatingPointError(
+                    "non-finite value encountered during isolation"
+                    " forest scoring"
+                )
+            scores.append(_positive_zero(score))
+        return scores
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during isolation forest scoring"
+        ) from exc
 
 
 class AdaBoostClassifier:
