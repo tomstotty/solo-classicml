@@ -197,6 +197,7 @@ __all__ = [
     "GradientBoostingRegressor",
     "GradientBoostingClassifier",
     "LassoRegression",
+    "ElasticNetRegression",
     "StandardScaler",
     "KMeans",
     "PCA",
@@ -2517,6 +2518,28 @@ def _require_exact_positive_or_finite_float(value, name):
     )
 
 
+def _require_unit_interval_float(value, name):
+    """Validate an ElasticNet mixing parameter in the closed interval
+    ``[0, 1]``.
+
+    The value must be an exact ``int`` or a finite ``float`` (booleans
+    and subclasses are rejected) and lie in ``[0, 1]``; anything else is
+    ValueError.
+    """
+    if type(value) not in (int, float) or isinstance(value, bool):
+        raise ValueError(
+            "%s must be a finite non-boolean number in [0, 1]" % name
+        )
+    if type(value) is float and not math.isfinite(value):
+        raise ValueError(
+            "%s must be a finite non-boolean number in [0, 1]" % name
+        )
+    if value < 0 or value > 1:
+        raise ValueError(
+            "%s must be a finite non-boolean number in [0, 1]" % name
+        )
+
+
 def _is_exact_int_or_finite_float(value):
     """Return True for an exact int of any magnitude or a finite
     non-boolean float; booleans, subclasses and other types return False.
@@ -3377,6 +3400,177 @@ class LassoRegression:
         except (OverflowError, ValueError, ZeroDivisionError) as exc:
             raise FloatingPointError(
                 "non-finite value encountered during lasso regression"
+            ) from exc
+
+        self.w = w
+        self.b = b
+        return self
+
+    def predict(self, X):
+        if self.w is None or self.b is None:
+            raise ValueError("model must be fitted before predict is called")
+        # Integers of any magnitude are structurally legal input; only an
+        # arithmetic failure below rejects such a row.
+        width = _check_lasso_matrix(X)
+        if width != len(self.w):
+            raise ValueError(
+                "X must have the same number of features as the training data"
+            )
+
+        results = []
+        for row in X:
+            try:
+                prediction = (
+                    math.fsum(self.w[j] * row[j] for j in range(width))
+                    + self.b
+                )
+            except (
+                OverflowError,
+                ValueError,
+                ZeroDivisionError,
+            ) as exc:
+                raise FloatingPointError(
+                    "non-finite prediction encountered"
+                ) from exc
+            if not math.isfinite(prediction):
+                raise FloatingPointError("non-finite prediction encountered")
+            results.append(_positive_zero(prediction))
+        return results
+
+
+class ElasticNetRegression:
+    """Linear regression with a combined L1/L2 penalty, fitted by
+    coordinate descent.
+
+    Construction mirrors :class:`LassoRegression` with an additional
+    ``l1_ratio`` mixing parameter in the closed interval ``[0, 1]``.
+    Training starts from ``w = [0.0] * n_features`` and
+    ``b = fsum(y) / n``. Each round first sets the intercept to
+    ``b = fsum(y_i - fsum(w_j * x_ij)) / n`` and then visits the
+    features ``j`` in ascending order. For each feature it computes
+    ``r = fsum(x_ij * (y_i - b - fsum(w_k * x_ik for k != j))) / n``,
+    ``z = fsum(x_ij ** 2) / n + alpha * (1 - l1_ratio)`` and
+    ``q = alpha * l1_ratio``. When ``z`` is zero the weight becomes
+    ``0.0``; otherwise the soft-thresholded value is ``(r - q) / z``
+    when ``r > q``, ``(r + q) / z`` when ``r < -q`` and ``0``
+    otherwise. Every sum iterates over indices in ascending order and
+    uses ``math.fsum``. Training stops after a round whose largest
+    absolute change in ``b`` or any weight is at most ``tol``, and in
+    any case after at most ``max_iter`` rounds. No randomness is used.
+    """
+
+    def __init__(self, alpha=1.0, l1_ratio=0.5, max_iter=1000, tol=1e-8):
+        # As with LassoRegression, alpha/tol accept an exact int of any
+        # magnitude (only their use against finite float arithmetic
+        # decides whether it overflows) or a strictly positive finite
+        # float; booleans and subclasses are rejected without ever
+        # converting the int through float.
+        _require_exact_positive_or_finite_float(alpha, "alpha")
+        _require_unit_interval_float(l1_ratio, "l1_ratio")
+        if type(max_iter) is not int or max_iter <= 0:
+            raise ValueError("max_iter must be a positive integer")
+        _require_exact_positive_or_finite_float(tol, "tol")
+
+        self.alpha = alpha
+        self.l1_ratio = l1_ratio
+        self.max_iter = max_iter
+        self.tol = tol
+        self.w = None
+        self.b = None
+
+    def fit(self, X, y):
+        # Clear any previous fit up front so that a failed validation or
+        # computation leaves the model unfitted.
+        self.w = None
+        self.b = None
+        width = _check_lasso_matrix(X)
+        _check_lasso_target(y, len(X))
+
+        n = len(X)
+        w = [0.0] * width
+        try:
+            b = math.fsum(y) / n
+        except (OverflowError, ValueError, ZeroDivisionError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during elastic net "
+                "regression"
+            ) from exc
+        if not math.isfinite(b):
+            raise FloatingPointError(
+                "non-finite value encountered during elastic net "
+                "regression"
+            )
+        b = _positive_zero(b)
+        alpha = self.alpha
+        l1_ratio = self.l1_ratio
+        tol = self.tol
+
+        try:
+            for _ in range(self.max_iter):
+                previous_b = b
+                b = math.fsum(
+                    y[i]
+                    - math.fsum(w[j] * X[i][j] for j in range(width))
+                    for i in range(n)
+                ) / n
+                if not math.isfinite(b):
+                    raise FloatingPointError(
+                        "non-finite value encountered during elastic net "
+                        "regression"
+                    )
+                max_change = abs(b - previous_b)
+
+                for j in range(width):
+                    previous_w = w[j]
+                    r = math.fsum(
+                        X[i][j]
+                        * (
+                            y[i]
+                            - b
+                            - math.fsum(
+                                w[k] * X[i][k]
+                                for k in range(width)
+                                if k != j
+                            )
+                        )
+                        for i in range(n)
+                    ) / n
+                    z = (
+                        math.fsum(X[i][j] ** 2 for i in range(n)) / n
+                        + alpha * (1 - l1_ratio)
+                    )
+                    q = alpha * l1_ratio
+                    if not math.isfinite(r) or not math.isfinite(z):
+                        raise FloatingPointError(
+                            "non-finite value encountered during elastic "
+                            "net regression"
+                        )
+                    if z == 0.0:
+                        updated = 0.0
+                    else:
+                        if r > q:
+                            updated = (r - q) / z
+                        elif r < -q:
+                            updated = (r + q) / z
+                        else:
+                            updated = 0.0
+                        if not math.isfinite(updated):
+                            raise FloatingPointError(
+                                "non-finite value encountered during "
+                                "elastic net regression"
+                            )
+                    w[j] = updated
+                    change = abs(updated - previous_w)
+                    if change > max_change:
+                        max_change = change
+
+                b = _positive_zero(b)
+                if max_change <= tol:
+                    break
+        except (OverflowError, ValueError, ZeroDivisionError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during elastic net "
+                "regression"
             ) from exc
 
         self.w = w
@@ -15206,9 +15400,10 @@ def dumps(model):
     elements and ``b`` are exact ints or finite floats. Every number is
     quantized to 10 decimal places via ``Decimal(str(v))`` with
     ROUND_HALF_UP (never through ``float`` first; negative zero becomes
-    ``0.0000000000``); the fixed text must convert back with ``float``
-    to exactly the original finite value, and ``alpha``/``tol`` must
-    remain positive.
+    ``0.0000000000``); the fixed text of each ``w`` element and of ``b``
+    must convert back with ``float`` to exactly the original finite
+    value, while ``alpha``/``tol`` only need to read back as finite
+    strictly positive floats.
 
     For MultinomialLogisticRegression the top-level keys are ``class``,
     ``lr``, ``l2``, ``max_iter``, ``tol``, ``classes``, ``W``, ``b`` in
@@ -15583,10 +15778,12 @@ def _dumps_lasso(model):
     finite float (booleans and subclasses rejected). Every number is
     formatted via ``Decimal(str(v))`` quantized to 10 decimal places with
     ROUND_HALF_UP (negative zero becomes ``0.0000000000``), never passing
-    the original value through ``float`` first; the fixed text must
-    convert back with ``float`` to a finite number exactly equal to the
-    original value, and ``alpha``/``tol`` must remain positive, or dumps
-    raises ValueError.
+    the original value through ``float`` first. The fixed text of each
+    ``w`` coordinate and of ``b`` must convert back with ``float`` to a
+    finite number exactly equal to the original value, while
+    ``alpha``/``tol`` only need to read back as finite strictly
+    positive floats (their quantized text may differ from the original
+    value); anything else raises ValueError.
     """
     w = model.w
     b = model.b
@@ -15604,8 +15801,12 @@ def _dumps_lasso(model):
     if type(max_iter) is not int or max_iter <= 0:
         raise ValueError("model has invalid construction parameters")
 
-    alpha_text = _quantize_lasso_number(alpha, "alpha", positive=True)
-    tol_text = _quantize_lasso_number(tol, "tol", positive=True)
+    alpha_text = _quantize_lasso_number(
+        alpha, "alpha", positive=True, exact=False
+    )
+    tol_text = _quantize_lasso_number(
+        tol, "tol", positive=True, exact=False
+    )
 
     if not isinstance(w, list) or len(w) == 0:
         raise ValueError("w must be a non-empty list")
@@ -15633,15 +15834,18 @@ def _dumps_lasso(model):
     )
 
 
-def _quantize_lasso_number(value, name, positive=False):
+def _quantize_lasso_number(value, name, positive=False, exact=True):
     """Quantize an exact int/float to its canonical 10-decimal JSON form.
 
     Unlike :func:`_quantize_fixed`, the value is never converted through
     ``float`` beforehand: ``Decimal(str(value))`` carries an exact int of
     arbitrary magnitude into the ROUND_HALF_UP quantization, and negative
     zero becomes ``0.0000000000``. The resulting text must convert back
-    with ``float`` to a finite number exactly equal to ``value`` (and,
-    when ``positive`` is set, strictly positive); anything else is a
+    with ``float`` to a finite number; when ``exact`` is set (used for
+    the fitted ``w`` coordinates and ``b``) it must also equal
+    ``value``, while the construction parameters ``alpha``/``tol`` only
+    need to read back as strictly positive finite floats (their
+    quantized value may differ from the original). Anything else is a
     ValueError.
     """
     if isinstance(value, bool) or type(value) not in (int, float):
@@ -15665,7 +15869,11 @@ def _quantize_lasso_number(value, name, positive=False):
         raise ValueError(
             "%s must equal its float serialization" % name
         ) from exc
-    if not math.isfinite(converted) or converted != value:
+    if not math.isfinite(converted):
+        raise ValueError(
+            "%s must equal its float serialization" % name
+        )
+    if exact and converted != value:
         raise ValueError(
             "%s must equal its float serialization" % name
         )
