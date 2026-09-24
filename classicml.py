@@ -37,6 +37,9 @@ Exports:
         single, complete, or average linkage.
     GaussianMixture -- deterministic one-dimensional Gaussian mixture
         model fitted by expectation-maximization from sorted initial means.
+    IsolationForest -- deterministic isolation-forest anomaly detector
+        with a reusable fitted forest and a contamination-driven
+        decision threshold.
     accuracy_score -- fraction of positions where two integer label
         vectors agree.
     mean_squared_error -- weighted mean of squared element-wise
@@ -260,6 +263,7 @@ __all__ = [
     "DBSCAN",
     "AgglomerativeClustering",
     "GaussianMixture",
+    "IsolationForest",
     "accuracy_score",
     "mean_squared_error",
     "root_mean_squared_error",
@@ -2253,6 +2257,50 @@ def _isolation_path(node, row, c_values):
     return depth + c_values[node.count]
 
 
+def _isolation_forest_trees(X, n_estimators, max_samples, seed):
+    """Build the seeded forest of ``n_estimators`` isolation trees over
+    ``X`` exactly as ``isolation_forest_score`` does, and return the
+    trees together with the table of ``c`` values up to
+    ``max_samples``."""
+    n = len(X)
+    width = len(X[0])
+    rng = random.Random(seed)
+    max_depth = math.ceil(math.log2(max_samples))
+    c_values = [0.0] + [
+        _isolation_c(s) for s in range(1, max_samples + 1)
+    ]
+    trees = []
+    for _ in range(n_estimators):
+        indices = rng.sample(range(n), max_samples)
+        trees.append(
+            _isolation_tree_build(X, indices, 0, max_depth, width, rng)
+        )
+    return trees, c_values
+
+
+def _isolation_forest_score_rows(trees, X, c_values):
+    """Return the isolation-forest anomaly score of each row of ``X``
+    against ``trees``: ``2 ** (-F(paths in tree order) / T / c(psi))``
+    with zero written as ``+0.0``."""
+    c_psi = c_values[len(c_values) - 1]
+    scores = []
+    for row in X:
+        score = 2.0 ** (
+            -math.fsum(
+                _isolation_path(tree, row, c_values) for tree in trees
+            )
+            / len(trees)
+            / c_psi
+        )
+        if not math.isfinite(score):
+            raise FloatingPointError(
+                "non-finite value encountered during isolation"
+                " forest scoring"
+            )
+        scores.append(_positive_zero(score))
+    return scores
+
+
 def isolation_forest_score(X, n_estimators=100, max_samples=256, seed=0):
     """Return the isolation-forest anomaly score of each row of ``X``.
 
@@ -2289,45 +2337,22 @@ def isolation_forest_score(X, n_estimators=100, max_samples=256, seed=0):
         raise ValueError("max_samples must be at least 2")
     if type(seed) is not int:
         raise ValueError("seed must be an integer")
-    width = _check_tree_matrix(X)
+    _check_tree_matrix(X)
     if len(X) < max_samples:
         raise ValueError("X must have at least max_samples rows")
 
     try:
-        n = len(X)
-        rng = random.Random(seed)
-        max_depth = math.ceil(math.log2(max_samples))
-        c_values = [0.0] + [
-            _isolation_c(s) for s in range(1, max_samples + 1)
-        ]
-        c_psi = c_values[max_samples]
-        paths = [[] for _ in range(n)]
-        for _ in range(n_estimators):
-            indices = rng.sample(range(n), max_samples)
-            tree = _isolation_tree_build(
-                X, indices, 0, max_depth, width, rng
-            )
-            for i in range(n):
-                paths[i].append(_isolation_path(tree, X[i], c_values))
-        scores = []
-        for sample_paths in paths:
-            score = 2.0 ** (
-                -math.fsum(sample_paths) / n_estimators / c_psi
-            )
-            if not math.isfinite(score):
-                raise FloatingPointError(
-                    "non-finite value encountered during isolation"
-                    " forest scoring"
-                )
-            scores.append(_positive_zero(score))
-        return scores
+        trees, c_values = _isolation_forest_trees(
+            X, n_estimators, max_samples, seed
+        )
+        return _isolation_forest_score_rows(trees, X, c_values)
     except (OverflowError, ValueError, ZeroDivisionError) as exc:
         raise FloatingPointError(
             "non-finite value encountered during isolation forest scoring"
         ) from exc
 
 
-def local_outlier_factor_score(X, n_neighbors=20) -> "list[float]":
+def local_outlier_factor_score(X, n_neighbors=20) -> list[float]:
     """Return the local outlier factor (LOF) of each row of ``X``.
 
     ``n_neighbors`` must be an exact integer ``k`` with
@@ -2426,6 +2451,131 @@ def local_outlier_factor_score(X, n_neighbors=20) -> "list[float]":
             "non-finite value encountered during local outlier factor"
             " scoring"
         ) from exc
+
+
+class IsolationForest:
+    """Deterministic isolation-forest anomaly detector.
+
+    ``n_estimators`` and ``max_samples`` must be exact integers with
+    ``n_estimators > 0`` and ``max_samples >= 2``, ``seed`` must be an
+    exact integer, and ``contamination`` must be the string ``"auto"``
+    or a finite value of type exactly ``int`` or ``float`` (booleans
+    and subclasses are rejected) with ``0 < contamination <= 0.5``;
+    any violation raises ValueError.
+
+    ``fit(X)`` validates ``X`` like ``isolation_forest_score`` and
+    requires at least ``max_samples`` rows, grows the same seeded
+    forest (subsample order, depth limit, ``c`` table and scoring are
+    identical to that function), and scores the training rows. The
+    decision threshold ``threshold_`` is ``0.5`` when
+    ``contamination == "auto"``; otherwise, with
+    ``m = ceil(contamination * len(X))``, it is the ``m``-th entry of
+    the training scores sorted in descending order. ``fit`` clears all
+    learned state first, so a failed ``fit`` leaves the model
+    unfitted, and returns ``self``.
+
+    ``score_samples(X)`` scores a non-empty matrix with the same
+    number of columns as the training data using the saved trees and
+    returns the scores as a list of floats in input order with zero
+    written as ``+0.0``; calling it before ``fit``, with invalid
+    ``X``, or with a different column count raises ValueError.
+    ``predict(X)`` returns a list of ints with ``-1`` where the score
+    is at least ``threshold_`` and ``1`` otherwise. Any OverflowError,
+    ValueError, ZeroDivisionError or non-finite result after
+    validation raises FloatingPointError. ``X`` is not modified and
+    the same arguments always give the same result.
+    """
+
+    def __init__(
+        self, n_estimators=100, max_samples=256,
+        contamination="auto", seed=0,
+    ):
+        if type(n_estimators) is not int:
+            raise ValueError("n_estimators must be an integer")
+        if n_estimators <= 0:
+            raise ValueError("n_estimators must be greater than 0")
+        if type(max_samples) is not int:
+            raise ValueError("max_samples must be an integer")
+        if max_samples < 2:
+            raise ValueError("max_samples must be at least 2")
+        if type(seed) is not int:
+            raise ValueError("seed must be an integer")
+        if contamination != "auto":
+            if type(contamination) not in (int, float) or not math.isfinite(
+                contamination
+            ):
+                raise ValueError(
+                    'contamination must be "auto" or a finite'
+                    " non-boolean number"
+                )
+            if not 0 < contamination <= 0.5:
+                raise ValueError("contamination must be in (0, 0.5]")
+        self.n_estimators = n_estimators
+        self.max_samples = max_samples
+        self.contamination = contamination
+        self.seed = seed
+        self._trees = None
+        self._c_values = None
+        self._n_features = None
+        self.threshold_ = None
+
+    def fit(self, X):
+        self._trees = None
+        self._c_values = None
+        self._n_features = None
+        self.threshold_ = None
+        width = _check_tree_matrix(X)
+        if len(X) < self.max_samples:
+            raise ValueError("X must have at least max_samples rows")
+
+        try:
+            trees, c_values = _isolation_forest_trees(
+                X, self.n_estimators, self.max_samples, self.seed
+            )
+            scores = _isolation_forest_score_rows(trees, X, c_values)
+        except (OverflowError, ValueError, ZeroDivisionError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during isolation forest"
+                " scoring"
+            ) from exc
+
+        if self.contamination == "auto":
+            threshold = 0.5
+        else:
+            m = math.ceil(self.contamination * len(X))
+            threshold = sorted(scores, reverse=True)[m - 1]
+        self._trees = trees
+        self._c_values = c_values
+        self._n_features = width
+        self.threshold_ = threshold
+        return self
+
+    def score_samples(self, X):
+        if self._trees is None:
+            raise ValueError(
+                "model must be fitted before score_samples is called"
+            )
+        width = _check_tree_matrix(X)
+        if width != self._n_features:
+            raise ValueError(
+                "X must have the same number of features as the training"
+                " data"
+            )
+        try:
+            return _isolation_forest_score_rows(
+                self._trees, X, self._c_values
+            )
+        except (OverflowError, ValueError, ZeroDivisionError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during isolation forest"
+                " scoring"
+            ) from exc
+
+    def predict(self, X):
+        scores = self.score_samples(X)
+        return [
+            -1 if score >= self.threshold_ else 1 for score in scores
+        ]
 
 
 class AdaBoostClassifier:
