@@ -194,6 +194,10 @@ Exports:
         probability estimates at evaluation times, using the
         inverse-probability-of-censoring weighting with the Kaplan-Meier
         estimator of the censoring distribution.
+    survival_brier_score -- Brier score of survival probability
+        estimates at each evaluation time, using the
+        inverse-probability-of-censoring weighting with the Kaplan-Meier
+        estimator of the censoring distribution.
     cumulative_dynamic_auc -- cumulative/dynamic AUC of risk scores at
         evaluation times, using inverse-probability-of-censoring
         weighting with the Kaplan-Meier estimator of the censoring
@@ -331,6 +335,7 @@ __all__ = [
     "weighted_interval_score",
     "concordance_index",
     "integrated_brier_score",
+    "survival_brier_score",
     "cumulative_dynamic_auc",
     "dumps",
     "loads",
@@ -18635,6 +18640,248 @@ def integrated_brier_score(
 integrated_brier_score.__annotations__["return"] = float
 
 
+def survival_brier_score(
+    event_time, event_observed, survival_prob, times
+) -> list[float]:
+    """Return the Brier score of survival predictions at each time.
+
+    ``event_time`` (``T``) must be a non-empty list of finite
+    non-negative values of type exactly ``int`` or ``float`` (booleans
+    are rejected). ``event_observed`` (``E``) must be a list of the same
+    length whose elements are exactly the integers ``0`` or ``1``
+    (booleans are rejected); ``1`` marks an observed event and ``0`` a
+    censoring. ``times`` (``t``) must be a non-empty list of finite
+    non-negative values of type exactly ``int`` or ``float`` in strictly
+    increasing order. ``survival_prob`` (``S``) must be a
+    ``len(T)`` by ``len(t)`` two-dimensional list whose entries are
+    finite values of type exactly ``int`` or ``float`` in ``[0, 1]``;
+    each row must be non-increasing. Any container, length, type,
+    range, ordering, or finiteness violation (including
+    ``OverflowError`` raised by ``math.isfinite``) raises ValueError.
+
+    After validation all values are converted to ``float``. For the
+    sorted unique event times ``u``, the Kaplan-Meier estimator of the
+    censoring distribution is built as ``R = #(T >= u)``,
+    ``D = #(T == u and E == 0)`` and
+    ``G(u) = G(u-) * (1 - D / R)`` starting from ``G = 1``; the
+    estimator is right-continuous and ``G(T_i-)`` is retained for every
+    sample. At each evaluation time ``t_j`` the Brier score is the
+    ``math.fsum`` over samples in ascending order of
+    ``E_i * I(T_i <= t_j) * S_ij**2 / G(T_i-)`` plus
+    ``I(T_i > t_j) * (1 - S_ij)**2 / G(t_j)``, divided by the number of
+    samples; ``G(t_j)`` is the right-continuous step value of the
+    estimator. A required censoring probability that is less than or
+    equal to zero raises ValueError.
+
+    Overflow, invalid operations, or division by zero during the
+    post-validation conversion, the Kaplan-Meier computation, the
+    arithmetic, the squaring, or the summation, and non-finite
+    intermediate values or results, raise FloatingPointError. An exact
+    zero result is normalized to positive ``0.0``. The return value is
+    a list of floats, one per evaluation time, in the order of
+    ``times``. The inputs are not modified. Deterministic: same inputs,
+    same result.
+    """
+    if not isinstance(event_time, list) or not isinstance(event_observed, list):
+        raise ValueError("event_time and event_observed must be lists")
+    n = len(event_time)
+    if n == 0:
+        raise ValueError("event_time must be a non-empty list")
+    if len(event_observed) != n:
+        raise ValueError(
+            "event_observed must have the same length as event_time"
+        )
+    for value in event_time:
+        if type(value) not in (int, float):
+            raise ValueError(
+                "event_time must contain only finite non-boolean numbers"
+            )
+        # math.isfinite raises OverflowError for ints too large to
+        # convert to float; such values fail the finite requirement.
+        try:
+            finite = math.isfinite(value)
+        except OverflowError as exc:
+            raise ValueError(
+                "event_time must contain only finite non-boolean numbers"
+            ) from exc
+        if not finite:
+            raise ValueError(
+                "event_time must contain only finite non-boolean numbers"
+            )
+        if value < 0:
+            raise ValueError("event_time must contain only non-negative values")
+    for value in event_observed:
+        if type(value) is not int or value not in (0, 1):
+            raise ValueError("event_observed must contain only 0 or 1")
+
+    if not isinstance(times, list) or len(times) == 0:
+        raise ValueError("times must be a non-empty list")
+    previous_time = None
+    for value in times:
+        if type(value) not in (int, float):
+            raise ValueError(
+                "times must contain only finite non-boolean numbers"
+            )
+        try:
+            finite = math.isfinite(value)
+        except OverflowError as exc:
+            raise ValueError(
+                "times must contain only finite non-boolean numbers"
+            ) from exc
+        if not finite:
+            raise ValueError(
+                "times must contain only finite non-boolean numbers"
+            )
+        if value < 0:
+            raise ValueError("times must contain only non-negative values")
+        if previous_time is not None and not value > previous_time:
+            raise ValueError("times must be strictly increasing")
+        previous_time = value
+
+    if not isinstance(survival_prob, list) or len(survival_prob) != n:
+        raise ValueError(
+            "survival_prob must be a list with one row per event time"
+        )
+    m = len(times)
+    for row in survival_prob:
+        if not isinstance(row, list) or len(row) != m:
+            raise ValueError(
+                "each survival_prob row must have one value per time"
+            )
+        previous_prob = None
+        for value in row:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "survival_prob must contain only finite non-boolean "
+                    "numbers in [0, 1]"
+                )
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "survival_prob must contain only finite non-boolean "
+                    "numbers in [0, 1]"
+                ) from exc
+            if not finite or value < 0 or value > 1:
+                raise ValueError(
+                    "survival_prob must contain only finite non-boolean "
+                    "numbers in [0, 1]"
+                )
+            if previous_prob is not None and value > previous_prob:
+                raise ValueError(
+                    "each survival_prob row must be non-increasing"
+                )
+            previous_prob = value
+
+    def non_finite():
+        return FloatingPointError(
+            "non-finite value encountered during survival brier score"
+        )
+
+    try:
+        event_times = [float(value) for value in event_time]
+        eval_times = [float(value) for value in times]
+        survival = [[float(value) for value in row] for row in survival_prob]
+    except (OverflowError, ValueError) as exc:
+        raise non_finite() from exc
+    for value in event_times:
+        if not math.isfinite(value):
+            raise non_finite()
+    for value in eval_times:
+        if not math.isfinite(value):
+            raise non_finite()
+    for row in survival:
+        for value in row:
+            if not math.isfinite(value):
+                raise non_finite()
+
+    # Kaplan-Meier estimator G of the censoring distribution:
+    # g_before[u] is G(u-) and g_after[u] is G(u).
+    unique_times = sorted(set(event_times))
+    g_before = {}
+    g_after = {}
+    g = 1.0
+    for u in unique_times:
+        g_before[u] = g
+        at_risk = 0
+        censored = 0
+        for i in range(n):
+            if event_times[i] >= u:
+                at_risk += 1
+            if event_times[i] == u and event_observed[i] == 0:
+                censored += 1
+        try:
+            g = g * (1.0 - censored / at_risk)
+        except (OverflowError, ValueError, ZeroDivisionError) as exc:
+            raise non_finite() from exc
+        if not math.isfinite(g):
+            raise non_finite()
+        g_after[u] = g
+
+    def g_at(value):
+        # Right-continuous step value: largest unique time <= value.
+        lo, hi = 0, len(unique_times)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if unique_times[mid] <= value:
+                lo = mid + 1
+            else:
+                hi = mid
+        if lo == 0:
+            return 1.0
+        return g_after[unique_times[lo - 1]]
+
+    brier = []
+    for j in range(m):
+        t_j = eval_times[j]
+        g_tj = None
+        terms = []
+        for i in range(n):
+            s_ij = survival[i][j]
+            term = 0.0
+            if event_observed[i] == 1 and event_times[i] <= t_j:
+                weight = g_before[event_times[i]]
+                if weight <= 0.0:
+                    raise ValueError(
+                        "the censoring survival probability must be "
+                        "greater than 0"
+                    )
+                try:
+                    term = term + (s_ij * s_ij) / weight
+                except (OverflowError, ValueError, ZeroDivisionError) as exc:
+                    raise non_finite() from exc
+            if event_times[i] > t_j:
+                if g_tj is None:
+                    g_tj = g_at(t_j)
+                    if g_tj <= 0.0:
+                        raise ValueError(
+                            "the censoring survival probability must be "
+                            "greater than 0"
+                        )
+                try:
+                    term = term + ((1.0 - s_ij) * (1.0 - s_ij)) / g_tj
+                except (OverflowError, ValueError, ZeroDivisionError) as exc:
+                    raise non_finite() from exc
+            if not math.isfinite(term):
+                raise non_finite()
+            terms.append(term)
+        try:
+            b_j = math.fsum(terms) / n
+        except (OverflowError, ValueError, ZeroDivisionError) as exc:
+            raise non_finite() from exc
+        if not math.isfinite(b_j):
+            raise non_finite()
+        if b_j == 0:
+            b_j = 0.0
+        brier.append(b_j)
+    return brier
+
+
+# ``from __future__ import annotations`` stores annotations as strings;
+# expose the builtin generic as the runtime return annotation.
+survival_brier_score.__annotations__["return"] = list[float]
+
+
 def cumulative_dynamic_auc(
     event_time, event_observed, risk_score, times
 ) -> list[float]:
@@ -18664,7 +18911,7 @@ def cumulative_dynamic_auc(
     with ``w_i = 1 / G(T_i-)`` the sums are scanned with ``i`` outer
     and ``j`` inner: ``math.fsum`` computes ``W`` as the sum of ``w_i``
     repeated once per control and ``C`` as the sum of ``w_i`` when
-    ``R_i > R_j``, ``0.5 * w_i`` when ``R_i == R_j``, and nothing
+    ``R_i > R_j``, ``0.5 * w_i`` when ``R_i == R_j``, and ``0.0``
     otherwise. The result at that time is ``C / W``. No cases, no
     controls, a required censoring probability less than or equal to
     zero, or ``W <= 0`` raises ValueError.
@@ -18837,6 +19084,8 @@ def cumulative_dynamic_auc(
                         concordant_terms.append(0.5 * w_i)
                     except (OverflowError, ValueError) as exc:
                         raise non_finite() from exc
+                else:
+                    concordant_terms.append(0.0)
         try:
             total_weight = math.fsum(total_terms)
         except (OverflowError, ValueError) as exc:
