@@ -5,6 +5,8 @@ Exports:
         an optional L2 (ridge) penalty, trained by full-batch gradient descent.
     LogisticRegression -- deterministic binary logistic regression with an
         optional L2 penalty, trained by full-batch gradient descent.
+    LassoRegression -- deterministic L1-penalized (lasso) linear
+        regression trained by cyclic coordinate descent.
     MultinomialLogisticRegression -- deterministic softmax multi-class
         logistic regression with an optional L2 penalty, trained by
         full-batch gradient descent.
@@ -186,6 +188,7 @@ from fractions import Fraction
 __all__ = [
     "LinearRegression",
     "LogisticRegression",
+    "LassoRegression",
     "MultinomialLogisticRegression",
     "KNeighborsClassifier",
     "KNeighborsRegressor",
@@ -3190,6 +3193,163 @@ class GradientBoostingClassifier:
                     "non-finite value encountered during gradient boosting"
                 )
             results.append([_positive_zero(negative), _positive_zero(p)])
+        return results
+
+
+class LassoRegression:
+    """Deterministic L1-penalized (lasso) linear regression fitted by
+    cyclic coordinate descent.
+
+    Training minimizes the mean squared error plus ``alpha`` times the
+    L1 norm of the weights; the intercept is not penalized. The weights
+    start at zero and the intercept at ``math.fsum(y) / n``. Each round
+    first updates the intercept to the sample mean of the residuals,
+    ``b = fsum(y_i - fsum(w_j * x_ij over j) over i) / n``, and then
+    sweeps the features in ascending index order, updating each weight
+    in place from the current values of the others: with
+    ``r = fsum(x_ij * (y_i - b - fsum(w_k * x_ik over k != j)) over i)
+    / n`` and ``z = fsum(x_ij ** 2 over i) / n``, a zero ``z`` sets
+    ``w_j = 0.0``; otherwise soft-thresholding takes ``s = r - alpha``
+    when ``r > alpha``, ``s = r + alpha`` when ``r < -alpha`` and
+    ``s = 0`` otherwise, and ``w_j = s / z``. Every summation is a
+    ``math.fsum`` in ascending index order. Training stops after a round
+    whose largest absolute change of the intercept and the weights is at
+    most ``tol``, and in any case after at most ``max_iter`` rounds.
+    Prediction returns ``fsum(w_j * x_j) + b`` per row with an exact
+    zero normalized to positive 0.0. No randomness is used.
+    """
+
+    def __init__(self, alpha=1.0, max_iter=1000, tol=1e-8):
+        _require_exact_finite_positive(alpha, "alpha")
+        if type(max_iter) is not int or max_iter <= 0:
+            raise ValueError("max_iter must be a positive integer")
+        _require_exact_finite_positive(tol, "tol")
+
+        self.alpha = alpha
+        self.max_iter = max_iter
+        self.tol = tol
+        self.w = None
+        self.b = None
+
+    def fit(self, X, y):
+        # Clear the previous fit up front so that a failed validation or
+        # computation leaves the model unfitted.
+        self.w = None
+        self.b = None
+        try:
+            width = _check_gradient_matrix(X)
+            _check_gradient_target(y, len(X))
+        except OverflowError as exc:
+            # An int too large to convert to float failed its finiteness
+            # check: still a rejected input, hence ValueError.
+            raise ValueError(
+                "X and y must contain only finite non-boolean numbers"
+            ) from exc
+
+        n = len(X)
+        alpha = self.alpha
+        w = [0.0] * width
+        try:
+            b = math.fsum(y) / n
+            if not math.isfinite(b):
+                raise FloatingPointError(
+                    "non-finite value encountered during lasso fit"
+                )
+            for _ in range(self.max_iter):
+                previous_b = b
+                previous_w = list(w)
+
+                b = math.fsum(
+                    y[i] - math.fsum(w[j] * X[i][j] for j in range(width))
+                    for i in range(n)
+                ) / n
+                if not math.isfinite(b):
+                    raise FloatingPointError(
+                        "non-finite value encountered during lasso fit"
+                    )
+
+                for j in range(width):
+                    r = math.fsum(
+                        X[i][j]
+                        * (
+                            y[i]
+                            - b
+                            - math.fsum(
+                                w[k] * X[i][k]
+                                for k in range(width)
+                                if k != j
+                            )
+                        )
+                        for i in range(n)
+                    ) / n
+                    if not math.isfinite(r):
+                        raise FloatingPointError(
+                            "non-finite value encountered during lasso fit"
+                        )
+                    z = math.fsum(X[i][j] * X[i][j] for i in range(n)) / n
+                    if not math.isfinite(z):
+                        raise FloatingPointError(
+                            "non-finite value encountered during lasso fit"
+                        )
+                    if z == 0:
+                        w[j] = 0.0
+                    else:
+                        if r > alpha:
+                            s = r - alpha
+                        elif r < -alpha:
+                            s = r + alpha
+                        else:
+                            s = 0.0
+                        w[j] = s / z
+                        if not math.isfinite(w[j]):
+                            raise FloatingPointError(
+                                "non-finite value encountered during lasso fit"
+                            )
+
+                max_step = abs(b - previous_b)
+                for j in range(width):
+                    step = abs(w[j] - previous_w[j])
+                    if step > max_step:
+                        max_step = step
+                if max_step <= self.tol:
+                    break
+        except (OverflowError, ValueError, ZeroDivisionError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during lasso fit"
+            ) from exc
+
+        self.w = w
+        self.b = b
+        return self
+
+    def predict(self, X) -> list[float]:
+        if self.w is None or self.b is None:
+            raise ValueError("model must be fitted before predict is called")
+        try:
+            width = _check_gradient_matrix(X)
+        except OverflowError as exc:
+            raise ValueError(
+                "X must contain only finite non-boolean numbers"
+            ) from exc
+        if width != len(self.w):
+            raise ValueError(
+                "X must have the same number of features as the training data"
+            )
+
+        results = []
+        for row in X:
+            try:
+                prediction = (
+                    math.fsum(self.w[j] * row[j] for j in range(width))
+                    + self.b
+                )
+            except (OverflowError, ValueError, ZeroDivisionError) as exc:
+                raise FloatingPointError(
+                    "non-finite prediction encountered"
+                ) from exc
+            if not math.isfinite(prediction):
+                raise FloatingPointError("non-finite prediction encountered")
+            results.append(_positive_zero(prediction))
         return results
 
 
