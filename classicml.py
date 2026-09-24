@@ -37,6 +37,8 @@ Exports:
         single, complete, or average linkage.
     GaussianMixture -- deterministic one-dimensional Gaussian mixture
         model fitted by expectation-maximization from sorted initial means.
+    isolation_forest_score -- deterministic per-row Isolation Forest
+        anomaly scores for a finite matrix.
     accuracy_score -- fraction of positions where two integer label
         vectors agree.
     mean_squared_error -- weighted mean of squared element-wise
@@ -254,6 +256,7 @@ __all__ = [
     "DBSCAN",
     "AgglomerativeClustering",
     "GaussianMixture",
+    "isolation_forest_score",
     "accuracy_score",
     "mean_squared_error",
     "root_mean_squared_error",
@@ -5095,6 +5098,154 @@ class GaussianMixture:
                 "model must be fitted before bic is called"
             )
         return self._information_criterion(X, math.log)
+
+
+def _iforest_harmonic(m):
+    """H(m) = fsum(1/k for k in 1..m); H(0) = 0."""
+    return math.fsum(1.0 / k for k in range(1, m + 1))
+
+
+def _iforest_c(s):
+    """Average path length of an unsuccessful binary-search-tree search
+    in a sample of size s: c(1) = 0, c(s) = 2*H(s-1) - 2*(s-1)/s."""
+    if s <= 1:
+        return 0.0
+    return 2.0 * _iforest_harmonic(s - 1) - 2.0 * (s - 1) / s
+
+
+def _iforest_build(X, indices, features, depth, depth_limit, rng):
+    """Grow one iTree over the given sample indices.
+
+    A node is a leaf (storing only its sample count) when it has reached
+    depth ``ceil(log2(psi))``, holds a single sample, or is constant in
+    every feature. Otherwise the split feature is drawn with
+    ``rng.choice`` from the ascending table of features that are not
+    constant over the node's samples, and the split value is drawn with a
+    second ``rng.choice`` from the distinct ascending values of that
+    column except its maximum; samples with ``x <= t`` go left and the
+    rest go right. Both children are non-empty and are recursed left
+    before right. The two choice calls happen before any recursion.
+    """
+    if depth >= depth_limit or len(indices) == 1:
+        return (len(indices),)
+    sample_count = len(indices)
+
+    non_constant = []
+    split_tables = {}
+    for j in features:
+        distinct = sorted({X[i][j] for i in indices})
+        if len(distinct) > 1:
+            non_constant.append(j)
+            split_tables[j] = distinct[:-1]
+    if not non_constant:
+        return (sample_count,)
+
+    j = rng.choice(non_constant)
+    t = rng.choice(split_tables[j])
+    left_indices = [i for i in indices if X[i][j] <= t]
+    right_indices = [i for i in indices if X[i][j] > t]
+    left = _iforest_build(
+        X, left_indices, features, depth + 1, depth_limit, rng
+    )
+    right = _iforest_build(
+        X, right_indices, features, depth + 1, depth_limit, rng
+    )
+    return (j, t, left, right)
+
+
+def _iforest_path_length(node, row, depth):
+    """Depth of the leaf reached by row plus c(leaf sample count)."""
+    while len(node) == 4:
+        j, t, left, right = node
+        if row[j] <= t:
+            node = left
+        else:
+            node = right
+        depth += 1
+    return depth + _iforest_c(node[0])
+
+
+def isolation_forest_score(X, n_estimators=100, max_samples=256, seed=0):
+    """Deterministic Isolation Forest anomaly scores.
+
+    ``n_estimators`` (``T``) must be an exact positive integer,
+    ``max_samples`` (``psi``) an exact integer at least 2, and ``seed``
+    an exact integer. ``X`` is validated exactly as for
+    ``RandomForestClassifier`` (a non-empty rectangular list of rows of
+    exact ints or finite exact floats) and must have at least ``psi``
+    rows; every violation raises ValueError.
+
+    A single ``random.Random(seed)`` stream is consumed in tree order:
+    each tree draws its sample with ``rng.sample(range(n), psi)``, then
+    each non-leaf node consumes ``rng.choice`` calls (feature from the
+    ascending non-constant feature table, then split value from the
+    ascending distinct non-maximum values of that column) in left-before
+    -right recursion order. Trees stop at depth ``ceil(log2(psi))``, at
+    one sample, or when every column is constant. With
+    ``H(m) = fsum(1/k, k=1..m)``, the adjustment is
+    ``c(s) = 2*H(s-1) - 2*(s-1)/s`` (``c(1) = 0``) and a row's path in
+    a tree is its leaf depth plus ``c(leaf size)``. The score is
+    ``2 ** (-fsum(tree paths in tree order) / T / c(psi))``.
+
+    Results are returned in input order as plain floats, with an exact
+    zero written as positive ``0.0``. Any OverflowError, ValueError,
+    ZeroDivisionError, or non-finite value arising in the floating-point
+    computation after validation raises FloatingPointError. ``X`` is not
+    modified, only the standard library is used, and identical inputs
+    always give identical results.
+    """
+    if type(n_estimators) is not int:
+        raise ValueError("n_estimators must be an integer")
+    if n_estimators <= 0:
+        raise ValueError("n_estimators must be greater than 0")
+    if type(max_samples) is not int:
+        raise ValueError("max_samples must be an integer")
+    if max_samples < 2:
+        raise ValueError("max_samples must be at least 2")
+    if type(seed) is not int:
+        raise ValueError("seed must be an integer")
+    width = _check_tree_matrix(X)
+    n = len(X)
+    if n < max_samples:
+        raise ValueError("X must have at least max_samples rows")
+
+    try:
+        psi = max_samples
+        depth_limit = math.ceil(math.log2(psi))
+        features = list(range(width))
+        rng = random.Random(seed)
+
+        trees = []
+        for _ in range(n_estimators):
+            indices = rng.sample(range(n), psi)
+            trees.append(
+                _iforest_build(X, indices, features, 0, depth_limit, rng)
+            )
+
+        c_psi = _iforest_c(psi)
+        results = []
+        for row in X:
+            mean_path = math.fsum(
+                _iforest_path_length(tree, row, 0) for tree in trees
+            ) / n_estimators
+            score = 2.0 ** (-mean_path / c_psi)
+            if not math.isfinite(score):
+                raise FloatingPointError(
+                    "non-finite value encountered during isolation "
+                    "forest scoring"
+                )
+            if score == 0:
+                score = 0.0
+            results.append(score)
+    except (
+        OverflowError,
+        ValueError,
+        ZeroDivisionError,
+    ) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during isolation forest scoring"
+        ) from exc
+    return results
 
 
 def _check_metric_vectors(y_true, y_pred):
