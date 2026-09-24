@@ -2604,6 +2604,121 @@ class IsolationForest:
             for score in self.score_samples(X)
         ]
 
+    def permutation_importance(self, X, n_repeats=5, seed=0):
+        """Return permutation feature importances via score displacement.
+
+        ``X`` must be a non-empty rectangular list of non-empty rows whose
+        elements are finite values of type exactly ``int`` or ``float``
+        (booleans and subclasses are rejected), and the number of columns
+        must match the fitted model. ``n_repeats`` must be an exact
+        positive integer and ``seed`` an exact integer. The model must
+        already be fitted. Any violation raises ValueError.
+
+        The baseline is ``b = score_samples(X)``. Randomness comes from a
+        single ``random.Random(seed)`` stream: for each feature ``j`` in
+        order and each repeat ``r`` in order, a fresh
+        ``idx = list(range(n))`` is shuffled with ``rng.shuffle`` and a
+        copy of ``X`` has its column ``j`` replaced by ``X[idx[i]][j]``
+        in row order; with ``s = score_samples`` of the permuted copy,
+        the importance is ``fsum(abs(s[i] - b[i]) in input order) / n``.
+        The return value is the triple ``(mean, std, raw)`` where ``raw``
+        is the per-feature list of per-repeat importances,
+        ``mean[j] = fsum(raw[j]) / n_repeats``, and
+        ``std[j] = sqrt(fsum((v - mean[j]) ** 2) / n_repeats)``
+        (population standard deviation). Results are floats and an exact
+        zero is normalized to positive ``0.0``. The model and the input
+        are not modified. Exceptions raised by ``score_samples``
+        propagate unchanged; OverflowError, ValueError or
+        ZeroDivisionError from the remaining computation and any
+        non-finite result raise FloatingPointError.
+        """
+        if self._trees is None:
+            raise ValueError(
+                "model must be fitted before permutation_importance is called"
+            )
+        if type(n_repeats) is not int or n_repeats <= 0:
+            raise ValueError("n_repeats must be a positive integer")
+        if type(seed) is not int:
+            raise ValueError("seed must be an integer")
+        try:
+            width = _check_gradient_matrix(X)
+        except OverflowError as exc:
+            # An int too large to convert to float failed its finiteness
+            # check: still a rejected input, hence ValueError.
+            raise ValueError(
+                "X must contain only finite non-boolean numbers"
+            ) from exc
+        if width != self._width:
+            raise ValueError(
+                "X must have the same number of features as the training data"
+            )
+
+        n = len(X)
+        baseline = self.score_samples(X)
+
+        rng = random.Random(seed)
+        raw = []
+        for j in range(width):
+            column = [row[j] for row in X]
+            values = []
+            for _ in range(n_repeats):
+                idx = list(range(n))
+                rng.shuffle(idx)
+                permuted = [list(row) for row in X]
+                for i in range(n):
+                    permuted[i][j] = column[idx[i]]
+                scores = self.score_samples(permuted)
+                try:
+                    importance = math.fsum(
+                        abs(scores[i] - baseline[i]) for i in range(n)
+                    ) / n
+                except (OverflowError, ValueError, ZeroDivisionError) as exc:
+                    raise FloatingPointError(
+                        "non-finite value encountered during isolation "
+                        "forest scoring"
+                    ) from exc
+                if not math.isfinite(importance):
+                    raise FloatingPointError(
+                        "non-finite value encountered during isolation "
+                        "forest scoring"
+                    )
+                values.append(_positive_zero(float(importance)))
+            raw.append(values)
+
+        try:
+            mean = []
+            std = []
+            for j in range(width):
+                average = math.fsum(raw[j]) / n_repeats
+                if not math.isfinite(average):
+                    raise FloatingPointError(
+                        "non-finite value encountered during isolation "
+                        "forest scoring"
+                    )
+                average = _positive_zero(average)
+                mean.append(average)
+                deviation = math.fsum(
+                    (value - average) ** 2 for value in raw[j]
+                ) / n_repeats
+                standard_deviation = math.sqrt(deviation)
+                if not math.isfinite(standard_deviation):
+                    raise FloatingPointError(
+                        "non-finite value encountered during isolation "
+                        "forest scoring"
+                    )
+                std.append(_positive_zero(standard_deviation))
+        except FloatingPointError:
+            # A FloatingPointError raised anywhere propagates unchanged.
+            raise
+        except (OverflowError, ValueError, ZeroDivisionError) as exc:
+            # Any other overflow or invalid-operation during the computation
+            # is reported as FloatingPointError.
+            raise FloatingPointError(
+                "non-finite value encountered during isolation forest"
+                " scoring"
+            ) from exc
+        return mean, std, raw
+
 
 class AdaBoostClassifier:
     """Deterministic discrete AdaBoost (SAMME sign form) of decision stumps.
