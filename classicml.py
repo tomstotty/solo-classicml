@@ -178,6 +178,10 @@ Exports:
         predictions against one target per row.
     interval_score -- weighted mean interval score of central
         (1 - alpha) prediction intervals against one target per row.
+    weighted_interval_score -- weighted mean, over samples, of the
+        multi-interval weighted interval score combining a median
+        absolute-error term with central prediction intervals at
+        strictly increasing coverage levels.
     dumps -- serialize a fitted KMeans/PCA/linear/scaler/tree/forest
         model (including MultinomialLogisticRegression,
         AgglomerativeClustering, and DBSCAN) to whitespace-free JSON
@@ -306,6 +310,7 @@ __all__ = [
     "mean_average_precision_at_k_score",
     "continuous_ranked_probability_score",
     "interval_score",
+    "weighted_interval_score",
     "dumps",
     "loads",
 ]
@@ -17107,6 +17112,11 @@ def continuous_ranked_probability_score(
     return result
 
 
+# ``from __future__ import annotations`` stores annotations as strings;
+# expose the builtin ``float`` as the runtime return annotation.
+continuous_ranked_probability_score.__annotations__["return"] = float
+
+
 def interval_score(
     y_true, y_lower, y_upper, alpha=0.05, sample_weight=None
 ) -> float:
@@ -17288,6 +17298,274 @@ def interval_score(
     if result == 0:
         return 0.0
     return result
+
+
+# ``from __future__ import annotations`` stores annotations as strings;
+# expose the builtin ``float`` as the runtime return annotation.
+interval_score.__annotations__["return"] = float
+
+
+def weighted_interval_score(y, m, lo, hi, a, w=None) -> float:
+    """Return the weighted mean multi-interval weighted interval score.
+
+    ``y`` and ``m`` must be non-empty lists of the same length whose
+    elements are finite values of type exactly ``int`` or ``float``
+    (booleans are rejected); ``y`` holds the targets and ``m`` the
+    median predictions. ``a`` must be a non-empty list of finite values
+    of type exactly ``int`` or ``float`` (booleans are rejected), each
+    strictly between ``0`` and ``1``, in strictly increasing order.
+    ``lo`` and ``hi`` must be lists of rows with the same height as
+    ``y`` and a common width equal to ``len(a)``; their elements are
+    likewise finite values of type exactly ``int`` or ``float``
+    (booleans are rejected), and ``lo[i][k] <= hi[i][k]`` must hold for
+    every pair. ``w`` must be ``None`` -- every sample then weighs
+    ``1.0`` -- or a list with the same length as ``y`` whose elements
+    are finite non-negative values of type exactly ``int`` or ``float``
+    (booleans are rejected). Any container, length, shape, type, range,
+    ordering, or finiteness violation (including ``OverflowError``
+    raised by ``math.isfinite``) raises ValueError.
+
+    After validation the values and weights are converted to ``float``
+    in input order. ``math.fsum`` computes the total weight
+    ``W = fsum(w_i)``; if that summation overflows or is invalid, is
+    non-finite, or its total is less than or equal to zero, a ValueError
+    is raised. For sample ``i`` and interval ``k`` the interval width
+    is ``I = hi[i][k] - lo[i][k]``; when ``y[i] < lo[i][k]`` the penalty
+    ``2 * (lo[i][k] - y[i]) / a[k]`` is added, when
+    ``y[i] > hi[i][k]`` the penalty ``2 * (y[i] - hi[i][k]) / a[k]`` is
+    added, and no penalty is added otherwise. The per-sample score is
+    ``q_i = (0.5 * abs(y[i] - m[i]) + fsum((a[k] / 2) * I_k in
+    increasing-k order)) / (len(a) + 0.5)``. The result is
+    ``fsum(w_i * q_i in sample order) / W``. Apart from the ``W``
+    check, overflow or invalid operations during the post-validation
+    conversion, comparisons, absolute value, arithmetic, or
+    ``math.fsum`` steps, and non-finite intermediate values or results
+    raise FloatingPointError. An exact zero result is normalized to
+    ``0.0``.
+
+    The return value is a float. The inputs are not modified.
+    Deterministic: same inputs, same result.
+    """
+    if not isinstance(y, list) or len(y) == 0:
+        raise ValueError("y must be a non-empty list")
+    n = len(y)
+    if not isinstance(m, list) or len(m) != n:
+        raise ValueError("m must be a list with the same length as y")
+    for name, values in (("y", y), ("m", m)):
+        for value in values:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    name + " must contain only finite non-boolean numbers"
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    name + " must contain only finite non-boolean numbers"
+                ) from exc
+            if not finite:
+                raise ValueError(
+                    name + " must contain only finite non-boolean numbers"
+                )
+
+    if not isinstance(a, list) or len(a) == 0:
+        raise ValueError(
+            "a must be a non-empty list of strictly increasing numbers "
+            "with 0 < a[k] < 1"
+        )
+    previous = None
+    for value in a:
+        if type(value) not in (int, float):
+            raise ValueError(
+                "a must contain only finite non-boolean numbers with "
+                "0 < a[k] < 1"
+            )
+        try:
+            finite = math.isfinite(value)
+        except OverflowError as exc:
+            raise ValueError(
+                "a must contain only finite non-boolean numbers with "
+                "0 < a[k] < 1"
+            ) from exc
+        if not finite or not 0 < value < 1:
+            raise ValueError(
+                "a must be a non-empty list of strictly increasing "
+                "numbers with 0 < a[k] < 1"
+            )
+        if previous is not None and not value > previous:
+            raise ValueError(
+                "a must be a non-empty list of strictly increasing "
+                "numbers with 0 < a[k] < 1"
+            )
+        previous = value
+    p = len(a)
+
+    if not isinstance(lo, list) or len(lo) != n:
+        raise ValueError(
+            "lo must be a list of rows with the same length as y and the "
+            "same width as a"
+        )
+    if not isinstance(hi, list) or len(hi) != n:
+        raise ValueError(
+            "hi must be a list of rows with the same length as y and the "
+            "same width as a"
+        )
+    for name, rows in (("lo", lo), ("hi", hi)):
+        for row in rows:
+            if not isinstance(row, list) or len(row) != p:
+                raise ValueError(
+                    name
+                    + " must be a rectangular matrix with one row per "
+                    "sample and one column per entry of a"
+                )
+            for value in row:
+                if type(value) not in (int, float):
+                    raise ValueError(
+                        name
+                        + " must contain only finite non-boolean numbers"
+                    )
+                try:
+                    finite = math.isfinite(value)
+                except OverflowError as exc:
+                    raise ValueError(
+                        name
+                        + " must contain only finite non-boolean numbers"
+                    ) from exc
+                if not finite:
+                    raise ValueError(
+                        name
+                        + " must contain only finite non-boolean numbers"
+                    )
+    for i in range(n):
+        for k in range(p):
+            if not lo[i][k] <= hi[i][k]:
+                raise ValueError(
+                    "each lo element must be less than or equal to the "
+                    "corresponding hi element"
+                )
+
+    if w is not None:
+        if not isinstance(w, list) or len(w) != n:
+            raise ValueError(
+                "w must be a list with the same length as y"
+            )
+        for value in w:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "w must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "w must contain only finite non-negative "
+                    "non-boolean numbers"
+                ) from exc
+            if not finite or value < 0:
+                raise ValueError(
+                    "w must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+
+    def non_finite(exc):
+        return FloatingPointError(
+            "non-finite value encountered during weighted interval score"
+        )
+
+    try:
+        t = [float(value) for value in y]
+        med = [float(value) for value in m]
+        lower = [[float(value) for value in row] for row in lo]
+        upper = [[float(value) for value in row] for row in hi]
+        alphas = [float(value) for value in a]
+        if w is None:
+            weights = [1.0] * n
+        else:
+            weights = [float(value) for value in w]
+    except (OverflowError, ValueError) as exc:
+        raise non_finite(exc) from exc
+    for values in [t, med, alphas, weights] + lower + upper:
+        for value in values:
+            if not math.isfinite(value):
+                raise non_finite(None)
+
+    try:
+        total_weight = math.fsum(weights)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError("the total weight must be greater than 0") from exc
+    if not math.isfinite(total_weight) or total_weight <= 0.0:
+        raise ValueError("the total weight must be greater than 0")
+
+    row_scores = []
+    for i in range(n):
+        interval_terms = []
+        for k in range(p):
+            try:
+                width = upper[i][k] - lower[i][k]
+                if t[i] < lower[i][k]:
+                    width += (2.0 / alphas[k]) * (lower[i][k] - t[i])
+                elif t[i] > upper[i][k]:
+                    width += (2.0 / alphas[k]) * (t[i] - upper[i][k])
+                term = (alphas[k] / 2.0) * width
+            except (
+                OverflowError,
+                ValueError,
+                ZeroDivisionError,
+            ) as exc:
+                raise non_finite(exc) from exc
+            if not math.isfinite(width) or not math.isfinite(term):
+                raise non_finite(None)
+            interval_terms.append(term)
+        try:
+            median_distance = abs(t[i] - med[i])
+            median_term = 0.5 * median_distance
+            interval_sum = math.fsum(interval_terms)
+            numerator = median_term + interval_sum
+            row_score = numerator / (p + 0.5)
+        except (OverflowError, ValueError) as exc:
+            raise non_finite(exc) from exc
+        if (
+            not math.isfinite(median_distance)
+            or not math.isfinite(median_term)
+            or not math.isfinite(interval_sum)
+            or not math.isfinite(numerator)
+            or not math.isfinite(row_score)
+        ):
+            raise non_finite(None)
+        row_scores.append(row_score)
+
+    weighted_terms = []
+    for i in range(n):
+        try:
+            term = weights[i] * row_scores[i]
+        except (OverflowError, ValueError) as exc:
+            raise non_finite(exc) from exc
+        if not math.isfinite(term):
+            raise non_finite(None)
+        weighted_terms.append(term)
+    try:
+        weighted_total = math.fsum(weighted_terms)
+    except (OverflowError, ValueError) as exc:
+        raise non_finite(exc) from exc
+    if not math.isfinite(weighted_total):
+        raise non_finite(None)
+    try:
+        result = weighted_total / total_weight
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        raise non_finite(exc) from exc
+    if not math.isfinite(result):
+        raise non_finite(None)
+    if result == 0:
+        return 0.0
+    return result
+
+
+# ``from __future__ import annotations`` stores annotations as strings;
+# expose the builtin ``float`` as the runtime return annotation.
+weighted_interval_score.__annotations__["return"] = float
 
 
 _SERIAL_KEYS_KMEANS = (
