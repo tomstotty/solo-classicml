@@ -173,6 +173,9 @@ Exports:
     mean_reciprocal_rank_score -- weighted mean, over samples, of the
         reciprocal rank of the first positive label among the k
         highest-scoring columns of a binary label matrix.
+    continuous_ranked_probability_score -- weighted mean, over samples,
+        of the continuous ranked probability score of an ensemble of
+        predictions against one target per row.
     dumps -- serialize a fitted KMeans/PCA/linear/scaler/tree/forest
         model (including MultinomialLogisticRegression,
         AgglomerativeClustering, and DBSCAN) to whitespace-free JSON
@@ -299,6 +302,7 @@ __all__ = [
     "precision_at_k_score",
     "recall_at_k_score",
     "mean_average_precision_at_k_score",
+    "continuous_ranked_probability_score",
     "dumps",
     "loads",
 ]
@@ -16832,6 +16836,272 @@ def mean_average_precision_at_k_score(
     return _weighted_mean_at_k(
         y_true, y_score, k, sample_weight, "map"
     )
+
+
+def continuous_ranked_probability_score(
+    y_true, y_samples, sample_weight=None, ensemble_weight=None
+) -> float:
+    """Return the weighted mean continuous ranked probability score.
+
+    ``y_true`` must be a non-empty list whose elements are finite values
+    of type exactly ``int`` or ``float`` (booleans are rejected).
+    ``y_samples`` must be a list of rows of the same height as
+    ``y_true`` and a common width of at least one column; its elements
+    are likewise finite values of type exactly ``int`` or ``float``
+    (booleans are rejected). ``sample_weight`` must be ``None`` -- every
+    sample then weighs ``1.0`` -- or a list with the same length as
+    ``y_true``; ``ensemble_weight`` must be ``None`` -- every ensemble
+    member then weighs ``1.0`` -- or a list with the same length as the
+    number of columns. Weight entries must be finite non-negative values
+    of type exactly ``int`` or ``float`` (booleans are rejected). Any
+    container, shape, length, type, range, or finiteness violation
+    (including ``OverflowError`` raised by ``math.isfinite``) raises
+    ValueError.
+
+    After validation the values and weights are converted to ``float``
+    in input order. ``math.fsum`` computes the sample-weight total
+    ``W = fsum(w_i)`` and the ensemble-weight total
+    ``V = fsum(v_j)``; if either summation overflows or is invalid, is
+    non-finite, or its total is less than or equal to zero, a
+    ValueError is raised. For row ``i`` with target ``t_i`` and members
+    ``x_ij``, the member term is summed in column order ``j`` as
+    ``A = fsum(v_j * abs(x_ij - t_i)) / V`` and the pairwise term is
+    summed with ``j`` outer and ``k`` inner as
+    ``B = fsum(v_j * v_k * abs(x_ij - x_ik)) / (2 * V * V)``; the row
+    score is ``q_i = A - B``. The result is
+    ``fsum(w_i * q_i in row order) / W``. Overflow or invalid
+    operations during the post-validation conversion, absolute value,
+    arithmetic, or ``math.fsum`` steps, a zero division, and non-finite
+    intermediate values or results raise FloatingPointError. An exact
+    zero result is normalized to ``0.0``.
+
+    The return value is a float. The inputs are not modified.
+    Deterministic: same inputs, same result.
+    """
+    if not isinstance(y_true, list) or len(y_true) == 0:
+        raise ValueError("y_true must be a non-empty list")
+    n = len(y_true)
+    for value in y_true:
+        if type(value) not in (int, float):
+            raise ValueError(
+                "y_true must contain only finite non-boolean numbers"
+            )
+        # math.isfinite raises OverflowError for ints too large to
+        # convert to float; such values fail the finite requirement.
+        try:
+            finite = math.isfinite(value)
+        except OverflowError as exc:
+            raise ValueError(
+                "y_true must contain only finite non-boolean numbers"
+            ) from exc
+        if not finite:
+            raise ValueError(
+                "y_true must contain only finite non-boolean numbers"
+            )
+
+    if not isinstance(y_samples, list) or len(y_samples) != n:
+        raise ValueError(
+            "y_samples must be a list of rows with the same length as "
+            "y_true"
+        )
+    width = None
+    for row in y_samples:
+        if not isinstance(row, list) or len(row) == 0:
+            raise ValueError("y_samples rows must be non-empty lists")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError("y_samples must be rectangular")
+        for value in row:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "y_samples must contain only finite non-boolean "
+                    "numbers"
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "y_samples must contain only finite non-boolean "
+                    "numbers"
+                ) from exc
+            if not finite:
+                raise ValueError(
+                    "y_samples must contain only finite non-boolean "
+                    "numbers"
+                )
+
+    if sample_weight is not None:
+        if not isinstance(sample_weight, list) or len(sample_weight) != n:
+            raise ValueError(
+                "sample_weight must be a list with the same length as "
+                "y_true"
+            )
+        for value in sample_weight:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                ) from exc
+            if not finite or value < 0:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+
+    if ensemble_weight is not None:
+        if (
+            not isinstance(ensemble_weight, list)
+            or len(ensemble_weight) != width
+        ):
+            raise ValueError(
+                "ensemble_weight must be a list with the same length as "
+                "the number of columns of y_samples"
+            )
+        for value in ensemble_weight:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "ensemble_weight must contain only finite "
+                    "non-negative non-boolean numbers"
+                )
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "ensemble_weight must contain only finite "
+                    "non-negative non-boolean numbers"
+                ) from exc
+            if not finite or value < 0:
+                raise ValueError(
+                    "ensemble_weight must contain only finite "
+                    "non-negative non-boolean numbers"
+                )
+
+    def non_finite(exc):
+        return FloatingPointError(
+            "non-finite value encountered during continuous ranked "
+            "probability score"
+        )
+
+    try:
+        t = [float(value) for value in y_true]
+        x = [[float(value) for value in row] for row in y_samples]
+        if sample_weight is None:
+            w = [1.0] * n
+        else:
+            w = [float(value) for value in sample_weight]
+        if ensemble_weight is None:
+            v = [1.0] * width
+        else:
+            v = [float(value) for value in ensemble_weight]
+    except (OverflowError, ValueError) as exc:
+        raise non_finite(exc) from exc
+    for values in [t, w, v] + x:
+        for value in values:
+            if not math.isfinite(value):
+                raise non_finite(None)
+
+    try:
+        total_sample_weight = math.fsum(w)
+        total_ensemble_weight = math.fsum(v)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError("the total weight must be greater than 0") from exc
+    if (
+        not math.isfinite(total_sample_weight)
+        or total_sample_weight <= 0.0
+        or not math.isfinite(total_ensemble_weight)
+        or total_ensemble_weight <= 0.0
+    ):
+        raise ValueError("the total weight must be greater than 0")
+
+    row_scores = []
+    for i in range(n):
+        member_terms = []
+        pairwise_terms = []
+        for j in range(width):
+            try:
+                member_distance = abs(x[i][j] - t[i])
+                member_terms.append(v[j] * member_distance)
+            except (OverflowError, ValueError) as exc:
+                raise non_finite(exc) from exc
+            if not math.isfinite(member_distance) or not math.isfinite(
+                member_terms[-1]
+            ):
+                raise non_finite(None)
+            for k in range(width):
+                try:
+                    pairwise_distance = abs(x[i][j] - x[i][k])
+                    pairwise_terms.append(
+                        v[j] * v[k] * pairwise_distance
+                    )
+                except (OverflowError, ValueError) as exc:
+                    raise non_finite(exc) from exc
+                if not math.isfinite(pairwise_distance) or not math.isfinite(
+                    pairwise_terms[-1]
+                ):
+                    raise non_finite(None)
+        try:
+            member_sum = math.fsum(member_terms)
+            pairwise_sum = math.fsum(pairwise_terms)
+        except (OverflowError, ValueError) as exc:
+            raise non_finite(exc) from exc
+        if not math.isfinite(member_sum) or not math.isfinite(pairwise_sum):
+            raise non_finite(None)
+        try:
+            member_part = member_sum / total_ensemble_weight
+            pairwise_denominator = (
+                2.0 * total_ensemble_weight * total_ensemble_weight
+            )
+            pairwise_part = pairwise_sum / pairwise_denominator
+            row_score = member_part - pairwise_part
+        except (
+            OverflowError,
+            ValueError,
+            ZeroDivisionError,
+        ) as exc:
+            raise non_finite(exc) from exc
+        if (
+            not math.isfinite(pairwise_denominator)
+            or not math.isfinite(member_part)
+            or not math.isfinite(pairwise_part)
+            or not math.isfinite(row_score)
+        ):
+            raise non_finite(None)
+        row_scores.append(row_score)
+
+    weighted_terms = []
+    for i in range(n):
+        try:
+            term = w[i] * row_scores[i]
+        except (OverflowError, ValueError) as exc:
+            raise non_finite(exc) from exc
+        if not math.isfinite(term):
+            raise non_finite(None)
+        weighted_terms.append(term)
+    try:
+        weighted_total = math.fsum(weighted_terms)
+    except (OverflowError, ValueError) as exc:
+        raise non_finite(exc) from exc
+    if not math.isfinite(weighted_total):
+        raise non_finite(None)
+    try:
+        result = weighted_total / total_sample_weight
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        raise non_finite(exc) from exc
+    if not math.isfinite(result):
+        raise non_finite(None)
+    if result == 0:
+        return 0.0
+    return result
 
 
 _SERIAL_KEYS_KMEANS = (
