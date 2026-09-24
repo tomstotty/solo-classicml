@@ -58,6 +58,8 @@ Exports:
         optionally weighted.
     explained_variance_score -- weighted explained variance regression
         score of two finite real vectors.
+    concordance_correlation_coefficient -- Lin's weighted concordance
+        correlation coefficient of two finite real vectors.
     mean_pinball_loss -- weighted mean pinball (quantile) loss of two
         finite real vectors at a quantile level alpha in [0, 1].
     d2_pinball_score -- fraction by which pinball loss improves over the
@@ -214,6 +216,7 @@ __all__ = [
     "root_mean_squared_log_error",
     "r2_score",
     "explained_variance_score",
+    "concordance_correlation_coefficient",
     "mean_absolute_percentage_error",
     "median_absolute_percentage_error",
     "mean_squared_percentage_error",
@@ -6406,6 +6409,220 @@ def explained_variance_score(y_true, y_pred, sample_weight=None,
     if force_finite:
         return 0.0
     return float("-inf")
+
+
+def _ccc_float(value):
+    """Convert a validated number to float; overflow, invalid operations,
+    and non-finite results raise FloatingPointError."""
+    try:
+        result = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during concordance correlation "
+            "coefficient computation"
+        ) from exc
+    if not math.isfinite(result):
+        raise FloatingPointError(
+            "non-finite value encountered during concordance correlation "
+            "coefficient computation"
+        )
+    return result
+
+
+def concordance_correlation_coefficient(
+        y_true, y_pred, sample_weight=None) -> float:
+    """Return Lin's weighted concordance correlation coefficient.
+
+    ``y_true`` and ``y_pred`` must be non-empty lists of equal length
+    whose elements are finite values of type exactly ``int`` or
+    ``float`` (booleans are rejected). ``sample_weight`` must be
+    ``None`` -- every sample then weighs ``1.0`` -- or a list of the
+    same length whose elements are finite non-negative values of type
+    exactly ``int`` or ``float`` (booleans are rejected). The total
+    weight must be greater than zero. Any violation (including
+    ``OverflowError`` raised by ``math.isfinite``) raises ValueError.
+
+    After validation, the values and weights are converted to
+    ``float``. In input order, with ``t`` the true value, ``p`` the
+    prediction, and ``w`` the weight, ``math.fsum`` computes the total
+    weight ``W = sum(w)``, the weighted means ``mt = sum(w * t) / W``
+    and ``mp = sum(w * p) / W``, the weighted variances
+    ``Vt = sum(w * (t - mt) ** 2) / W`` and
+    ``Vp = sum(w * (p - mp) ** 2) / W``, and the weighted covariance
+    ``C = sum(w * (t - mt) * (p - mp)) / W``. The result is
+    ``2 * C / (Vt + Vp + (mt - mp) ** 2)``; when the denominator is
+    exactly zero the result is ``1.0``. Overflow, invalid operations
+    during the post-validation conversion, subtraction, multiplication,
+    squaring, ``math.fsum`` or division, and non-finite intermediate
+    values or results raise FloatingPointError. An exact zero result is
+    normalized to positive ``0.0``; the result is not clipped.
+
+    The return value is a float. The inputs are not modified.
+    Deterministic: same inputs, same result.
+    """
+    n = _check_metric_vectors(y_true, y_pred)
+    for name, values in (("y_true", y_true), ("y_pred", y_pred)):
+        for value in values:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "%s must contain only finite non-boolean numbers" % name
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "%s must contain only finite non-boolean numbers" % name
+                ) from exc
+            if not finite:
+                raise ValueError(
+                    "%s must contain only finite non-boolean numbers" % name
+                )
+
+    if sample_weight is None:
+        weights = [1.0] * n
+    else:
+        if not isinstance(sample_weight, list) or len(sample_weight) != n:
+            raise ValueError(
+                "sample_weight must be a list with the same length as "
+                "y_true"
+            )
+        for value in sample_weight:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                ) from exc
+            if not finite or value < 0:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+        weights = [_ccc_float(value) for value in sample_weight]
+
+    try:
+        total_weight = math.fsum(weights)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError("the total weight must be greater than 0") from exc
+    if not math.isfinite(total_weight) or total_weight <= 0.0:
+        raise ValueError("the total weight must be greater than 0")
+
+    t = [_ccc_float(value) for value in y_true]
+    p = [_ccc_float(value) for value in y_pred]
+
+    true_mean_terms = []
+    pred_mean_terms = []
+    for i in range(n):
+        try:
+            true_term = weights[i] * t[i]
+            pred_term = weights[i] * p[i]
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during concordance "
+                "correlation coefficient computation"
+            ) from exc
+        if not math.isfinite(true_term) or not math.isfinite(pred_term):
+            raise FloatingPointError(
+                "non-finite value encountered during concordance "
+                "correlation coefficient computation"
+            )
+        true_mean_terms.append(true_term)
+        pred_mean_terms.append(pred_term)
+    try:
+        mt = math.fsum(true_mean_terms) / total_weight
+        mp = math.fsum(pred_mean_terms) / total_weight
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during concordance correlation "
+            "coefficient computation"
+        ) from exc
+    if not math.isfinite(mt) or not math.isfinite(mp):
+        raise FloatingPointError(
+            "non-finite value encountered during concordance correlation "
+            "coefficient computation"
+        )
+
+    vt_terms = []
+    vp_terms = []
+    cov_terms = []
+    for i in range(n):
+        try:
+            true_offset = t[i] - mt
+            pred_offset = p[i] - mp
+            vt_term = weights[i] * true_offset ** 2
+            vp_term = weights[i] * pred_offset ** 2
+            cov_term = weights[i] * true_offset * pred_offset
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during concordance "
+                "correlation coefficient computation"
+            ) from exc
+        if (not math.isfinite(vt_term) or not math.isfinite(vp_term)
+                or not math.isfinite(cov_term)):
+            raise FloatingPointError(
+                "non-finite value encountered during concordance "
+                "correlation coefficient computation"
+            )
+        vt_terms.append(vt_term)
+        vp_terms.append(vp_term)
+        cov_terms.append(cov_term)
+    try:
+        vt = math.fsum(vt_terms) / total_weight
+        vp = math.fsum(vp_terms) / total_weight
+        covariance = math.fsum(cov_terms) / total_weight
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during concordance correlation "
+            "coefficient computation"
+        ) from exc
+    if (not math.isfinite(vt) or not math.isfinite(vp)
+            or not math.isfinite(covariance)):
+        raise FloatingPointError(
+            "non-finite value encountered during concordance correlation "
+            "coefficient computation"
+        )
+
+    try:
+        mean_gap_squared = (mt - mp) ** 2
+        denominator = vt + vp + mean_gap_squared
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during concordance correlation "
+            "coefficient computation"
+        ) from exc
+    if not math.isfinite(denominator):
+        raise FloatingPointError(
+            "non-finite value encountered during concordance correlation "
+            "coefficient computation"
+        )
+
+    if denominator == 0.0:
+        return 1.0
+    try:
+        result = 2.0 * covariance / denominator
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during concordance correlation "
+            "coefficient computation"
+        ) from exc
+    if not math.isfinite(result):
+        raise FloatingPointError(
+            "non-finite value encountered during concordance correlation "
+            "coefficient computation"
+        )
+    if result == 0:
+        result = 0.0
+    return result
 
 
 def mean_absolute_percentage_error(y_true, y_pred, sample_weight=None) -> float:
