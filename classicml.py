@@ -218,6 +218,9 @@ Exports:
         averaged over the tie-inclusive k-nearest neighborhoods.
     optics_clustering -- deterministic OPTICS-style clustering of a
         finite real matrix returning integer labels in input order.
+    nmf -- deterministic non-negative matrix factorization of a
+        non-negative finite real matrix by multiplicative updates from
+        a seeded random initialization.
     dumps -- serialize a fitted KMeans/PCA/linear/scaler/tree/forest
         model (including MultinomialLogisticRegression,
         AgglomerativeClustering, and DBSCAN) to whitespace-free JSON
@@ -360,6 +363,7 @@ __all__ = [
     "isolation_forest_score",
     "local_outlier_factor_score",
     "optics_clustering",
+    "nmf",
     "dumps",
     "loads",
 ]
@@ -2924,6 +2928,204 @@ def optics_clustering(X, eps, min_samples=5) -> list[int]:
     except (OverflowError, ValueError, ZeroDivisionError) as exc:
         raise FloatingPointError(
             "non-finite value encountered during optics clustering"
+        ) from exc
+
+
+def _check_nmf_matrix(X):
+    """Validate a non-empty rectangular matrix of exact ints or finite
+    non-negative floats (booleans and subclasses are rejected); an int
+    too large for the finiteness check raises ValueError from the
+    OverflowError it triggers."""
+    if not isinstance(X, list) or len(X) == 0:
+        raise ValueError("X must be a non-empty list of rows")
+    width = None
+    for row in X:
+        if not isinstance(row, list) or len(row) == 0:
+            raise ValueError("X rows must be non-empty lists")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError("X must be rectangular")
+        for value in row:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "X must contain only finite non-boolean numbers"
+                )
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "X must contain only finite non-boolean numbers"
+                ) from exc
+            if not finite:
+                raise ValueError(
+                    "X must contain only finite non-boolean numbers"
+                )
+            if value < 0:
+                raise ValueError(
+                    "X must contain only non-negative numbers"
+                )
+    return width
+
+
+def nmf(X, n_components=2, max_iter=200, tol=1e-6, seed=0):
+    """Return a non-negative matrix factorization ``(W, H)`` of ``X``.
+
+    ``X`` must be a non-empty rectangular matrix whose rows are
+    non-empty lists and whose elements have type exactly ``int`` or are
+    finite values of type exactly ``float`` (booleans and subclasses
+    are rejected), all greater than or equal to zero; an integer too
+    large for the finiteness check raises ValueError from the
+    OverflowError it triggers. ``n_components`` and ``max_iter`` must
+    be exact positive integers with
+    ``n_components <= min(len(X), width)``, ``tol`` must be a finite
+    non-boolean positive number, and ``seed`` must be an exact integer;
+    any violation raises ValueError.
+
+    Let ``n`` and ``p`` be the shape of ``X``, ``r = n_components``,
+    ``F = math.fsum`` and ``e = 1e-12``. With
+    ``rng = random.Random(seed)``, ``W`` (``n`` by ``r``) and then
+    ``H`` (``r`` by ``p``) are initialized to ``rng.random() + e`` in
+    row-major order. Each round computes, from the old ``W`` and ``H``,
+    ``P[i][j] = F(W[i][l] * H[l][j] for l in range(r))`` and then
+    synchronously ``H'[k][j] = H[k][j] * F(W[i][k] * X[i][j] for i)
+    / max(F(W[i][k] * P[i][j] for i), e)``; then
+    ``Q[i][j] = F(W[i][l] * H'[l][j] for l in range(r))`` and
+    synchronously ``W'[i][k] = W[i][k] * F(H'[k][j] * X[i][j] for j)
+    / max(F(H'[k][j] * Q[i][j] for j), e)``, with every index summed in
+    ascending order. A round ends the iteration when the largest
+    absolute coordinate change of ``W`` and ``H`` is at most ``tol``;
+    at most ``max_iter`` rounds run. The returned ``(W, H)`` are float
+    matrices with zero written as ``+0.0``; any OverflowError,
+    ValueError or non-finite value after validation raises
+    FloatingPointError. ``X`` is not modified, only the standard
+    library is used, and the same arguments always give the same
+    result.
+    """
+    if type(n_components) is not int:
+        raise ValueError("n_components must be an integer")
+    if n_components <= 0:
+        raise ValueError("n_components must be greater than 0")
+    if type(max_iter) is not int:
+        raise ValueError("max_iter must be an integer")
+    if max_iter <= 0:
+        raise ValueError("max_iter must be greater than 0")
+    tol = _checked_parameter(tol, "tol")
+    if tol <= 0:
+        raise ValueError("tol must be greater than 0")
+    if type(seed) is not int:
+        raise ValueError("seed must be an integer")
+    width = _check_nmf_matrix(X)
+    if n_components > min(len(X), width):
+        raise ValueError(
+            "n_components must not exceed min(len(X), width)"
+        )
+
+    try:
+        n = len(X)
+        p = width
+        r = n_components
+        e = 1e-12
+        rng = random.Random(seed)
+        W = [[rng.random() + e for _ in range(r)] for _ in range(n)]
+        H = [[rng.random() + e for _ in range(p)] for _ in range(r)]
+        for _ in range(max_iter):
+            P = [
+                [
+                    math.fsum(W[i][l] * H[l][j] for l in range(r))
+                    for j in range(p)
+                ]
+                for i in range(n)
+            ]
+            for i in range(n):
+                for j in range(p):
+                    if not math.isfinite(P[i][j]):
+                        raise FloatingPointError(
+                            "non-finite value encountered during nmf"
+                        )
+            new_H = []
+            for k in range(r):
+                new_row = []
+                for j in range(p):
+                    numerator = math.fsum(
+                        W[i][k] * X[i][j] for i in range(n)
+                    )
+                    denominator = math.fsum(
+                        W[i][k] * P[i][j] for i in range(n)
+                    )
+                    if not (
+                        math.isfinite(numerator)
+                        and math.isfinite(denominator)
+                    ):
+                        raise FloatingPointError(
+                            "non-finite value encountered during nmf"
+                        )
+                    value = H[k][j] * numerator / max(denominator, e)
+                    if not math.isfinite(value):
+                        raise FloatingPointError(
+                            "non-finite value encountered during nmf"
+                        )
+                    new_row.append(value)
+                new_H.append(new_row)
+            Q = [
+                [
+                    math.fsum(W[i][l] * new_H[l][j] for l in range(r))
+                    for j in range(p)
+                ]
+                for i in range(n)
+            ]
+            for i in range(n):
+                for j in range(p):
+                    if not math.isfinite(Q[i][j]):
+                        raise FloatingPointError(
+                            "non-finite value encountered during nmf"
+                        )
+            new_W = []
+            for i in range(n):
+                new_row = []
+                for k in range(r):
+                    numerator = math.fsum(
+                        new_H[k][j] * X[i][j] for j in range(p)
+                    )
+                    denominator = math.fsum(
+                        new_H[k][j] * Q[i][j] for j in range(p)
+                    )
+                    if not (
+                        math.isfinite(numerator)
+                        and math.isfinite(denominator)
+                    ):
+                        raise FloatingPointError(
+                            "non-finite value encountered during nmf"
+                        )
+                    value = W[i][k] * numerator / max(denominator, e)
+                    if not math.isfinite(value):
+                        raise FloatingPointError(
+                            "non-finite value encountered during nmf"
+                        )
+                    new_row.append(value)
+                new_W.append(new_row)
+            delta = 0.0
+            for i in range(n):
+                for k in range(r):
+                    change = abs(new_W[i][k] - W[i][k])
+                    if change > delta:
+                        delta = change
+            for k in range(r):
+                for j in range(p):
+                    change = abs(new_H[k][j] - H[k][j])
+                    if change > delta:
+                        delta = change
+            W = new_W
+            H = new_H
+            if delta <= tol:
+                break
+        return (
+            [[_positive_zero(value) for value in row] for row in W],
+            [[_positive_zero(value) for value in row] for row in H],
+        )
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during nmf"
         ) from exc
 
 
