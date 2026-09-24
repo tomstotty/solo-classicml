@@ -247,12 +247,15 @@ class LassoRegressionTest(unittest.TestCase):
             [[1.0], [float("nan")]],
             [[1.0], [float("inf")]],
             [[True], [False]],
-            [[1], [10 ** 400]],
         ]
         for bad in bad_matrices:
             with self.subTest(bad=bad):
                 with self.assertRaises(ValueError):
                     model.fit(bad, [0.0, 0.0])
+        # An arbitrarily large exact int is structurally legal input;
+        # its arithmetic overflow is a FloatingPointError instead.
+        with self.assertRaises(FloatingPointError):
+            model.fit([[1], [10 ** 400]], [0.0, 0.0])
 
     def test_invalid_targets_raise_value_error(self):
         X = [[0.0], [1.0]]
@@ -264,7 +267,9 @@ class LassoRegressionTest(unittest.TestCase):
             LassoRegression().fit(X, [0, True])
         with self.assertRaises(ValueError):
             LassoRegression().fit(X, [0.0, float("nan")])
-        with self.assertRaises(ValueError):
+        # An arbitrarily large exact int is legal target input; only the
+        # arithmetic overflow rejects the fit, as FloatingPointError.
+        with self.assertRaises(FloatingPointError):
             LassoRegression().fit([[0], [1]], [0, 10 ** 400])
 
     def test_invalid_predict_matrix_raises_value_error(self):
