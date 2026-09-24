@@ -205,6 +205,9 @@ Exports:
     isolation_forest_score -- deterministic isolation-forest anomaly
         score of each row of a finite real matrix, averaged over a
         seeded forest of random isolation trees.
+    local_outlier_factor_score -- deterministic local outlier factor of
+        each row of a finite real matrix from reachability distances
+        averaged over the tie-inclusive k-nearest neighborhoods.
     dumps -- serialize a fitted KMeans/PCA/linear/scaler/tree/forest
         model (including MultinomialLogisticRegression,
         AgglomerativeClustering, and DBSCAN) to whitespace-free JSON
@@ -341,6 +344,7 @@ __all__ = [
     "cumulative_dynamic_auc",
     "survival_brier_score",
     "isolation_forest_score",
+    "local_outlier_factor_score",
     "dumps",
     "loads",
 ]
@@ -2320,6 +2324,107 @@ def isolation_forest_score(X, n_estimators=100, max_samples=256, seed=0):
     except (OverflowError, ValueError, ZeroDivisionError) as exc:
         raise FloatingPointError(
             "non-finite value encountered during isolation forest scoring"
+        ) from exc
+
+
+def local_outlier_factor_score(X, n_neighbors=20) -> "list[float]":
+    """Return the local outlier factor (LOF) of each row of ``X``.
+
+    ``n_neighbors`` must be an exact integer ``k`` with
+    ``1 <= k < len(X)`` and ``X`` must be a non-empty rectangular matrix
+    with at least two rows, whose rows are non-empty lists and whose
+    elements have type exactly ``int`` or are finite values of type
+    exactly ``float`` (booleans and subclasses are rejected); any
+    violation raises ValueError.
+
+    Let ``F = math.fsum``. For each pair ``i != j`` the Euclidean
+    distance is ``d(i, j) = sqrt(F((X[i][h] - X[j][h]) ** 2))`` summed
+    over columns in ascending order. The other samples are sorted by
+    ``(d(i, j), j)`` ascending and the ``k``-th entry gives ``kd_i``;
+    the neighborhood ``N_i`` is ``{j != i: d(i, j) <= kd_i}`` (ties
+    included). For each sample
+    ``r_i = max(F(max(kd_j, d(i, j)) for j in N_i) / len(N_i),
+    sys.float_info.epsilon)`` with the terms summed over ``j`` in
+    ascending index order, and the returned factor is
+    ``LOF_i = F(r_i / r_j for j in N_i) / len(N_i)``, again with the
+    terms in ascending ``j`` order. Factors come back as floats in input
+    order with zero written as ``+0.0``; any OverflowError, ValueError,
+    ZeroDivisionError or non-finite intermediate value or result after
+    validation raises FloatingPointError. ``X`` is not modified, only
+    the standard library is used, and the same arguments always give
+    the same result.
+    """
+    if type(n_neighbors) is not int:
+        raise ValueError("n_neighbors must be an integer")
+    width = _check_tree_matrix(X)
+    if len(X) < 2:
+        raise ValueError("X must have at least two rows")
+    if n_neighbors < 1 or n_neighbors >= len(X):
+        raise ValueError(
+            "n_neighbors must satisfy 1 <= n_neighbors < len(X)"
+        )
+
+    try:
+        n = len(X)
+        epsilon = sys.float_info.epsilon
+        distances = [[0.0] * n for _ in range(n)]
+        for i in range(n):
+            row = distances[i]
+            for j in range(i + 1, n):
+                d_ij = math.sqrt(
+                    math.fsum(
+                        (X[i][h] - X[j][h]) ** 2 for h in range(width)
+                    )
+                )
+                if not math.isfinite(d_ij):
+                    raise FloatingPointError(
+                        "non-finite value encountered during local"
+                        " outlier factor scoring"
+                    )
+                row[j] = d_ij
+                distances[j][i] = d_ij
+        k_distances = [0.0] * n
+        neighborhoods = [None] * n
+        for i in range(n):
+            row = distances[i]
+            ordered = sorted(
+                (j for j in range(n) if j != i),
+                key=lambda j: (row[j], j),
+            )
+            kd_i = row[ordered[n_neighbors - 1]]
+            k_distances[i] = kd_i
+            neighborhoods[i] = [j for j in ordered if row[j] <= kd_i]
+
+        reachability = [0.0] * n
+        for i in range(n):
+            neighbors_i = sorted(neighborhoods[i])
+            value = math.fsum(
+                max(k_distances[j], distances[j][i]) for j in neighbors_i
+            ) / len(neighbors_i)
+            if not math.isfinite(value):
+                raise FloatingPointError(
+                    "non-finite value encountered during local outlier"
+                    " factor scoring"
+                )
+            reachability[i] = max(value, epsilon)
+
+        factors = []
+        for i in range(n):
+            neighbors_i = sorted(neighborhoods[i])
+            factor = math.fsum(
+                reachability[i] / reachability[j] for j in neighbors_i
+            ) / len(neighbors_i)
+            if not math.isfinite(factor):
+                raise FloatingPointError(
+                    "non-finite value encountered during local outlier"
+                    " factor scoring"
+                )
+            factors.append(_positive_zero(factor))
+        return factors
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during local outlier factor"
+            " scoring"
         ) from exc
 
 
