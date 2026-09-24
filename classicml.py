@@ -21169,7 +21169,7 @@ def dumps(model):
     MultinomialLogisticRegression, StandardScaler,
     DecisionTreeClassifier, DecisionTreeRegressor,
     RandomForestClassifier, ExtraTreesClassifier,
-    RandomForestRegressor, AdaBoostClassifier,
+    RandomForestRegressor, ExtraTreesRegressor, AdaBoostClassifier,
     GradientBoostingRegressor, GradientBoostingClassifier,
     GaussianMixture, KNeighborsRegressor,
     KNeighborsClassifier, AgglomerativeClustering, DBSCAN,
@@ -21227,6 +21227,8 @@ def dumps(model):
     decimal places via ``Decimal(str(v))`` with ROUND_HALF_UP (negative
     zero becomes ``0.0000000000``); the quantized text must convert back
     with ``float`` to exactly the original value.
+    ExtraTreesRegressor uses this exact same format, differing only in
+    ``class`` being ``"ExtraTreesRegressor"``.
 
     For AdaBoostClassifier the top-level keys are ``class``,
     ``n_estimators``, ``n_features_in``, ``stumps`` in that order;
@@ -21488,11 +21490,23 @@ def dumps(model):
 
     if isinstance(model, RandomForestRegressor):
         try:
-            return _dumps_forest_regressor(model)
+            return _dumps_forest_regressor(
+                model, "RandomForestRegressor"
+            )
         except ValueError:
             raise
         except Exception as exc:
             raise ValueError("invalid RandomForestRegressor state") from exc
+
+    if isinstance(model, ExtraTreesRegressor):
+        try:
+            return _dumps_forest_regressor(
+                model, "ExtraTreesRegressor"
+            )
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("invalid ExtraTreesRegressor state") from exc
 
     if isinstance(model, DecisionTreeRegressor):
         try:
@@ -21598,7 +21612,7 @@ def dumps(model):
         "MultinomialLogisticRegression, "
         "StandardScaler, DecisionTreeClassifier, DecisionTreeRegressor, "
         "RandomForestClassifier, ExtraTreesClassifier, "
-        "RandomForestRegressor, "
+        "RandomForestRegressor, ExtraTreesRegressor, "
         "AdaBoostClassifier, GradientBoostingRegressor, "
         "GradientBoostingClassifier, "
         "GaussianMixture, KNeighborsRegressor, "
@@ -22430,25 +22444,27 @@ def _dumps_tree_regressor(model):
     )
 
 
-def _dumps_forest_regressor(model):
-    """Serialize a fitted RandomForestRegressor.
+def _dumps_forest_regressor(model, class_name):
+    """Serialize a fitted RandomForestRegressor or ExtraTreesRegressor.
 
     The top-level keys are class, n_estimators, max_depth, max_features,
     seed, n_features_in, trees in that order; class is
-    ``"RandomForestRegressor"``, seed is a JSON integer, max_depth is a
+    ``"RandomForestRegressor"`` or ``"ExtraTreesRegressor"``, seed is a
+    JSON integer, max_depth is a
     positive JSON integer or the string ``"none"``, and the remaining
     numeric fields (n_estimators, max_features, n_features_in) are
     positive JSON integers with ``max_features <= n_features_in``. The
     ``trees`` array holds exactly n_estimators node trees encoded by
-    ``_encode_forest_regressor_node``. The construction parameters are
-    re-validated exactly as ``__init__`` performs the checks, and the
-    fitted state must match them in shape.
+    ``_encode_forest_regressor_node``. The two classes share this format
+    exactly, differing only in the ``class`` string. The construction
+    parameters are re-validated exactly as ``__init__`` performs the
+    checks, and the fitted state must match them in shape.
     """
     trees = model._trees
     n_features = model._n_features
     if trees is None or n_features is None:
         raise ValueError(
-            "RandomForestRegressor must be fitted before dumps is called"
+            class_name + " must be fitted before dumps is called"
         )
     n_estimators = model.n_estimators
     max_depth = model.max_depth
@@ -22462,7 +22478,7 @@ def _dumps_forest_regressor(model):
         or type(seed) is not int
     ):
         raise ValueError(
-            "RandomForestRegressor has invalid construction parameters"
+            class_name + " has invalid construction parameters"
         )
     if max_depth is not None and (
         type(max_depth) is not int or max_depth < 1
@@ -22484,7 +22500,7 @@ def _dumps_forest_regressor(model):
         _encode_forest_regressor_node(tree, n_features) for tree in trees
     ) + "]"
     return (
-        '{"class":"RandomForestRegressor","n_estimators":'
+        '{"class":"' + class_name + '","n_estimators":'
         + str(n_estimators)
         + ',"max_depth":'
         + max_depth_text
@@ -23821,18 +23837,18 @@ def _load_tree_regressor(pairs):
     return model
 
 
-def _load_forest_regressor(pairs):
+def _load_forest_regressor(pairs, class_name):
     keys = tuple(key for key, _ in pairs)
     if keys != _SERIAL_KEYS_FOREST_REGRESSOR:
         raise ValueError(
-            "RandomForestRegressor JSON must have exactly the serialized "
+            class_name + " JSON must have exactly the serialized "
             "keys in the serialized order"
         )
     data = _convert(pairs)
 
-    class_name = data["class"]
-    if not isinstance(class_name, str) or class_name != "RandomForestRegressor":
-        raise ValueError('class must be "RandomForestRegressor"')
+    class_entry = data["class"]
+    if not isinstance(class_entry, str) or class_entry != class_name:
+        raise ValueError('class must be "' + class_name + '"')
 
     n_estimators = _expect_int(data["n_estimators"], "n_estimators")
     if n_estimators <= 0:
@@ -23865,12 +23881,20 @@ def _load_forest_regressor(pairs):
         _load_forest_regressor_node(tree, n_features) for tree in trees_node
     ]
 
-    model = RandomForestRegressor(
-        n_estimators=n_estimators,
-        max_depth=max_depth,
-        max_features=max_features,
-        seed=seed,
-    )
+    if class_name == "ExtraTreesRegressor":
+        model = ExtraTreesRegressor(
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            max_features=max_features,
+            seed=seed,
+        )
+    else:
+        model = RandomForestRegressor(
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            max_features=max_features,
+            seed=seed,
+        )
     model._trees = trees
     model._n_features = n_features
     return model
@@ -24452,7 +24476,7 @@ def loads(text):
     MultinomialLogisticRegression, StandardScaler,
     DecisionTreeClassifier, DecisionTreeRegressor,
     RandomForestClassifier, ExtraTreesClassifier,
-    RandomForestRegressor, AdaBoostClassifier,
+    RandomForestRegressor, ExtraTreesRegressor, AdaBoostClassifier,
     GradientBoostingRegressor, GradientBoostingClassifier,
     GaussianMixture, KNeighborsRegressor, KNeighborsClassifier,
     AgglomerativeClustering, DBSCAN, IsolationForest, or KMedoids
@@ -24478,7 +24502,8 @@ def loads(text):
     MultinomialLogisticRegression from the column count of ``W``
     (with its ``classes``/``W``/``b`` arrays copied rather than shared),
     StandardScaler/DecisionTreeClassifier/DecisionTreeRegressor/
-    RandomForestClassifier/ExtraTreesClassifier/RandomForestRegressor
+    RandomForestClassifier/ExtraTreesClassifier/RandomForestRegressor/
+    ExtraTreesRegressor
     from ``n_features_in``,
     AdaBoostClassifier from ``n_features_in``,
     GradientBoostingRegressor/GradientBoostingClassifier from
@@ -24620,7 +24645,18 @@ def loads(text):
             raise ValueError("malformed serialized model") from exc
     if class_entry == "RandomForestRegressor":
         try:
-            return _load_forest_regressor(pairs)
+            return _load_forest_regressor(
+                pairs, "RandomForestRegressor"
+            )
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("malformed serialized model") from exc
+    if class_entry == "ExtraTreesRegressor":
+        try:
+            return _load_forest_regressor(
+                pairs, "ExtraTreesRegressor"
+            )
         except ValueError:
             raise
         except Exception as exc:
