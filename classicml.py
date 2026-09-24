@@ -196,6 +196,7 @@ __all__ = [
     "AdaBoostClassifier",
     "GradientBoostingRegressor",
     "GradientBoostingClassifier",
+    "LassoRegression",
     "StandardScaler",
     "KMeans",
     "PCA",
@@ -3190,6 +3191,169 @@ class GradientBoostingClassifier:
                     "non-finite value encountered during gradient boosting"
                 )
             results.append([_positive_zero(negative), _positive_zero(p)])
+        return results
+
+
+class LassoRegression:
+    """Linear regression with an L1 penalty, fitted by coordinate descent.
+
+    Training starts from ``w = [0.0] * n_features`` and
+    ``b = fsum(y) / n``. Each round first sets the intercept to
+    ``b = fsum(y_i - fsum(w_j * x_ij)) / n`` and then visits the features
+    ``j`` in ascending order. For each feature it computes
+    ``r = fsum(x_ij * (y_i - b - fsum(w_k * x_ik for k != j))) / n`` and
+    ``z = fsum(x_ij ** 2) / n``. When ``z`` is zero the weight becomes
+    ``0.0``; otherwise the soft-thresholded value ``s`` is ``r - alpha``
+    when ``r > alpha``, ``r + alpha`` when ``r < -alpha`` and ``0``
+    otherwise, giving ``w_j = s / z``. Every sum iterates over indices in
+    ascending order and uses ``math.fsum``. Training stops after a round
+    whose largest absolute change in ``b`` or any weight is at most
+    ``tol``, and in any case after at most ``max_iter`` rounds. No
+    randomness is used.
+    """
+
+    def __init__(self, alpha=1.0, max_iter=1000, tol=1e-8):
+        _require_exact_finite_positive(alpha, "alpha")
+        if type(max_iter) is not int or max_iter <= 0:
+            raise ValueError("max_iter must be a positive integer")
+        _require_exact_finite_positive(tol, "tol")
+
+        self.alpha = alpha
+        self.max_iter = max_iter
+        self.tol = tol
+        self.w = None
+        self.b = None
+
+    def fit(self, X, y):
+        # Clear any previous fit up front so that a failed validation or
+        # computation leaves the model unfitted.
+        self.w = None
+        self.b = None
+        try:
+            width = _check_gradient_matrix(X)
+            _check_gradient_target(y, len(X))
+        except OverflowError as exc:
+            # An int too large to convert to float failed its finiteness
+            # check: still a rejected input, hence ValueError.
+            raise ValueError(
+                "X and y must contain only finite non-boolean numbers"
+            ) from exc
+
+        n = len(X)
+        w = [0.0] * width
+        try:
+            b = math.fsum(y) / n
+        except (OverflowError, ValueError, ZeroDivisionError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during lasso regression"
+            ) from exc
+        if not math.isfinite(b):
+            raise FloatingPointError(
+                "non-finite value encountered during lasso regression"
+            )
+        b = _positive_zero(b)
+        alpha = self.alpha
+        tol = self.tol
+
+        try:
+            for _ in range(self.max_iter):
+                previous_b = b
+                b = math.fsum(
+                    y[i]
+                    - math.fsum(w[j] * X[i][j] for j in range(width))
+                    for i in range(n)
+                ) / n
+                if not math.isfinite(b):
+                    raise FloatingPointError(
+                        "non-finite value encountered during lasso regression"
+                    )
+                max_change = abs(b - previous_b)
+
+                for j in range(width):
+                    previous_w = w[j]
+                    r = math.fsum(
+                        X[i][j]
+                        * (
+                            y[i]
+                            - b
+                            - math.fsum(
+                                w[k] * X[i][k]
+                                for k in range(width)
+                                if k != j
+                            )
+                        )
+                        for i in range(n)
+                    ) / n
+                    z = math.fsum(X[i][j] ** 2 for i in range(n)) / n
+                    if not math.isfinite(r) or not math.isfinite(z):
+                        raise FloatingPointError(
+                            "non-finite value encountered during lasso "
+                            "regression"
+                        )
+                    if z == 0.0:
+                        updated = 0.0
+                    else:
+                        if r > alpha:
+                            s = r - alpha
+                        elif r < -alpha:
+                            s = r + alpha
+                        else:
+                            s = 0.0
+                        updated = s / z
+                        if not math.isfinite(updated):
+                            raise FloatingPointError(
+                                "non-finite value encountered during lasso "
+                                "regression"
+                            )
+                    w[j] = updated
+                    change = abs(updated - previous_w)
+                    if change > max_change:
+                        max_change = change
+
+                b = _positive_zero(b)
+                if max_change <= tol:
+                    break
+        except (OverflowError, ValueError, ZeroDivisionError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during lasso regression"
+            ) from exc
+
+        self.w = w
+        self.b = b
+        return self
+
+    def predict(self, X):
+        if self.w is None or self.b is None:
+            raise ValueError("model must be fitted before predict is called")
+        try:
+            width = _check_gradient_matrix(X)
+        except OverflowError as exc:
+            raise ValueError(
+                "X must contain only finite non-boolean numbers"
+            ) from exc
+        if width != len(self.w):
+            raise ValueError(
+                "X must have the same number of features as the training data"
+            )
+
+        results = []
+        for row in X:
+            try:
+                prediction = (
+                    math.fsum(self.w[j] * row[j] for j in range(width))
+                    + self.b
+                )
+            except (
+                OverflowError,
+                ValueError,
+                ZeroDivisionError,
+            ) as exc:
+                raise FloatingPointError(
+                    "non-finite prediction encountered"
+                ) from exc
+            if not math.isfinite(prediction):
+                raise FloatingPointError("non-finite prediction encountered")
+            results.append(_positive_zero(prediction))
         return results
 
 
