@@ -267,6 +267,7 @@ __all__ = [
     "precision_at_k_score",
     "recall_at_k_score",
     "mean_average_precision_at_k_score",
+    "concordance_correlation_coefficient",
     "dumps",
     "loads",
 ]
@@ -14547,6 +14548,245 @@ def mean_average_precision_at_k_score(
     return _weighted_mean_at_k(
         y_true, y_score, k, sample_weight, "map"
     )
+
+
+def concordance_correlation_coefficient(y_true, y_pred,
+                                        sample_weight=None) -> float:
+    """Return the weighted concordance correlation coefficient.
+
+    ``y_true`` and ``y_pred`` must be non-empty lists of equal length
+    whose elements are finite values of type exactly ``int`` or
+    ``float`` (booleans are rejected). ``sample_weight`` must be
+    ``None`` -- every position then weighs ``1.0`` -- or a list of the
+    same length whose elements are finite non-negative values of type
+    exactly ``int`` or ``float`` (booleans are rejected). Any
+    container, length, type, value, range, or finiteness violation
+    (including ``OverflowError`` raised by ``math.isfinite``) raises
+    ValueError.
+
+    After validation the values and weights are converted to ``float``
+    in input order; a conversion failure or a non-finite converted
+    value raises FloatingPointError. ``math.fsum`` computes the total
+    weight ``W = sum(w_i)``; if that summation overflows or is
+    invalid, is non-finite, or ``W`` is less than or equal to zero, a
+    ValueError is raised. In input order, ``math.fsum`` computes the
+    weighted means ``mt = sum(w_i * t_i) / W`` and
+    ``mp = sum(w_i * p_i) / W``, the weighted variances
+    ``Vt = sum(w_i * (t_i - mt) ** 2) / W`` and
+    ``Vp = sum(w_i * (p_i - mp) ** 2) / W``, and the weighted
+    covariance ``C = sum(w_i * (t_i - mt) * (p_i - mp)) / W``. With
+    ``D = Vt + Vp + (mt - mp) ** 2`` the result is ``1.0`` when
+    ``D == 0`` and ``2 * C / D`` otherwise; the result is not clipped.
+    Overflow, invalid operations, or division by zero during the
+    post-validation conversion, arithmetic, summation, and final
+    division, and non-finite intermediate values or results, raise
+    FloatingPointError.
+
+    An exact zero result is normalized to positive ``0.0``. The return
+    value is a float. The inputs are not modified. Deterministic: same
+    inputs, same result.
+    """
+    n = _check_metric_vectors(y_true, y_pred)
+    for name, values in (("y_true", y_true), ("y_pred", y_pred)):
+        for value in values:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "%s must contain only finite non-boolean numbers" % name
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "%s must contain only finite non-boolean numbers" % name
+                ) from exc
+            if not finite:
+                raise ValueError(
+                    "%s must contain only finite non-boolean numbers" % name
+                )
+
+    if sample_weight is not None:
+        if not isinstance(sample_weight, list) or len(sample_weight) != n:
+            raise ValueError(
+                "sample_weight must be a list with the same length as y_true"
+            )
+        for value in sample_weight:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                ) from exc
+            if not finite or value < 0:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+
+    try:
+        t = [float(value) for value in y_true]
+        p = [float(value) for value in y_pred]
+        if sample_weight is None:
+            w = [1.0] * n
+        else:
+            w = [float(value) for value in sample_weight]
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during concordance correlation "
+            "coefficient"
+        ) from exc
+    for values in (t, p, w):
+        for value in values:
+            if not math.isfinite(value):
+                raise FloatingPointError(
+                    "non-finite value encountered during concordance "
+                    "correlation coefficient"
+                )
+
+    try:
+        total_weight = math.fsum(w)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError("the total weight must be greater than 0") from exc
+    if not math.isfinite(total_weight) or total_weight <= 0.0:
+        raise ValueError("the total weight must be greater than 0")
+
+    def _weighted_sum(terms):
+        try:
+            total = math.fsum(terms)
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during concordance "
+                "correlation coefficient"
+            ) from exc
+        if not math.isfinite(total):
+            raise FloatingPointError(
+                "non-finite value encountered during concordance "
+                "correlation coefficient"
+            )
+        return total
+
+    def _divide(total):
+        try:
+            value = total / total_weight
+        except (OverflowError, ValueError, ZeroDivisionError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during concordance "
+                "correlation coefficient"
+            ) from exc
+        if not math.isfinite(value):
+            raise FloatingPointError(
+                "non-finite value encountered during concordance "
+                "correlation coefficient"
+            )
+        return value
+
+    def _products(terms, left, right):
+        try:
+            product = left * right
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during concordance "
+                "correlation coefficient"
+            ) from exc
+        if not math.isfinite(product):
+            raise FloatingPointError(
+                "non-finite value encountered during concordance "
+                "correlation coefficient"
+            )
+        terms.append(product)
+
+    mean_t_terms = []
+    mean_p_terms = []
+    for i in range(n):
+        _products(mean_t_terms, w[i], t[i])
+        _products(mean_p_terms, w[i], p[i])
+    mt = _divide(_weighted_sum(mean_t_terms))
+    mp = _divide(_weighted_sum(mean_p_terms))
+
+    var_t_terms = []
+    var_p_terms = []
+    cross_terms = []
+    for i in range(n):
+        try:
+            dt = t[i] - mt
+            dp = p[i] - mp
+            qt = dt ** 2
+            qp = dp ** 2
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during concordance "
+                "correlation coefficient"
+            ) from exc
+        if (
+            not math.isfinite(dt)
+            or not math.isfinite(dp)
+            or not math.isfinite(qt)
+            or not math.isfinite(qp)
+        ):
+            raise FloatingPointError(
+                "non-finite value encountered during concordance "
+                "correlation coefficient"
+            )
+        _products(var_t_terms, w[i], qt)
+        _products(var_p_terms, w[i], qp)
+        _products(cross_terms, dt, dp)
+
+    cross_products = cross_terms
+    cov_weighted = []
+    for i in range(n):
+        _products(cov_weighted, w[i], cross_products[i])
+
+    vt = _divide(_weighted_sum(var_t_terms))
+    vp = _divide(_weighted_sum(var_p_terms))
+    c = _divide(_weighted_sum(cov_weighted))
+
+    try:
+        mean_gap = mt - mp
+        gap_square = mean_gap ** 2
+        denominator = vt + vp + gap_square
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during concordance "
+            "correlation coefficient"
+        ) from exc
+    if (
+        not math.isfinite(mean_gap)
+        or not math.isfinite(gap_square)
+        or not math.isfinite(denominator)
+    ):
+        raise FloatingPointError(
+            "non-finite value encountered during concordance "
+            "correlation coefficient"
+        )
+
+    if denominator == 0:
+        return 1.0
+
+    try:
+        numerator = 2.0 * c
+        result = numerator / denominator
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during concordance "
+            "correlation coefficient"
+        ) from exc
+    if not math.isfinite(result):
+        raise FloatingPointError(
+            "non-finite value encountered during concordance "
+            "correlation coefficient"
+        )
+    if result == 0:
+        result = 0.0
+    return result
 
 
 _SERIAL_KEYS_KMEANS = (
