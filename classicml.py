@@ -237,6 +237,7 @@ __all__ = [
     "d2_tweedie_score",
     "precision_recall_fscore_support",
     "confusion_matrix",
+    "multilabel_confusion_matrix",
     "precision_score",
     "recall_score",
     "f1_score",
@@ -9296,6 +9297,155 @@ def confusion_matrix(y_true, y_pred, sample_weight=None, normalize=None):
                 matrix[r][c], grand_total
             )
     return normalized
+
+
+def multilabel_confusion_matrix(
+    y_true, y_pred, labels=None, sample_weight=None
+) -> list:
+    """Build one 2x2 confusion matrix per label, in label order.
+
+    ``y_true`` and ``y_pred`` must be non-empty lists of equal length
+    whose elements have type exactly ``int`` (booleans are rejected).
+    When ``labels`` is ``None`` it defaults to the sorted union of the
+    labels appearing in either vector, in ascending order; otherwise
+    ``labels`` must be a non-empty list of distinct elements of type
+    exactly ``int`` and its order is preserved. It may name labels that
+    never occur and omit labels that do. ``sample_weight`` must be
+    ``None`` or a list of the same length whose elements are finite
+    non-negative values of type exactly ``int`` or ``float`` (booleans
+    are rejected). Any violation -- including an OverflowError during a
+    finiteness check -- raises ValueError.
+
+    For each label ``c`` the returned matrix is
+    ``[[TN, FP], [FN, TP]]``: both vectors are not ``c``, only the
+    prediction is ``c``, only the truth is ``c``, and both are ``c``.
+    Without weights the cells hold exact ``int`` counts. With weights
+    each cell sums the weights of its samples, in sample order, with
+    ``math.fsum`` and holds a ``float``; an empty cell or an exact zero
+    sum is ``+0.0``. ``math.fsum`` raising OverflowError or ValueError,
+    or producing a non-finite result, raises FloatingPointError.
+
+    The return value is a three-level list. The inputs are not
+    modified. Deterministic: same inputs, same result.
+    """
+    n = _check_metric_vectors(y_true, y_pred)
+    for value in y_true:
+        if type(value) is not int:
+            raise ValueError("y_true must contain only integers")
+    for value in y_pred:
+        if type(value) is not int:
+            raise ValueError("y_pred must contain only integers")
+
+    if labels is None:
+        label_list = sorted(set(y_true) | set(y_pred))
+    else:
+        if not isinstance(labels, list) or len(labels) == 0:
+            raise ValueError("labels must be a non-empty list")
+        label_list = []
+        seen = set()
+        for value in labels:
+            if type(value) is not int or value in seen:
+                raise ValueError(
+                    "labels must contain only distinct integers"
+                )
+            seen.add(value)
+            label_list.append(value)
+
+    weighted = sample_weight is not None
+    if weighted:
+        if not isinstance(sample_weight, list) or len(sample_weight) != n:
+            raise ValueError(
+                "sample_weight must be a list with the same length as the "
+                "label vectors"
+            )
+        for value in sample_weight:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                ) from exc
+            if not finite or value < 0:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+
+    # Cells per label, in label order: [TN, FP, FN, TP]. With weights the
+    # terms are accumulated per cell in sample order for math.fsum.
+    if weighted:
+        terms = [[[] for _ in range(4)] for _ in label_list]
+        for i in range(n):
+            true_label = y_true[i]
+            pred_label = y_pred[i]
+            weight = float(sample_weight[i])
+            for k, c in enumerate(label_list):
+                in_true = true_label == c
+                in_pred = pred_label == c
+                if not in_true and not in_pred:
+                    cell = 0
+                elif not in_true and in_pred:
+                    cell = 1
+                elif in_true and not in_pred:
+                    cell = 2
+                else:
+                    cell = 3
+                terms[k][cell].append(weight)
+
+        result = []
+        for k in range(len(label_list)):
+            cells = [0.0, 0.0, 0.0, 0.0]
+            for cell in range(4):
+                cell_terms = terms[k][cell]
+                if not cell_terms:
+                    continue
+                try:
+                    total = math.fsum(cell_terms)
+                except (OverflowError, ValueError) as exc:
+                    raise FloatingPointError(
+                        "non-finite value encountered during multilabel "
+                        "confusion matrix"
+                    ) from exc
+                if not math.isfinite(total):
+                    raise FloatingPointError(
+                        "non-finite value encountered during multilabel "
+                        "confusion matrix"
+                    )
+                cells[cell] = total
+            result.append(
+                [[cells[0], cells[1]], [cells[2], cells[3]]]
+            )
+        return result
+
+    counts = [[0 for _ in range(4)] for _ in label_list]
+    for i in range(n):
+        true_label = y_true[i]
+        pred_label = y_pred[i]
+        for k, c in enumerate(label_list):
+            in_true = true_label == c
+            in_pred = pred_label == c
+            if not in_true and not in_pred:
+                cell = 0
+            elif not in_true and in_pred:
+                cell = 1
+            elif in_true and not in_pred:
+                cell = 2
+            else:
+                cell = 3
+            counts[k][cell] += 1
+
+    return [
+        [[cells[0], cells[1]], [cells[2], cells[3]]]
+        for cells in counts
+    ]
 
 
 def precision_score(
