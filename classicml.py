@@ -60,6 +60,10 @@ Exports:
         score of two finite real vectors.
     concordance_correlation_coefficient -- Lin's weighted concordance
         correlation coefficient of two finite real vectors.
+    concordance_index -- Harrell's weighted concordance (C-) index of
+        censored event times against a risk score: comparable pairs with
+        the higher risk on the earlier event count fully, tied risks
+        half.
     mean_pinball_loss -- weighted mean pinball (quantile) loss of two
         finite real vectors at a quantile level alpha in [0, 1].
     d2_pinball_score -- fraction by which pinball loss improves over the
@@ -251,6 +255,7 @@ __all__ = [
     "r2_score",
     "explained_variance_score",
     "concordance_correlation_coefficient",
+    "concordance_index",
     "mean_absolute_percentage_error",
     "symmetric_mean_absolute_percentage_error",
     "median_absolute_percentage_error",
@@ -6668,6 +6673,235 @@ def concordance_correlation_coefficient(
         raise FloatingPointError(
             "non-finite value encountered during concordance correlation "
             "coefficient computation"
+        )
+    if result == 0:
+        result = 0.0
+    return result
+
+
+def _concordance_index_float(value):
+    """Convert a validated concordance-index number to float; overflow,
+    invalid conversion, and a non-finite result raise FloatingPointError."""
+    try:
+        result = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during concordance index "
+            "computation"
+        ) from exc
+    if not math.isfinite(result):
+        raise FloatingPointError(
+            "non-finite value encountered during concordance index "
+            "computation"
+        )
+    return result
+
+
+def concordance_index(event_time, risk_score, event_observed=None,
+                      sample_weight=None) -> float:
+    """Return Harrell's weighted concordance (C-) index.
+
+    ``event_time`` and ``risk_score`` must be non-empty lists of equal
+    length whose elements are finite values of type exactly ``int`` or
+    ``float`` (booleans are rejected); every event time must also be
+    non-negative. ``event_observed`` must be ``None`` -- every
+    observation is then treated as an event -- or a list of the same
+    length whose elements are exactly the integers ``0`` or ``1``
+    (booleans are rejected). ``sample_weight`` must be ``None`` --
+    every observation then weighs ``1.0`` -- or a list of the same
+    length whose elements are finite non-negative values of type
+    exactly ``int`` or ``float`` (booleans are rejected). Any
+    violation (including ``OverflowError`` raised by
+    ``math.isfinite``) raises ValueError.
+
+    After validation, every value is converted to ``float``. Pairs are
+    examined with the outer index ``i`` and inner index ``j`` over
+    ``i < j``. A pair is comparable only when
+    ``event_time[i] < event_time[j]`` and ``event_observed[i] == 1``,
+    or vice versa; equal times and pairs whose earlier observation was
+    censored are ignored. Writing the earlier event observation as
+    ``a`` and the other observation as ``b``, with weights ``w``, the
+    comparable pair has weight ``q = w_a * w_b`` and contributes ``q``
+    when ``risk_score[a] > risk_score[b]``, ``0.5 * q`` on equal risk,
+    and ``0`` otherwise. ``math.fsum`` accumulates the total
+    comparable weight ``W`` and the concordant weight ``C``. When
+    ``W <= 0`` (no comparable pairs) ValueError is raised; otherwise
+    the result is ``C / W``, with an exact zero normalized to positive
+    ``0.0``. Overflow, invalid operations during the post-validation
+    conversion, multiplication or division, in ``math.fsum``, or a
+    non-finite intermediate value or result raise
+    FloatingPointError.
+
+    The return value is a float. The inputs are not modified.
+    Deterministic: same inputs, same result.
+    """
+    if not isinstance(event_time, list) or not isinstance(risk_score, list):
+        raise ValueError("event_time and risk_score must be lists")
+    if len(event_time) == 0 or len(risk_score) == 0:
+        raise ValueError(
+            "event_time and risk_score must be non-empty lists"
+        )
+    if len(event_time) != len(risk_score):
+        raise ValueError(
+            "event_time and risk_score must have the same length"
+        )
+    n = len(event_time)
+
+    for value in event_time:
+        if type(value) not in (int, float):
+            raise ValueError(
+                "event_time must contain only finite non-negative "
+                "non-boolean numbers"
+            )
+        # math.isfinite raises OverflowError for ints too large to
+        # convert to float; such values fail the finite requirement.
+        try:
+            finite = math.isfinite(value)
+        except OverflowError as exc:
+            raise ValueError(
+                "event_time must contain only finite non-negative "
+                "non-boolean numbers"
+            ) from exc
+        if not finite or value < 0:
+            raise ValueError(
+                "event_time must contain only finite non-negative "
+                "non-boolean numbers"
+            )
+
+    for value in risk_score:
+        if type(value) not in (int, float):
+            raise ValueError(
+                "risk_score must contain only finite non-boolean numbers"
+            )
+        try:
+            finite = math.isfinite(value)
+        except OverflowError as exc:
+            raise ValueError(
+                "risk_score must contain only finite non-boolean numbers"
+            ) from exc
+        if not finite:
+            raise ValueError(
+                "risk_score must contain only finite non-boolean numbers"
+            )
+
+    if event_observed is None:
+        events = [1] * n
+    else:
+        if not isinstance(event_observed, list) or len(event_observed) != n:
+            raise ValueError(
+                "event_observed must be a list with the same length as "
+                "event_time"
+            )
+        for value in event_observed:
+            if type(value) is not int or value not in (0, 1):
+                raise ValueError(
+                    "event_observed must contain only the integers 0 and 1"
+                )
+        events = list(event_observed)
+
+    if sample_weight is None:
+        weights = [1.0] * n
+    else:
+        if not isinstance(sample_weight, list) or len(sample_weight) != n:
+            raise ValueError(
+                "sample_weight must be a list with the same length as "
+                "event_time"
+            )
+        for value in sample_weight:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                ) from exc
+            if not finite or value < 0:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+        weights = [_concordance_index_float(value) for value in sample_weight]
+
+    times = [_concordance_index_float(value) for value in event_time]
+    risks = [_concordance_index_float(value) for value in risk_score]
+
+    weight_terms = []
+    concordant_terms = []
+    # i outer, j inner, over i < j; each comparable pair is visited once.
+    for i in range(n):
+        for j in range(i + 1, n):
+            if times[i] == times[j]:
+                continue
+            if times[i] < times[j]:
+                if events[i] != 1:
+                    continue
+                earlier, later = i, j
+            else:
+                if events[j] != 1:
+                    continue
+                earlier, later = j, i
+            try:
+                pair_weight = weights[earlier] * weights[later]
+            except (OverflowError, ValueError) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during concordance "
+                    "index computation"
+                ) from exc
+            if not math.isfinite(pair_weight):
+                raise FloatingPointError(
+                    "non-finite value encountered during concordance "
+                    "index computation"
+                )
+            weight_terms.append(pair_weight)
+            if risks[earlier] > risks[later]:
+                concordant_terms.append(pair_weight)
+            elif risks[earlier] == risks[later]:
+                try:
+                    half_weight = 0.5 * pair_weight
+                except (OverflowError, ValueError) as exc:
+                    raise FloatingPointError(
+                        "non-finite value encountered during concordance "
+                        "index computation"
+                    ) from exc
+                if not math.isfinite(half_weight):
+                    raise FloatingPointError(
+                        "non-finite value encountered during concordance "
+                        "index computation"
+                    )
+                concordant_terms.append(half_weight)
+    try:
+        total_weight = math.fsum(weight_terms)
+        concordant_weight = math.fsum(concordant_terms)
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during concordance index "
+            "computation"
+        ) from exc
+    if not math.isfinite(total_weight) or not math.isfinite(concordant_weight):
+        raise FloatingPointError(
+            "non-finite value encountered during concordance index "
+            "computation"
+        )
+    if total_weight <= 0.0:
+        raise ValueError(
+            "the total weight of comparable pairs must be greater than 0"
+        )
+    try:
+        result = concordant_weight / total_weight
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during concordance index "
+            "computation"
+        ) from exc
+    if not math.isfinite(result):
+        raise FloatingPointError(
+            "non-finite value encountered during concordance index "
+            "computation"
         )
     if result == 0:
         result = 0.0
