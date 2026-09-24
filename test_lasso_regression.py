@@ -247,12 +247,17 @@ class LassoRegressionTest(unittest.TestCase):
             [[1.0], [float("nan")]],
             [[1.0], [float("inf")]],
             [[True], [False]],
-            [[1], [10 ** 400]],
         ]
         for bad in bad_matrices:
             with self.subTest(bad=bad):
                 with self.assertRaises(ValueError):
                     model.fit(bad, [0.0, 0.0])
+
+    def test_oversized_integer_entries_raise_floating_point_error(self):
+        # Exact ints of any size are *valid* inputs; only the arithmetic
+        # that cannot be represented as a finite float fails.
+        with self.assertRaises(FloatingPointError):
+            LassoRegression().fit([[1], [10 ** 400]], [0, 0])
 
     def test_invalid_targets_raise_value_error(self):
         X = [[0.0], [1.0]]
@@ -264,7 +269,9 @@ class LassoRegressionTest(unittest.TestCase):
             LassoRegression().fit(X, [0, True])
         with self.assertRaises(ValueError):
             LassoRegression().fit(X, [0.0, float("nan")])
-        with self.assertRaises(ValueError):
+
+    def test_oversized_integer_target_raises_floating_point_error(self):
+        with self.assertRaises(FloatingPointError):
             LassoRegression().fit([[0], [1]], [0, 10 ** 400])
 
     def test_invalid_predict_matrix_raises_value_error(self):
@@ -321,6 +328,161 @@ class LassoRegressionTest(unittest.TestCase):
         self.assertGreater(model.w[0], 1.8)
         with self.assertRaises(FloatingPointError):
             model.predict([[1e308]])
+
+    def test_oversized_integer_parameters_accepted(self):
+        model = LassoRegression(alpha=10 ** 500, max_iter=3, tol=10 ** 600)
+        self.assertEqual(model.alpha, 10 ** 500)
+        self.assertEqual(model.tol, 10 ** 600)
+        # Arithmetic with such a penalty is well defined: every weight is
+        # soft-thresholded to zero and predictions equal the intercept.
+        fitted = model.fit([[0.0], [1.0], [2.0]], [1.0, 3.0, 5.0])
+        self.assertEqual(fitted.w, [0.0])
+        self.assertEqual(fitted.predict([[17.0]]), [3.0])
+
+    def test_oversized_integer_predict_raises_floating_point_error(self):
+        model = LassoRegression(alpha=0.001, max_iter=5000, tol=1e-12).fit(
+            [[0.0], [1.0], [2.0]], [0.0, 1.0, 2.0]
+        )
+        self.assertGreater(model.w[0], 0.0)
+        with self.assertRaises(FloatingPointError):
+            model.predict([[10 ** 400]])
+
+    def test_failed_fit_on_oversized_inputs_leaves_model_unfitted(self):
+        model = LassoRegression().fit([[0.0], [1.0]], [0.0, 1.0])
+        with self.assertRaises(FloatingPointError):
+            model.fit([[10 ** 400], [0]], [0, 0])
+        self.assertIsNone(model.w)
+        self.assertIsNone(model.b)
+        with self.assertRaises(ValueError):
+            model.predict([[0.0]])
+
+
+class LassoSerializationTest(unittest.TestCase):
+    def _model(self, alpha=0.3, max_iter=500, tol=1e-8, w=None, b=0.125):
+        model = LassoRegression(alpha=alpha, max_iter=max_iter, tol=tol)
+        model.w = list(w if w is not None else [1.25, -0.5])
+        model.b = b
+        return model
+
+    def test_dumps_byte_format(self):
+        text = classicml.dumps(self._model())
+        self.assertIsInstance(text, str)
+        self.assertNotIn(" ", text)
+        self.assertNotIn("\t", text)
+        self.assertNotIn("\n", text)
+        self.assertFalse(text.endswith("\n"))
+        self.assertEqual(
+            text,
+            '{"class":"LassoRegression","alpha":0.3000000000,"max_iter":500,'
+            '"tol":0.0000000100,"w":[1.2500000000,-0.5000000000],'
+            '"b":0.1250000000}',
+        )
+
+    def test_dumps_quantizes_half_up_and_normalizes_negative_zero(self):
+        text = classicml.dumps(self._model(w=[-0.0, 0.0], b=-0.0))
+        self.assertIn('"w":[0.0000000000,0.0000000000],"b":0.0000000000', text)
+
+    def test_round_trip_preserves_state_and_predictions(self):
+        model = self._model()
+        restored = classicml.loads(classicml.dumps(model))
+        self.assertIsInstance(restored, LassoRegression)
+        self.assertEqual(restored.alpha, model.alpha)
+        self.assertEqual(restored.max_iter, model.max_iter)
+        self.assertEqual(restored.tol, model.tol)
+        self.assertEqual(restored.w, model.w)
+        self.assertEqual(restored.b, model.b)
+        queries = [[0.0, 0.0], [1.0, 2.0], [-3.0, 0.5]]
+        self.assertEqual(restored.predict(queries), model.predict(queries))
+
+    def test_round_trip_returns_independent_model(self):
+        model = self._model()
+        restored = classicml.loads(classicml.dumps(model))
+        restored.w.append(9.0)
+        restored.w[0] = 100.0
+        again = classicml.loads(classicml.dumps(model))
+        self.assertEqual(again.w, model.w)
+
+    def test_dumps_accepts_integer_parameters(self):
+        text = classicml.dumps(self._model(alpha=1, tol=2, max_iter=7,
+                                           w=[0.0], b=0.0))
+        restored = classicml.loads(text)
+        self.assertEqual(restored.alpha, 1.0)
+        self.assertEqual(restored.tol, 2.0)
+        self.assertEqual(restored.max_iter, 7)
+
+    def test_dumps_rejects_unfitted_unsupported_and_contract_breaks(self):
+        with self.assertRaises(ValueError):
+            classicml.dumps(LassoRegression())
+        with self.assertRaises(ValueError):
+            classicml.dumps(object())
+        # Non-round-trippable fitted weights violate the byte contract.
+        fitted = LassoRegression(alpha=1e-10, max_iter=5000, tol=1e-12).fit(
+            [[0.0], [1.0], [2.0], [3.0]], [1.0, 3.0, 5.0, 7.0]
+        )
+        with self.assertRaises(ValueError):
+            classicml.dumps(fitted)
+        # A positive int that cannot survive float conversion is rejected.
+        huge = LassoRegression(alpha=10 ** 400, max_iter=1, tol=1e-8)
+        huge.w = [0.0]
+        huge.b = 1.0
+        with self.assertRaises(ValueError):
+            classicml.dumps(huge)
+
+    def test_loads_requires_exact_str(self):
+        text = classicml.dumps(self._model())
+        for bad in (None, 1, 1.0, True, b"x", bytearray(text, "utf-8")):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    classicml.loads(bad)
+
+    def test_loads_rejects_malformed_bytes(self):
+        good = (
+            '{"class":"LassoRegression","alpha":1.0000000000,'
+            '"max_iter":10,"tol":0.0000000100,"w":[0.0000000000],'
+            '"b":2.0000000000}'
+        )
+        self.assertEqual(classicml.loads(good).b, 2.0)
+        malformed = [
+            good + " ",
+            good[:-1] + ', "x":1}',
+            good.replace('"b":2.0000000000', '"b":2.0000000000,"x":1'),
+            # w/b out of order
+            '{"class":"LassoRegression","alpha":1.0000000000,'
+            '"max_iter":10,"tol":0.0000000100,"b":2.0000000000,'
+            '"w":[0.0000000000]}',
+            # missing key
+            '{"class":"LassoRegression","alpha":1.0000000000,'
+            '"max_iter":10,"tol":0.0000000100,"w":[0.0000000000]}',
+            # wrong class
+            good.replace('"LassoRegression"', '"Other"'),
+            # empty w
+            good.replace('"w":[0.0000000000]', '"w":[]'),
+            # non-positive parameters
+            good.replace("1.0000000000", "0.0000000000", 1),
+            good.replace('"max_iter":10', '"max_iter":0'),
+            # wrong lexical numeric forms
+            good.replace("1.0000000000", "1e0", 1),
+            good.replace("1.0000000000", "1.0", 1),
+            good.replace("1.0000000000", "01.0000000000", 1),
+            # negative zero
+            good.replace('"b":2.0000000000', '"b":-0.0000000000'),
+            # integer where a fixed number belongs (and vice versa)
+            good.replace('"alpha":1.0000000000', '"alpha":1'),
+            good.replace('"max_iter":10', '"max_iter":10.0'),
+            good.replace('"w":[0.0000000000]', '"w":[0]'),
+            # booleans / exponents / two-dimensional w
+            good.replace('[0.0000000000]', '[[0.0000000000]]'),
+            good.replace('[0.0000000000]', '[true]'),
+        ]
+        for bad in malformed:
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    classicml.loads(bad)
+        duplicate = good.replace(
+            '"max_iter":10', '"max_iter":10,"max_iter":11', 1
+        )
+        with self.assertRaises(ValueError):
+            classicml.loads(duplicate)
 
 
 if __name__ == "__main__":

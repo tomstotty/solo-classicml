@@ -2436,6 +2436,27 @@ def _require_exact_finite_positive(value, name):
         )
 
 
+def _require_exact_positive_number(value, name):
+    """Validate a strictly positive exact int/float (booleans rejected).
+
+    An int of arbitrary size is accepted even when it is too large ever
+    to be converted to float; only floats must be finite. Non-positive
+    values, non-finite floats, booleans, subclasses, and other types all
+    raise ValueError.
+    """
+    if type(value) is int:
+        if value <= 0:
+            raise ValueError(
+                "%s must be a finite non-boolean positive number" % name
+            )
+        return
+    if type(value) is float and math.isfinite(value) and value > 0.0:
+        return
+    raise ValueError(
+        "%s must be a finite non-boolean positive number" % name
+    )
+
+
 def _require_exact_finite_number(value, name):
     """Validate an exact finite int/float (booleans rejected).
 
@@ -2516,6 +2537,108 @@ def _check_gradient_binary_target(y, n):
             seen_one = True
     if not seen_zero or not seen_one:
         raise ValueError("y must contain both classes 0 and 1")
+
+
+def _check_lasso_matrix(X):
+    """Validate a non-empty rectangular matrix accepting exact ints of
+    arbitrary size and finite non-boolean floats.
+
+    Unlike :func:`_check_gradient_matrix`, an integer is never passed
+    through ``math.isfinite``: an int too large to convert to float is a
+    legal input whose later arithmetic failure is reported as
+    FloatingPointError rather than a validation error. Booleans,
+    subclasses, non-finite floats, non-lists, empty or ragged rows are
+    ValueError.
+    """
+    if not isinstance(X, list) or len(X) == 0:
+        raise ValueError("X must be a non-empty list of rows")
+    width = None
+    for row in X:
+        if not isinstance(row, list) or len(row) == 0:
+            raise ValueError("X rows must be non-empty lists")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError("X must be rectangular")
+        for value in row:
+            if not _is_finite_or_int(value):
+                raise ValueError(
+                    "X must contain only finite non-boolean numbers"
+                )
+    return width
+
+
+def _check_lasso_target(y, n):
+    """Validate a target vector with the same length as X.
+
+    Elements are exact ints of arbitrary size or finite non-boolean
+    floats (booleans and subclasses are rejected).
+    """
+    if not isinstance(y, list) or len(y) != n:
+        raise ValueError("y must be a list with the same length as X")
+    for value in y:
+        if not _is_finite_or_int(value):
+            raise ValueError("y must contain only finite non-boolean numbers")
+
+
+def _lasso_float_sum(terms):
+    """Accumulate an iterable of exact ints/floats with ``math.fsum``.
+
+    Unlike :func:`math.fsum` on a generator, any ``OverflowError`` (for
+    example from an integer too large to convert to float) is reported as
+    :class:`FloatingPointError`, the contract for arithmetic failures
+    during Lasso fitting/prediction, rather than escaping with the
+    arithmetic's own exception type.
+    """
+    try:
+        return math.fsum(terms)
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during lasso regression"
+        ) from exc
+
+
+def _lasso_divide(numerator, denominator):
+    """Divide two already-validated values, mapping failures to
+    FloatingPointError and rejecting non-finite quotients."""
+    try:
+        result = numerator / denominator
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during lasso regression"
+        ) from exc
+    if not math.isfinite(result):
+        raise FloatingPointError(
+            "non-finite value encountered during lasso regression"
+        )
+    return result
+
+
+def _lasso_linear_sum(w, row, width, skip=None):
+    """``fsum(w[j] * row[j])`` with each multiplication guarded.
+
+    A weight is always a float, but a row entry may be an int of a size
+    that cannot be converted to float; the resulting OverflowError, like
+    any non-finite product or sum, becomes FloatingPointError. When
+    ``skip`` is given, that feature index is omitted (the coordinate
+    descent residual leaves out the coordinate being updated).
+    """
+    products = []
+    for j in range(width):
+        if j == skip:
+            continue
+        try:
+            product = w[j] * row[j]
+        except (OverflowError, ValueError, ZeroDivisionError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during lasso regression"
+            ) from exc
+        if not math.isfinite(product):
+            raise FloatingPointError(
+                "non-finite value encountered during lasso regression"
+            )
+        products.append(product)
+    return _lasso_float_sum(products)
 
 
 class GradientBoostingRegressor:
@@ -3213,10 +3336,10 @@ class LassoRegression:
     """
 
     def __init__(self, alpha=1.0, max_iter=1000, tol=1e-8):
-        _require_exact_finite_positive(alpha, "alpha")
+        _require_exact_positive_number(alpha, "alpha")
         if type(max_iter) is not int or max_iter <= 0:
             raise ValueError("max_iter must be a positive integer")
-        _require_exact_finite_positive(tol, "tol")
+        _require_exact_positive_number(tol, "tol")
 
         self.alpha = alpha
         self.max_iter = max_iter
@@ -3229,67 +3352,46 @@ class LassoRegression:
         # computation leaves the model unfitted.
         self.w = None
         self.b = None
-        try:
-            width = _check_gradient_matrix(X)
-            _check_gradient_target(y, len(X))
-        except OverflowError as exc:
-            # An int too large to convert to float failed its finiteness
-            # check: still a rejected input, hence ValueError.
-            raise ValueError(
-                "X and y must contain only finite non-boolean numbers"
-            ) from exc
+        width = _check_lasso_matrix(X)
+        _check_lasso_target(y, len(X))
 
         n = len(X)
         w = [0.0] * width
-        try:
-            b = math.fsum(y) / n
-        except (OverflowError, ValueError, ZeroDivisionError) as exc:
-            raise FloatingPointError(
-                "non-finite value encountered during lasso regression"
-            ) from exc
-        if not math.isfinite(b):
-            raise FloatingPointError(
-                "non-finite value encountered during lasso regression"
-            )
-        b = _positive_zero(b)
+        b = _positive_zero(_lasso_divide(_lasso_float_sum(y), n))
         alpha = self.alpha
         tol = self.tol
 
         try:
             for _ in range(self.max_iter):
                 previous_b = b
-                b = math.fsum(
-                    y[i]
-                    - math.fsum(w[j] * X[i][j] for j in range(width))
-                    for i in range(n)
-                ) / n
-                if not math.isfinite(b):
-                    raise FloatingPointError(
-                        "non-finite value encountered during lasso regression"
-                    )
+                b = _lasso_divide(
+                    _lasso_float_sum(
+                        y[i]
+                        - _lasso_linear_sum(w, X[i], width)
+                        for i in range(n)
+                    ),
+                    n,
+                )
                 max_change = abs(b - previous_b)
 
                 for j in range(width):
                     previous_w = w[j]
-                    r = math.fsum(
-                        X[i][j]
-                        * (
-                            y[i]
-                            - b
-                            - math.fsum(
-                                w[k] * X[i][k]
-                                for k in range(width)
-                                if k != j
+                    r = _lasso_divide(
+                        _lasso_float_sum(
+                            X[i][j]
+                            * (
+                                y[i]
+                                - b
+                                - _lasso_linear_sum(w, X[i], width, skip=j)
                             )
-                        )
-                        for i in range(n)
-                    ) / n
-                    z = math.fsum(X[i][j] ** 2 for i in range(n)) / n
-                    if not math.isfinite(r) or not math.isfinite(z):
-                        raise FloatingPointError(
-                            "non-finite value encountered during lasso "
-                            "regression"
-                        )
+                            for i in range(n)
+                        ),
+                        n,
+                    )
+                    z = _lasso_divide(
+                        _lasso_float_sum(X[i][j] ** 2 for i in range(n)),
+                        n,
+                    )
                     if z == 0.0:
                         updated = 0.0
                     else:
@@ -3325,12 +3427,7 @@ class LassoRegression:
     def predict(self, X):
         if self.w is None or self.b is None:
             raise ValueError("model must be fitted before predict is called")
-        try:
-            width = _check_gradient_matrix(X)
-        except OverflowError as exc:
-            raise ValueError(
-                "X must contain only finite non-boolean numbers"
-            ) from exc
+        width = _check_lasso_matrix(X)
         if width != len(self.w):
             raise ValueError(
                 "X must have the same number of features as the training data"
@@ -3340,9 +3437,10 @@ class LassoRegression:
         for row in X:
             try:
                 prediction = (
-                    math.fsum(self.w[j] * row[j] for j in range(width))
-                    + self.b
+                    _lasso_linear_sum(self.w, row, width) + self.b
                 )
+            except FloatingPointError:
+                raise
             except (
                 OverflowError,
                 ValueError,
@@ -14314,6 +14412,7 @@ _SERIAL_KEYS_KMEANS = (
 )
 _SERIAL_KEYS_PCA = ("class", "mean", "components")
 _SERIAL_KEYS_LINEAR = ("class", "lr", "l2", "max_iter", "tol", "w", "b")
+_SERIAL_KEYS_LASSO = ("class", "alpha", "max_iter", "tol", "w", "b")
 _SERIAL_KEYS_MULTINOMIAL = (
     "class",
     "lr",
@@ -15028,7 +15127,8 @@ def _dumps_dbscan(model):
 
 def dumps(model):
     """Serialize a fitted KMeans, PCA, LinearRegression,
-    LogisticRegression, MultinomialLogisticRegression, StandardScaler,
+    LogisticRegression, LassoRegression, MultinomialLogisticRegression,
+    StandardScaler,
     DecisionTreeClassifier, DecisionTreeRegressor,
     RandomForestClassifier, RandomForestRegressor, AdaBoostClassifier,
     GradientBoostingRegressor, GradientBoostingClassifier,
@@ -15114,6 +15214,18 @@ def dumps(model):
     three finite exact int/float values quantized to 10 decimal places,
     each of which must convert back with ``float`` to exactly the
     original value so a reloaded model predicts identically.
+
+    For LassoRegression the top-level keys are ``class``, ``alpha``,
+    ``max_iter``, ``tol``, ``w``, ``b`` in that order; ``class`` is
+    ``"LassoRegression"``, ``max_iter`` is a positive JSON integer,
+    ``alpha`` and ``tol`` are strictly positive exact ints/floats (an
+    int may be arbitrarily large) whose fixed 10-decimal quantization
+    stays strictly positive, and ``w`` is a non-empty 1-D array with
+    ``b`` a scalar; every weight and the intercept are finite. Each real
+    is quantized with ``Decimal(str(v))`` and ROUND_HALF_UP to 10
+    decimal places (negative zero becomes ``0.0000000000``), and the
+    quantized text of ``alpha``, ``tol``, ``w`` and ``b`` must convert
+    back with ``float`` to exactly the value stored on the model.
 
     For GaussianMixture the top-level keys are ``class``,
     ``n_components``, ``weights``, ``means``, ``variances`` in that
@@ -15217,6 +15329,14 @@ def dumps(model):
             raise
         except Exception as exc:
             raise ValueError("invalid linear model state") from exc
+
+    if isinstance(model, LassoRegression):
+        try:
+            return _dumps_lasso(model)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("invalid LassoRegression state") from exc
 
     if isinstance(model, MultinomialLogisticRegression):
         try:
@@ -15344,7 +15464,8 @@ def dumps(model):
 
     raise ValueError(
         "dumps only supports fitted KMeans, PCA, LinearRegression, "
-        "LogisticRegression, MultinomialLogisticRegression, "
+        "LogisticRegression, LassoRegression, "
+        "MultinomialLogisticRegression, "
         "StandardScaler, DecisionTreeClassifier, DecisionTreeRegressor, "
         "RandomForestClassifier, RandomForestRegressor, "
         "AdaBoostClassifier, GradientBoostingRegressor, "
@@ -15486,6 +15607,116 @@ def _dumps_linear(model):
         + ',"w":'
         + w_text
         + ',"b":'
+        + b_text
+        + "}"
+    )
+
+
+def _dumps_lasso(model):
+    """Serialize a fitted LassoRegression.
+
+    The top-level keys are ``class``, ``alpha``, ``max_iter``, ``tol``,
+    ``w``, ``b`` in that order; ``class`` is ``"LassoRegression"``.
+    ``alpha`` and ``tol`` are strictly positive exact ints or finite
+    floats (booleans rejected) -- an int may be arbitrarily large -- and
+    ``max_iter`` is a positive exact int. ``w`` is a non-empty list and
+    ``b`` a scalar, both finite non-boolean numbers.
+
+    Every real is quantized to 10 decimal places with
+    ``Decimal(str(v))`` and ROUND_HALF_UP (negative zero becomes
+    ``0.0000000000``). The quantized text of ``alpha``, ``tol`` and
+    every weight/intercept must convert back with ``float`` to exactly
+    the parameter value found on the model, and ``alpha``/``tol`` must
+    remain strictly positive after quantization; otherwise dumps raises
+    ValueError. The argument is not modified.
+    """
+    w = model.w
+    b = model.b
+    if w is None or b is None:
+        raise ValueError("model must be fitted before dumps is called")
+    alpha = model.alpha
+    max_iter = model.max_iter
+    tol = model.tol
+    # Re-validate the construction parameters exactly as __init__ does:
+    # arbitrary-size positive ints are legal, so floats alone go through
+    # the finiteness check.
+    if (
+        type(alpha) not in (int, float)
+        or isinstance(alpha, bool)
+        or (type(alpha) is int and alpha <= 0)
+        or (type(alpha) is float and (not math.isfinite(alpha) or alpha <= 0.0))
+        or type(max_iter) is not int
+        or max_iter <= 0
+        or type(tol) not in (int, float)
+        or isinstance(tol, bool)
+        or (type(tol) is int and tol <= 0)
+        or (type(tol) is float and (not math.isfinite(tol) or tol <= 0.0))
+    ):
+        raise ValueError("model has invalid construction parameters")
+    if not isinstance(w, list) or len(w) == 0:
+        raise ValueError("w must be a non-empty list")
+    for value in w:
+        if (
+            isinstance(value, bool)
+            or type(value) not in (int, float)
+            or not math.isfinite(float(value))
+        ):
+            raise ValueError("w must contain only finite numbers")
+    if (
+        isinstance(b, bool)
+        or type(b) not in (int, float)
+        or not math.isfinite(float(b))
+    ):
+        raise ValueError("b must be a finite number")
+
+    alpha_text = _quantize_fixed(alpha)
+    alpha_f = float(alpha_text)
+    if not math.isfinite(alpha_f) or alpha_f <= 0.0:
+        raise ValueError(
+            "alpha must remain a finite positive value after quantization "
+            "to 10 decimals"
+        )
+    if alpha_f != float(alpha):
+        raise ValueError(
+            "alpha must round-trip exactly through 10-decimal quantization"
+        )
+    tol_text = _quantize_fixed(tol)
+    tol_f = float(tol_text)
+    if not math.isfinite(tol_f) or tol_f <= 0.0:
+        raise ValueError(
+            "tol must remain a finite positive value after quantization "
+            "to 10 decimals"
+        )
+    if tol_f != float(tol):
+        raise ValueError(
+            "tol must round-trip exactly through 10-decimal quantization"
+        )
+    w_tokens = []
+    for value in w:
+        token = _quantize_fixed(value)
+        token_f = float(token)
+        if not math.isfinite(token_f) or token_f != float(value):
+            raise ValueError(
+                "w values must round-trip exactly through 10-decimal "
+                "quantization"
+            )
+        w_tokens.append(token)
+    b_text = _quantize_fixed(b)
+    b_f = float(b_text)
+    if not math.isfinite(b_f) or b_f != float(b):
+        raise ValueError(
+            "b must round-trip exactly through 10-decimal quantization"
+        )
+    return (
+        '{"class":"LassoRegression","alpha":'
+        + alpha_text
+        + ',"max_iter":'
+        + str(max_iter)
+        + ',"tol":'
+        + tol_text
+        + ',"w":['
+        + ",".join(w_tokens)
+        + '],"b":'
         + b_text
         + "}"
     )
@@ -16716,6 +16947,42 @@ def _load_linear(pairs, model_class, class_name):
     return model
 
 
+def _load_lasso(pairs):
+    keys = tuple(key for key, _ in pairs)
+    if keys != _SERIAL_KEYS_LASSO:
+        raise ValueError(
+            "LassoRegression JSON must have exactly the serialized keys "
+            "in the serialized order"
+        )
+    data = _convert(pairs)
+
+    class_entry = data["class"]
+    if not isinstance(class_entry, str) or class_entry != "LassoRegression":
+        raise ValueError('class must be "LassoRegression"')
+
+    alpha = _expect_fixed(data["alpha"], "alpha")
+    if alpha <= 0.0:
+        raise ValueError("alpha must be greater than 0")
+    max_iter = _expect_int(data["max_iter"], "max_iter")
+    if max_iter < 1:
+        raise ValueError("max_iter must be at least 1")
+    tol = _expect_fixed(data["tol"], "tol")
+    if tol <= 0.0:
+        raise ValueError("tol must be greater than 0")
+
+    w_node = data["w"]
+    if not isinstance(w_node, list) or len(w_node) == 0:
+        raise ValueError("w must be a non-empty array")
+    w = [_expect_fixed(v, "w element") for v in w_node]
+
+    b = _expect_fixed(data["b"], "b")
+
+    model = LassoRegression(alpha=alpha, max_iter=max_iter, tol=tol)
+    model.w = list(w)
+    model.b = b
+    return model
+
+
 def _load_multinomial(pairs):
     keys = tuple(key for key, _ in pairs)
     if keys != _SERIAL_KEYS_MULTINOMIAL:
@@ -17469,7 +17736,8 @@ def _load_dbscan(pairs):
 
 def loads(text):
     """Reconstruct a fitted KMeans, PCA, LinearRegression,
-    LogisticRegression, MultinomialLogisticRegression, StandardScaler,
+    LogisticRegression, LassoRegression, MultinomialLogisticRegression,
+    StandardScaler,
     DecisionTreeClassifier, DecisionTreeRegressor,
     RandomForestClassifier, RandomForestRegressor, AdaBoostClassifier,
     GradientBoostingRegressor, GradientBoostingClassifier,
@@ -17558,6 +17826,13 @@ def loads(text):
     if class_entry == "LogisticRegression":
         try:
             return _load_linear(pairs, LogisticRegression, "LogisticRegression")
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("malformed serialized model") from exc
+    if class_entry == "LassoRegression":
+        try:
+            return _load_lasso(pairs)
         except ValueError:
             raise
         except Exception as exc:
