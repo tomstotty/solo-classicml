@@ -54,6 +54,10 @@ Exports:
     root_mean_squared_log_error -- square root of the weighted mean
         squared logarithmic error of two finite non-negative real
         vectors.
+    continuous_ranked_probability_score -- weighted continuous ranked
+        probability score of true values against a rectangular matrix
+        of ensemble samples, with optional per-sample and per-ensemble
+        member weights.
     r2_score -- coefficient of determination of two finite real vectors,
         optionally weighted.
     explained_variance_score -- weighted explained variance regression
@@ -233,6 +237,7 @@ __all__ = [
     "max_error",
     "mean_squared_log_error",
     "root_mean_squared_log_error",
+    "continuous_ranked_probability_score",
     "r2_score",
     "explained_variance_score",
     "concordance_correlation_coefficient",
@@ -5995,6 +6000,220 @@ def root_mean_squared_log_error(y_true, y_pred, sample_weight=None) -> float:
         raise FloatingPointError(
             "non-finite value encountered during root mean squared log "
             "error"
+        )
+    if result == 0:
+        result = 0.0
+    return result
+
+
+def _crps_isfinite(value):
+    """``math.isfinite`` with integer-conversion overflow reported as a
+    ValueError (the value fails the finite requirement)."""
+    try:
+        return math.isfinite(value)
+    except OverflowError as exc:
+        raise ValueError(
+            "values and weights must be finite non-boolean numbers"
+        ) from exc
+
+
+def continuous_ranked_probability_score(
+    y_true, y_samples, sample_weight=None, ensemble_weight=None
+) -> float:
+    """Return the weighted continuous ranked probability score (CRPS).
+
+    ``y_true`` must be a non-empty list of values of type exactly
+    ``int`` or ``float`` (booleans are rejected), all finite.
+    ``y_samples`` must be a non-empty rectangular list of lists with the
+    same number of rows as ``y_true`` and at least one column; every
+    element follows the same finite exact-type rule. ``sample_weight``
+    must be ``None`` -- every row then weighs ``1.0`` -- or a list with
+    the same length as the number of rows whose elements are finite
+    non-negative values of type exactly ``int`` or ``float`` (booleans
+    are rejected); ``ensemble_weight`` must be ``None`` -- every
+    ensemble member then weighs ``1.0`` -- or a list with the same
+    length as the number of columns following the same rules. Any
+    container, shape, length, type, range, or finiteness violation
+    (including ``OverflowError`` raised by ``math.isfinite``) raises
+    ValueError.
+
+    After validation the values and weights are converted to ``float``.
+    ``math.fsum`` computes the total sample weight ``W = sum(w_i)`` and
+    the total ensemble weight ``V = sum(v_j)``; if either summation
+    overflows or is invalid, or either total is non-finite or less than
+    or equal to zero, a ValueError is raised. For row ``i``, in column
+    order ``j``,
+    ``A_i = sum(v_j * |x_ij - t_i|) / V`` and, with ``j`` outer and
+    ``k`` inner,
+    ``B_i = sum(v_j * v_k * |x_ij - x_ik|) / (2 * V * V)``; the row
+    score is ``q_i = A_i - B_i``. The return value is
+    ``sum(w_i * q_i) / W`` with both weighted sums accumulated by
+    ``math.fsum`` in input order. Overflow, invalid operations, zero
+    division, or non-finite values during the post-validation
+    conversion, the absolute values, the multiplications, the
+    divisions, or the summations raise FloatingPointError. An exact zero
+    result is normalized to ``0.0``.
+
+    The return value is a float. The inputs are not modified.
+    Deterministic: same inputs, same result.
+    """
+    # Containers and shapes.
+    if not isinstance(y_true, list) or len(y_true) == 0:
+        raise ValueError("y_true must be a non-empty list")
+    if not isinstance(y_samples, list) or len(y_samples) == 0:
+        raise ValueError("y_samples must be a non-empty list of rows")
+    if len(y_samples) != len(y_true):
+        raise ValueError(
+            "y_samples must have the same number of rows as y_true"
+        )
+    width = None
+    for row in y_samples:
+        if not isinstance(row, list) or len(row) == 0:
+            raise ValueError("y_samples rows must be non-empty lists")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError("y_samples must be rectangular")
+    n = len(y_true)
+    m = width
+
+    # Element types and finiteness.
+    for value in y_true:
+        if type(value) not in (int, float) or not _crps_isfinite(value):
+            raise ValueError(
+                "y_true must contain only finite non-boolean numbers"
+            )
+    for row in y_samples:
+        for value in row:
+            if type(value) not in (int, float) or not _crps_isfinite(value):
+                raise ValueError(
+                    "y_samples must contain only finite non-boolean numbers"
+                )
+    if sample_weight is not None:
+        if not isinstance(sample_weight, list) or len(sample_weight) != n:
+            raise ValueError(
+                "sample_weight must be a list with the same length as y_true"
+            )
+        for value in sample_weight:
+            if (
+                type(value) not in (int, float)
+                or not _crps_isfinite(value)
+                or value < 0
+            ):
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+    if ensemble_weight is not None:
+        if not isinstance(ensemble_weight, list) or len(ensemble_weight) != m:
+            raise ValueError(
+                "ensemble_weight must be a list with the same length as the "
+                "number of columns of y_samples"
+            )
+        for value in ensemble_weight:
+            if (
+                type(value) not in (int, float)
+                or not _crps_isfinite(value)
+                or value < 0
+            ):
+                raise ValueError(
+                    "ensemble_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+
+    # Post-validation conversion to float.
+    try:
+        t = [float(value) for value in y_true]
+        x = [[float(value) for value in row] for row in y_samples]
+        w = (
+            [1.0] * n
+            if sample_weight is None
+            else [float(value) for value in sample_weight]
+        )
+        v = (
+            [1.0] * m
+            if ensemble_weight is None
+            else [float(value) for value in ensemble_weight]
+        )
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during continuous ranked "
+            "probability score computation"
+        ) from exc
+    for values in (t, w, v):
+        for value in values:
+            if not math.isfinite(value):
+                raise FloatingPointError(
+                    "non-finite value encountered during continuous ranked "
+                    "probability score computation"
+                )
+    for row in x:
+        for value in row:
+            if not math.isfinite(value):
+                raise FloatingPointError(
+                    "non-finite value encountered during continuous ranked "
+                    "probability score computation"
+                )
+
+    # Total weights; a non-positive total is a validation-style failure.
+    try:
+        total_sample_weight = math.fsum(w)
+        total_ensemble_weight = math.fsum(v)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError(
+            "the total weights must be greater than 0"
+        ) from exc
+    if (
+        not math.isfinite(total_sample_weight)
+        or total_sample_weight <= 0.0
+        or not math.isfinite(total_ensemble_weight)
+        or total_ensemble_weight <= 0.0
+    ):
+        raise ValueError("the total weights must be greater than 0")
+    W = total_sample_weight
+    V = total_ensemble_weight
+
+    row_scores = []
+    for i in range(n):
+        try:
+            a_terms = [
+                v[j] * abs(x[i][j] - t[i]) for j in range(m)
+            ]
+            A = math.fsum(a_terms) / V
+            b_terms = [
+                v[j] * v[k] * abs(x[i][j] - x[i][k])
+                for j in range(m)
+                for k in range(m)
+            ]
+            B = math.fsum(b_terms) / (2.0 * V * V)
+            q = A - B
+        except (OverflowError, ValueError, ZeroDivisionError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during continuous ranked "
+                "probability score computation"
+            ) from exc
+        if not math.isfinite(A) or not math.isfinite(B) or not math.isfinite(q):
+            raise FloatingPointError(
+                "non-finite value encountered during continuous ranked "
+                "probability score computation"
+            )
+        row_scores.append(q)
+
+    try:
+        weighted_scores = [
+            w[i] * row_scores[i] for i in range(n)
+        ]
+        total_score = math.fsum(weighted_scores)
+        result = total_score / W
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during continuous ranked "
+            "probability score computation"
+        ) from exc
+    if not math.isfinite(total_score) or not math.isfinite(result):
+        raise FloatingPointError(
+            "non-finite value encountered during continuous ranked "
+            "probability score computation"
         )
     if result == 0:
         result = 0.0
