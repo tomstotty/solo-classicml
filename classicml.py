@@ -92,6 +92,9 @@ Exports:
         thresholds for a binary score ranking.
     average_precision_score -- stepwise area under the
         precision_recall_curve.
+    multiclass_average_precision_score -- one-vs-rest average precision
+        of a multiclass score matrix, per class or averaged macro or
+        weighted by class support.
     calibration_curve -- per-bin positive-class weight fractions and mean
         predicted probabilities for a binary probability vector.
     expected_calibration_error -- weighted expected calibration error for
@@ -259,6 +262,7 @@ __all__ = [
     "det_curve",
     "precision_recall_curve",
     "average_precision_score",
+    "multiclass_average_precision_score",
     "calibration_curve",
     "expected_calibration_error",
     "adaptive_calibration_error",
@@ -10558,6 +10562,210 @@ def average_precision_score(y_true, y_score, pos_label=1, sample_weight=None):
     if ap == 0:
         ap = 0.0
     return ap
+
+
+def multiclass_average_precision_score(
+    y_true, y_score, average="macro", sample_weight=None
+):
+    """Return the one-vs-rest multiclass average precision.
+
+    ``y_true`` and ``y_score`` must be non-empty lists of equal length.
+    ``y_true`` must contain values of type exactly ``int`` (booleans are
+    rejected) drawn from at least three distinct labels; the classes are
+    the sorted distinct labels, in ascending order, and each column of
+    ``y_score`` corresponds to one class in that order. Every ``y_score``
+    row must be a list whose length equals the number of classes and whose
+    elements are finite values in the closed interval ``[0, 1]`` with type
+    exactly ``int`` or ``float`` (booleans are rejected); the elements of
+    each row, in column order, must sum to exactly ``1.0`` under
+    ``math.fsum``. ``average`` must be exactly ``None``, ``"macro"``, or
+    ``"weighted"``. ``sample_weight`` must be ``None`` -- every sample
+    then weighs ``1.0`` -- or a list of the same length whose elements
+    are finite non-negative values of type exactly ``int`` or ``float``
+    (booleans are rejected); the total weight of every class, accumulated
+    in input order with ``math.fsum``, must be finite and greater than
+    zero. Any violation -- container, length, class, shape, type, range,
+    row-sum, average, or per-class-weight checks, including an
+    OverflowError raised by a finiteness check -- raises ValueError.
+
+    For each class, in ascending class order, a binary label vector is
+    built with ``1`` at samples whose true class is that class and ``0``
+    elsewhere; :func:`average_precision_score` is then called on that
+    vector, the class's score column, ``pos_label=1``, and the same
+    sample weights. With ``average`` ``None`` the return is the list of
+    per-class average precisions in class order. With ``"macro"`` the
+    result is the ``math.fsum`` of the per-class values divided by the
+    number of classes. With ``"weighted"`` the result is the
+    ``math.fsum`` -- in class order -- of each per-class value times its
+    class weight, divided by the ``math.fsum`` of the class weights; an
+    exact zero result is normalized to ``0.0``. The two averaging modes
+    return a float.
+
+    An OverflowError, ValueError, ZeroDivisionError, or ArithmeticError
+    raised during post-validation conversion, the per-class calls, or the
+    multiplications, divisions, or ``math.fsum`` steps, as well as any
+    non-finite intermediate value or result, raises FloatingPointError.
+    The inputs are not modified. Deterministic: same inputs, same result.
+    """
+    if not isinstance(y_true, list) or not isinstance(y_score, list):
+        raise ValueError("y_true and y_score must be lists")
+    if len(y_true) == 0 or len(y_score) == 0:
+        raise ValueError("y_true and y_score must be non-empty lists")
+    if len(y_true) != len(y_score):
+        raise ValueError("y_true and y_score must have the same length")
+    n = len(y_true)
+
+    for value in y_true:
+        if type(value) is not int:
+            raise ValueError("y_true must contain only integers")
+    classes = sorted(set(y_true))
+    if len(classes) < 3:
+        raise ValueError(
+            "y_true must contain at least three distinct classes"
+        )
+    n_classes = len(classes)
+    class_index = {label: j for j, label in enumerate(classes)}
+
+    for row in y_score:
+        if not isinstance(row, list):
+            raise ValueError("y_score rows must be lists")
+        if len(row) != n_classes:
+            raise ValueError(
+                "each y_score row must have one entry per class"
+            )
+        for value in row:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "y_score must contain only finite numbers in [0, 1]"
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "y_score must contain only finite numbers in [0, 1]"
+                ) from exc
+            if not finite or value < 0 or value > 1:
+                raise ValueError(
+                    "y_score must contain only finite numbers in [0, 1]"
+                )
+        # The columns of each row must describe a probability distribution.
+        try:
+            row_sum = math.fsum(row)
+        except OverflowError as exc:
+            raise ValueError(
+                "each y_score row must sum to exactly 1.0"
+            ) from exc
+        if row_sum != 1.0:
+            raise ValueError("each y_score row must sum to exactly 1.0")
+
+    if average not in (None, "macro", "weighted"):
+        raise ValueError('average must be None, "macro", or "weighted"')
+
+    if sample_weight is None:
+        weights = [1.0] * n
+    else:
+        if not isinstance(sample_weight, list) or len(sample_weight) != n:
+            raise ValueError(
+                "sample_weight must be a list with the same length as "
+                "y_true"
+            )
+        for value in sample_weight:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                ) from exc
+            if not finite or value < 0:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+        try:
+            weights = [float(value) for value in sample_weight]
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during multiclass-average-"
+                "precision computation"
+            ) from exc
+        for value in weights:
+            if not math.isfinite(value) or value < 0.0:
+                raise FloatingPointError(
+                    "non-finite value encountered during multiclass-average-"
+                    "precision computation"
+                )
+
+    # Every class needs a strictly positive weight, otherwise its
+    # one-vs-rest average precision is undefined.
+    class_weight_terms = [[] for _ in range(n_classes)]
+    for i in range(n):
+        class_weight_terms[class_index[y_true[i]]].append(weights[i])
+    class_weights = []
+    for terms in class_weight_terms:
+        try:
+            total = math.fsum(terms)
+        except (OverflowError, ValueError) as exc:
+            raise ValueError(
+                "the total weight of each class must be greater than 0"
+            ) from exc
+        if not math.isfinite(total) or total <= 0.0:
+            raise ValueError(
+                "the total weight of each class must be greater than 0"
+            )
+        class_weights.append(total)
+
+    def fail(exc):
+        return FloatingPointError(
+            "non-finite value encountered during multiclass-average-"
+            "precision computation"
+        )
+
+    scores = []
+    for j in range(n_classes):
+        binary_true = [1 if y_true[i] == classes[j] else 0 for i in range(n)]
+        class_scores = [y_score[i][j] for i in range(n)]
+        try:
+            ap = average_precision_score(
+                binary_true,
+                class_scores,
+                pos_label=1,
+                sample_weight=weights,
+            )
+        except (OverflowError, ValueError, ZeroDivisionError) as exc:
+            raise fail(exc) from exc
+        if not math.isfinite(ap):
+            raise fail(None)
+        scores.append(ap)
+
+    if average is None:
+        return scores
+
+    try:
+        if average == "macro":
+            result = math.fsum(scores) / n_classes
+        else:
+            numerator = math.fsum(
+                scores[j] * class_weights[j] for j in range(n_classes)
+            )
+            denominator = math.fsum(class_weights)
+            result = numerator / denominator
+        if not math.isfinite(result):
+            raise fail(None)
+        if result == 0:
+            result = 0.0
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        raise fail(exc) from exc
+    return result
 
 
 def _cal_float(value):
