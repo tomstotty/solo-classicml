@@ -45,6 +45,9 @@ Exports:
     IsolationForest -- reusable deterministic isolation-forest anomaly
         detector with fit/score_samples/predict and a contamination-
         derived score threshold.
+    NMF -- reusable deterministic non-negative matrix factorization
+        reducer whose fit delegates to nmf and whose transform refines
+        W by multiplicative updates with the fitted H held fixed.
     accuracy_score -- fraction of positions where two integer label
         vectors agree.
     mean_squared_error -- weighted mean of squared element-wise
@@ -277,6 +280,7 @@ __all__ = [
     "AgglomerativeClustering",
     "GaussianMixture",
     "IsolationForest",
+    "NMF",
     "accuracy_score",
     "mean_squared_error",
     "root_mean_squared_error",
@@ -2968,7 +2972,9 @@ def _check_nmf_matrix(X):
     return width
 
 
-def nmf(X, n_components=2, max_iter=200, tol=1e-6, seed=0):
+def nmf(
+    X, n_components=2, max_iter=200, tol=1e-6, seed=0
+) -> tuple[list[list[float]], list[list[float]]]:
     """Return a non-negative matrix factorization ``(W, H)`` of ``X``.
 
     ``X`` must be a non-empty rectangular matrix whose rows are
@@ -3127,6 +3133,171 @@ def nmf(X, n_components=2, max_iter=200, tol=1e-6, seed=0):
         raise FloatingPointError(
             "non-finite value encountered during nmf"
         ) from exc
+
+
+class NMF:
+    """Reusable deterministic non-negative matrix factorization reducer.
+
+    The constructor parameters follow exactly the same rules as those of
+    ``nmf``: ``n_components`` and ``max_iter`` must be exact positive
+    integers, ``tol`` a finite non-boolean positive number, and ``seed``
+    an exact integer; any violation raises ValueError. ``components_``
+    and ``n_features_in_`` are ``None`` initially and after a failed
+    fit.
+
+    ``fit`` first clears the fitted state and then calls ``nmf`` on
+    ``X``, saving the resulting ``H`` as ``components_`` and its number
+    of columns as ``n_features_in_``; a failed call leaves the model
+    unfitted. It returns ``self``. ``fit_transform`` fits the same way
+    and returns a brand-new copy of the resulting ``W``. The ``nmf``
+    matrix and rank rules apply to ``X`` in both methods; any violation
+    raises ValueError.
+
+    ``transform`` raises ValueError when the model is not fitted, when
+    ``X`` violates the ``nmf`` matrix rules, or when its number of
+    columns differs from the training data; it never changes the fitted
+    state. Let ``n`` be the number of rows of ``X``,
+    ``r = n_components``, ``p`` the number of columns,
+    ``F = math.fsum`` and ``e = 1e-12``. ``W`` (``n`` by ``r``) starts
+    filled with ``1.0``. Each round computes, synchronously from the
+    old ``W``, ``P[i][j] = F(W[i][l] * H[l][j] for l in range(r))`` and
+    then ``W'[i][k] = W[i][k] * F(H[k][j] * X[i][j] for j)
+    / max(F(H[k][j] * P[i][j] for j), e)``, with every index summed in
+    ascending order. A round ends the iteration when the largest
+    absolute coordinate change of ``W`` is at most ``tol``; at most
+    ``max_iter`` rounds run. The result is a brand-new float matrix
+    with zero written as ``+0.0``; any OverflowError, ValueError or
+    ZeroDivisionError triggered after validation, and any non-finite
+    value, raises FloatingPointError. No method modifies its input,
+    only the standard library is used, and the same arguments always
+    give the same result.
+    """
+
+    def __init__(self, n_components=2, max_iter=200, tol=1e-6, seed=0):
+        if type(n_components) is not int:
+            raise ValueError("n_components must be an integer")
+        if n_components <= 0:
+            raise ValueError("n_components must be greater than 0")
+        if type(max_iter) is not int:
+            raise ValueError("max_iter must be an integer")
+        if max_iter <= 0:
+            raise ValueError("max_iter must be greater than 0")
+        tol = _checked_parameter(tol, "tol")
+        if tol <= 0:
+            raise ValueError("tol must be greater than 0")
+        if type(seed) is not int:
+            raise ValueError("seed must be an integer")
+
+        self.n_components = n_components
+        self.max_iter = max_iter
+        self.tol = tol
+        self.seed = seed
+        self.components_ = None
+        self.n_features_in_ = None
+
+    def fit(self, X) -> NMF:
+        """Fit ``H`` on ``X`` via ``nmf`` and return ``self``."""
+        self.components_ = None
+        self.n_features_in_ = None
+        W, H = nmf(
+            X,
+            n_components=self.n_components,
+            max_iter=self.max_iter,
+            tol=self.tol,
+            seed=self.seed,
+        )
+        self.components_ = H
+        self.n_features_in_ = len(H[0])
+        return self
+
+    def fit_transform(self, X) -> list[list[float]]:
+        """Fit on ``X`` and return a brand-new fitted ``W``."""
+        self.components_ = None
+        self.n_features_in_ = None
+        W, H = nmf(
+            X,
+            n_components=self.n_components,
+            max_iter=self.max_iter,
+            tol=self.tol,
+            seed=self.seed,
+        )
+        self.components_ = H
+        self.n_features_in_ = len(H[0])
+        return W
+
+    def transform(self, X) -> list[list[float]]:
+        """Return a brand-new ``W`` for ``X`` keeping fitted ``H`` fixed."""
+        if self.components_ is None or self.n_features_in_ is None:
+            raise ValueError("NMF must be fitted before transform is called")
+        width = _check_nmf_matrix(X)
+        if width != self.n_features_in_:
+            raise ValueError(
+                "X must have the same number of features as the training data"
+            )
+
+        H = self.components_
+        n = len(X)
+        p = width
+        r = self.n_components
+        e = 1e-12
+
+        try:
+            W = [[1.0 for _ in range(r)] for _ in range(n)]
+            for _ in range(self.max_iter):
+                P = [
+                    [
+                        math.fsum(W[i][l] * H[l][j] for l in range(r))
+                        for j in range(p)
+                    ]
+                    for i in range(n)
+                ]
+                for i in range(n):
+                    for j in range(p):
+                        if not math.isfinite(P[i][j]):
+                            raise FloatingPointError(
+                                "non-finite value encountered"
+                                " during transform"
+                            )
+                new_W = []
+                for i in range(n):
+                    new_row = []
+                    for k in range(r):
+                        numerator = math.fsum(
+                            H[k][j] * X[i][j] for j in range(p)
+                        )
+                        denominator = math.fsum(
+                            H[k][j] * P[i][j] for j in range(p)
+                        )
+                        if not (
+                            math.isfinite(numerator)
+                            and math.isfinite(denominator)
+                        ):
+                            raise FloatingPointError(
+                                "non-finite value encountered"
+                                " during transform"
+                            )
+                        value = W[i][k] * numerator / max(denominator, e)
+                        if not math.isfinite(value):
+                            raise FloatingPointError(
+                                "non-finite value encountered"
+                                " during transform"
+                            )
+                        new_row.append(value)
+                    new_W.append(new_row)
+                delta = 0.0
+                for i in range(n):
+                    for k in range(r):
+                        change = abs(new_W[i][k] - W[i][k])
+                        if change > delta:
+                            delta = change
+                W = new_W
+                if delta <= self.tol:
+                    break
+            return [[_positive_zero(value) for value in row] for row in W]
+        except (OverflowError, ValueError, ZeroDivisionError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during transform"
+            ) from exc
 
 
 class IsolationForest:
