@@ -84,6 +84,10 @@ Exports:
         score ranking.
     roc_auc_score -- trapezoidal area under the roc_curve, with optional
         standardized partial AUC over an FPR range.
+    multiclass_roc_auc_score -- Hand-Till multiclass area under the ROC
+        curve: the macro or prevalence-weighted mean of the pairwise
+        one-vs-one binary AUCs over a probability matrix with one column
+        per class.
     det_curve -- false positive/false negative rates and ascending
         thresholds for a binary score ranking.
     precision_recall_curve -- precision/recall pairs at descending score
@@ -253,6 +257,7 @@ __all__ = [
     "fbeta_score",
     "roc_curve",
     "roc_auc_score",
+    "multiclass_roc_auc_score",
     "det_curve",
     "precision_recall_curve",
     "average_precision_score",
@@ -9978,6 +9983,245 @@ def roc_auc_score(
 # ``from __future__ import annotations`` stores annotations as strings;
 # expose the builtin ``float`` as the runtime return annotation.
 roc_auc_score.__annotations__["return"] = float
+
+
+def _multiclass_roc_auc_float(value):
+    """Convert a validated score/weight to float; overflow, invalid
+    operations, and non-finite results raise FloatingPointError."""
+    try:
+        result = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during multiclass-roc-auc "
+            "computation"
+        ) from exc
+    if not math.isfinite(result):
+        raise FloatingPointError(
+            "non-finite value encountered during multiclass-roc-auc "
+            "computation"
+        )
+    return result
+
+
+def multiclass_roc_auc_score(
+    y_true, y_score, average="macro", sample_weight=None
+) -> float:
+    """Compute the Hand-Till multiclass area under the ROC curve.
+
+    ``y_true`` and ``y_score`` must be non-empty lists of equal length.
+    ``y_true`` must contain values of type exactly ``int`` (booleans are
+    rejected) drawn from at least three distinct labels; the classes are
+    the sorted distinct labels, in ascending order, and each column of
+    ``y_score`` corresponds to one class in that order. Every ``y_score``
+    row must be a list whose length equals the number of classes and whose
+    elements are finite values in the closed interval ``[0, 1]`` with type
+    exactly ``int`` or ``float`` (booleans are rejected); the elements of
+    each row, in column order, must sum to exactly ``1.0`` under
+    ``math.fsum``. ``average`` must be ``"macro"`` or ``"weighted"``.
+    ``sample_weight`` must be ``None`` -- every sample then weighs
+    ``1.0`` -- or a list of the same length whose elements are finite
+    non-negative values of type exactly ``int`` or ``float`` (booleans are
+    rejected). The total weight of each class must be greater than zero.
+    Any violation -- container, length, class, shape, type, range,
+    row-sum, average, weight, per-class-total, or finiteness checks,
+    including overflow during those checks -- raises ValueError.
+
+    For each unordered pair ``(a, b)`` of classes, enumerated in ascending
+    class order, only the samples whose true class is ``a`` or ``b`` are
+    kept, in input order. :func:`roc_auc_score` is called on that subset
+    twice -- with column ``a`` and ``pos_label=a``, and with column ``b``
+    and ``pos_label=b`` -- and the pair value is the mean of the two
+    areas. With ``average="macro"`` the result is the mean of the pair
+    values, summed in pair order with ``math.fsum``; with
+    ``average="weighted"`` each pair is weighted by the sum of the two
+    classes' total weights and the result is the weighted mean, both
+    accumulated with ``math.fsum``. An exact zero result is normalized to
+    ``0.0``. After validation, arithmetic or ``math.fsum`` raising
+    OverflowError, ValueError, or ZeroDivisionError, or producing a
+    non-finite value, raises FloatingPointError.
+
+    The return value is a float. The inputs are not modified.
+    Deterministic: same inputs, same result.
+    """
+    if not isinstance(y_true, list) or not isinstance(y_score, list):
+        raise ValueError("y_true and y_score must be lists")
+    if len(y_true) == 0 or len(y_score) == 0:
+        raise ValueError("y_true and y_score must be non-empty lists")
+    if len(y_true) != len(y_score):
+        raise ValueError("y_true and y_score must have the same length")
+    n = len(y_true)
+
+    for value in y_true:
+        if type(value) is not int:
+            raise ValueError("y_true must contain only integers")
+    classes = sorted(set(y_true))
+    if len(classes) < 3:
+        raise ValueError(
+            "y_true must contain at least three distinct classes"
+        )
+    n_classes = len(classes)
+
+    for row in y_score:
+        if not isinstance(row, list):
+            raise ValueError("y_score rows must be lists")
+        if len(row) != n_classes:
+            raise ValueError(
+                "each y_score row must have one entry per class"
+            )
+        for value in row:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "y_score must contain only finite numbers in [0, 1]"
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "y_score must contain only finite numbers in [0, 1]"
+                ) from exc
+            if not finite or value < 0 or value > 1:
+                raise ValueError(
+                    "y_score must contain only finite numbers in [0, 1]"
+                )
+        # The columns of each row must describe a probability distribution.
+        try:
+            row_sum = math.fsum(row)
+        except OverflowError as exc:
+            raise ValueError(
+                "each y_score row must sum to exactly 1.0"
+            ) from exc
+        if row_sum != 1.0:
+            raise ValueError(
+                "each y_score row must sum to exactly 1.0"
+            )
+
+    if average not in ("macro", "weighted"):
+        raise ValueError("average must be 'macro' or 'weighted'")
+
+    if sample_weight is None:
+        weights = [1.0] * n
+    else:
+        if not isinstance(sample_weight, list) or len(sample_weight) != n:
+            raise ValueError(
+                "sample_weight must be a list with the same length as "
+                "y_true"
+            )
+        for value in sample_weight:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                ) from exc
+            if not finite or value < 0:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+        weights = [
+            _multiclass_roc_auc_float(value) for value in sample_weight
+        ]
+
+    # The per-class weight totals are part of the input checks: overflow,
+    # invalid operations, a non-finite total, and a non-positive total all
+    # raise ValueError.
+    class_totals = []
+    for label in classes:
+        terms = [weights[i] for i in range(n) if y_true[i] == label]
+        try:
+            total = math.fsum(terms)
+        except (OverflowError, ValueError) as exc:
+            raise ValueError(
+                "the total weight of each class must be greater than 0"
+            ) from exc
+        if not math.isfinite(total) or total <= 0.0:
+            raise ValueError(
+                "the total weight of each class must be greater than 0"
+            )
+        class_totals.append(total)
+
+    pair_values = []
+    pair_weights = []
+    for ai in range(n_classes):
+        for bi in range(ai + 1, n_classes):
+            a = classes[ai]
+            b = classes[bi]
+            sub_true = []
+            sub_a_scores = []
+            sub_b_scores = []
+            sub_weights = []
+            for i in range(n):
+                if y_true[i] == a or y_true[i] == b:
+                    sub_true.append(y_true[i])
+                    sub_a_scores.append(y_score[i][ai])
+                    sub_b_scores.append(y_score[i][bi])
+                    sub_weights.append(weights[i])
+            try:
+                auc_a = roc_auc_score(
+                    sub_true,
+                    sub_a_scores,
+                    pos_label=a,
+                    sample_weight=sub_weights,
+                )
+                auc_b = roc_auc_score(
+                    sub_true,
+                    sub_b_scores,
+                    pos_label=b,
+                    sample_weight=sub_weights,
+                )
+                pair_value = (auc_a + auc_b) / 2
+                pair_weight = class_totals[ai] + class_totals[bi]
+            except (OverflowError, ValueError, ZeroDivisionError) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during "
+                    "multiclass-roc-auc computation"
+                ) from exc
+            if not math.isfinite(pair_value) or not math.isfinite(
+                pair_weight
+            ):
+                raise FloatingPointError(
+                    "non-finite value encountered during "
+                    "multiclass-roc-auc computation"
+                )
+            pair_values.append(pair_value)
+            pair_weights.append(pair_weight)
+
+    try:
+        if average == "macro":
+            result = math.fsum(pair_values) / len(pair_values)
+        else:
+            result = math.fsum(
+                pair_values[k] * pair_weights[k]
+                for k in range(len(pair_values))
+            ) / math.fsum(pair_weights)
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during multiclass-roc-auc "
+            "computation"
+        ) from exc
+    if not math.isfinite(result):
+        raise FloatingPointError(
+            "non-finite value encountered during multiclass-roc-auc "
+            "computation"
+        )
+    if result == 0:
+        result = 0.0
+    return result
+
+
+# ``from __future__ import annotations`` stores annotations as strings;
+# expose the builtin ``float`` as the runtime return annotation.
+multiclass_roc_auc_score.__annotations__["return"] = float
 
 
 def _det_float(value):
