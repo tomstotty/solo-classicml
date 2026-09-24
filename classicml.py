@@ -218,6 +218,7 @@ __all__ = [
     "explained_variance_score",
     "concordance_correlation_coefficient",
     "mean_absolute_percentage_error",
+    "symmetric_mean_absolute_percentage_error",
     "median_absolute_percentage_error",
     "mean_squared_percentage_error",
     "mean_pinball_loss",
@@ -6777,6 +6778,191 @@ def mean_absolute_percentage_error(y_true, y_pred, sample_weight=None) -> float:
     if not math.isfinite(result):
         raise FloatingPointError(
             "non-finite value encountered during mean absolute "
+            "percentage error"
+        )
+    if result == 0:
+        result = 0.0
+    return result
+
+
+def symmetric_mean_absolute_percentage_error(
+    y_true, y_pred, sample_weight=None
+) -> float:
+    """Return the weighted symmetric mean absolute percentage error (SMAPE).
+
+    ``y_true`` and ``y_pred`` must be non-empty lists of equal length
+    whose elements are finite values of type exactly ``int`` or
+    ``float`` (booleans are rejected). ``sample_weight`` must be
+    ``None`` -- every sample then weighs ``1.0`` -- or a list of the
+    same length whose elements are finite non-negative values of type
+    exactly ``int`` or ``float`` (booleans are rejected). Any
+    container, length, type, range, or finiteness violation (including
+    ``OverflowError`` raised by ``math.isfinite``) raises ValueError.
+
+    After validation, the values and weights are converted to
+    ``float`` in input order. For each index, with ``t`` the true
+    value, ``p`` the prediction, and ``w`` the weight, the symmetric
+    absolute percentage error is ``e = 0.0`` when
+    ``abs(t) + abs(p) == 0`` and
+    ``e = 2.0 * abs(t - p) / (abs(t) + abs(p))`` otherwise.
+    ``math.fsum`` computes ``W = sum(w)`` and ``L = sum(w * e)``. If
+    summing ``W`` raises OverflowError or ValueError, or ``W`` is
+    non-finite or less than or equal to zero, a ValueError is raised;
+    otherwise the result is ``L / W``. Overflow, invalid operations
+    during the post-validation conversion, absolute value, arithmetic,
+    or ``L`` summation, and non-finite intermediate values or results
+    raise FloatingPointError. An exact zero result is normalized to
+    ``0.0``.
+
+    The return value is a float. The inputs are not modified.
+    Deterministic: same inputs, same result.
+    """
+    n = _check_metric_vectors(y_true, y_pred)
+    for name, values in (("y_true", y_true), ("y_pred", y_pred)):
+        for value in values:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "%s must contain only finite non-boolean numbers" % name
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "%s must contain only finite non-boolean numbers" % name
+                ) from exc
+            if not finite:
+                raise ValueError(
+                    "%s must contain only finite non-boolean numbers" % name
+                )
+
+    if sample_weight is not None:
+        if not isinstance(sample_weight, list) or len(sample_weight) != n:
+            raise ValueError(
+                "sample_weight must be a list with the same length as "
+                "y_true"
+            )
+        for value in sample_weight:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                ) from exc
+            if not finite or value < 0:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+
+    try:
+        t = [float(value) for value in y_true]
+        p = [float(value) for value in y_pred]
+        if sample_weight is None:
+            w = [1.0] * n
+        else:
+            w = [float(value) for value in sample_weight]
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during symmetric mean absolute "
+            "percentage error"
+        ) from exc
+    for values in (t, p, w):
+        for value in values:
+            if not math.isfinite(value):
+                raise FloatingPointError(
+                    "non-finite value encountered during symmetric mean "
+                    "absolute percentage error"
+                )
+
+    loss_terms = []
+    for i in range(n):
+        try:
+            abs_true = abs(t[i])
+            abs_pred = abs(p[i])
+            denom = abs_true + abs_pred
+            abs_diff = abs(t[i] - p[i])
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during symmetric mean "
+                "absolute percentage error"
+            ) from exc
+        if (
+            not math.isfinite(abs_true)
+            or not math.isfinite(abs_pred)
+            or not math.isfinite(denom)
+            or not math.isfinite(abs_diff)
+        ):
+            raise FloatingPointError(
+                "non-finite value encountered during symmetric mean "
+                "absolute percentage error"
+            )
+        if denom == 0.0:
+            error = 0.0
+        else:
+            try:
+                error = 2.0 * abs_diff / denom
+            except (OverflowError, ValueError, ZeroDivisionError) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during symmetric mean "
+                    "absolute percentage error"
+                ) from exc
+        if not math.isfinite(error):
+            raise FloatingPointError(
+                "non-finite value encountered during symmetric mean "
+                "absolute percentage error"
+            )
+        try:
+            term = w[i] * error
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during symmetric mean "
+                "absolute percentage error"
+            ) from exc
+        if not math.isfinite(term):
+            raise FloatingPointError(
+                "non-finite value encountered during symmetric mean "
+                "absolute percentage error"
+            )
+        loss_terms.append(term)
+
+    try:
+        total_weight = math.fsum(w)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError("the total weight must be greater than 0") from exc
+    if not math.isfinite(total_weight) or total_weight <= 0.0:
+        raise ValueError("the total weight must be greater than 0")
+    try:
+        total_loss = math.fsum(loss_terms)
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during symmetric mean absolute "
+            "percentage error"
+        ) from exc
+    if not math.isfinite(total_loss):
+        raise FloatingPointError(
+            "non-finite value encountered during symmetric mean absolute "
+            "percentage error"
+        )
+    try:
+        result = total_loss / total_weight
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during symmetric mean absolute "
+            "percentage error"
+        ) from exc
+    if not math.isfinite(result):
+        raise FloatingPointError(
+            "non-finite value encountered during symmetric mean absolute "
             "percentage error"
         )
     if result == 0:
