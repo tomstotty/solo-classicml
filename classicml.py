@@ -176,6 +176,8 @@ Exports:
     continuous_ranked_probability_score -- weighted mean, over samples,
         of the continuous ranked probability score of an ensemble of
         predictions against one target per row.
+    interval_score -- weighted mean, over samples, of the interval score
+        of a central prediction interval against one target per row.
     dumps -- serialize a fitted KMeans/PCA/linear/scaler/tree/forest
         model (including MultinomialLogisticRegression,
         AgglomerativeClustering, and DBSCAN) to whitespace-free JSON
@@ -303,6 +305,7 @@ __all__ = [
     "recall_at_k_score",
     "mean_average_precision_at_k_score",
     "continuous_ranked_probability_score",
+    "interval_score",
     "dumps",
     "loads",
 ]
@@ -17095,6 +17098,206 @@ def continuous_ranked_probability_score(
         raise non_finite(None)
     try:
         result = weighted_total / total_sample_weight
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        raise non_finite(exc) from exc
+    if not math.isfinite(result):
+        raise non_finite(None)
+    if result == 0:
+        return 0.0
+    return result
+
+
+def interval_score(
+    y_true, y_lower, y_upper, alpha=0.05, sample_weight=None
+) -> float:
+    """Return the weighted mean interval score.
+
+    ``y_true``, ``y_lower`` and ``y_upper`` must be non-empty lists of
+    the same length whose elements are finite values of type exactly
+    ``int`` or ``float`` (booleans are rejected); each lower endpoint
+    must be less than or equal to its corresponding upper endpoint.
+    ``alpha`` must be a finite value of type exactly ``int`` or
+    ``float`` (booleans are rejected) strictly between zero and one.
+    ``sample_weight`` must be ``None`` -- every sample then weighs
+    ``1.0`` -- or a list with the same length as ``y_true`` whose
+    entries are finite non-negative values of type exactly ``int`` or
+    ``float`` (booleans are rejected). Any container, length, type,
+    range, or finiteness violation (including ``OverflowError`` raised
+    by ``math.isfinite``) raises ValueError.
+
+    After validation the values and weights are converted to ``float``
+    in input order. ``math.fsum`` computes the weight total
+    ``W = fsum(w_i)``; if that summation overflows or is invalid, is
+    non-finite, or its total is less than or equal to zero, a
+    ValueError is raised. For item ``i`` with target ``t_i``, lower
+    endpoint ``l_i`` and upper endpoint ``u_i``, the per-item width is
+    ``s_i = u_i - l_i``; when ``t_i < l_i`` the penalty
+    ``(2 / alpha) * (l_i - t_i)`` is added, when ``t_i > u_i`` the
+    penalty ``(2 / alpha) * (t_i - u_i)`` is added, and no penalty is
+    added otherwise. The result is
+    ``fsum(w_i * term_i in input order) / W``. Overflow or invalid
+    operations during the post-validation conversions, comparisons,
+    arithmetic, or ``math.fsum`` steps, a zero division (other than the
+    weight-total check), and non-finite intermediate values or results
+    raise FloatingPointError. An exact zero result is normalized to
+    ``0.0``.
+
+    The return value is a float. The inputs are not modified.
+    Deterministic: same inputs, same result.
+    """
+    if not isinstance(y_true, list) or len(y_true) == 0:
+        raise ValueError("y_true must be a non-empty list")
+    n = len(y_true)
+    for name, values in (
+        ("y_true", y_true),
+        ("y_lower", y_lower),
+        ("y_upper", y_upper),
+    ):
+        if name != "y_true":
+            if not isinstance(values, list) or len(values) != n:
+                raise ValueError(
+                    name + " must be a list with the same length as y_true"
+                )
+        for value in values:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    name
+                    + " must contain only finite non-boolean numbers"
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    name
+                    + " must contain only finite non-boolean numbers"
+                ) from exc
+            if not finite:
+                raise ValueError(
+                    name
+                    + " must contain only finite non-boolean numbers"
+                )
+
+    for i in range(n):
+        if y_lower[i] > y_upper[i]:
+            raise ValueError(
+                "y_lower entries must be less than or equal to the "
+                "corresponding y_upper entries"
+            )
+
+    if type(alpha) not in (int, float) or isinstance(alpha, bool):
+        raise ValueError("alpha must be a finite number between 0 and 1")
+    try:
+        alpha_finite = math.isfinite(alpha)
+    except OverflowError as exc:
+        raise ValueError(
+            "alpha must be a finite number between 0 and 1"
+        ) from exc
+    if not alpha_finite or not (0 < alpha < 1):
+        raise ValueError("alpha must be a finite number between 0 and 1")
+
+    if sample_weight is not None:
+        if not isinstance(sample_weight, list) or len(sample_weight) != n:
+            raise ValueError(
+                "sample_weight must be a list with the same length as "
+                "y_true"
+            )
+        for value in sample_weight:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                ) from exc
+            if not finite or value < 0:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+
+    def non_finite(exc):
+        return FloatingPointError(
+            "non-finite value encountered during interval score"
+        )
+
+    try:
+        t = [float(value) for value in y_true]
+        l = [float(value) for value in y_lower]
+        u = [float(value) for value in y_upper]
+        a = float(alpha)
+        if sample_weight is None:
+            w = [1.0] * n
+        else:
+            w = [float(value) for value in sample_weight]
+    except (OverflowError, ValueError) as exc:
+        raise non_finite(exc) from exc
+    for values in (t, l, u, w):
+        for value in values:
+            if not math.isfinite(value):
+                raise non_finite(None)
+    if not math.isfinite(a) or not (0.0 < a < 1.0):
+        raise non_finite(None)
+    for i in range(n):
+        try:
+            ordered = l[i] <= u[i]
+        except (OverflowError, ValueError) as exc:
+            raise non_finite(exc) from exc
+        if not ordered:
+            raise non_finite(None)
+
+    try:
+        total_weight = math.fsum(w)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError("the total weight must be greater than 0") from exc
+    if not math.isfinite(total_weight) or total_weight <= 0.0:
+        raise ValueError("the total weight must be greater than 0")
+
+    terms = []
+    for i in range(n):
+        try:
+            width = u[i] - l[i]
+            if t[i] < l[i]:
+                penalty = (2.0 / a) * (l[i] - t[i])
+            elif t[i] > u[i]:
+                penalty = (2.0 / a) * (t[i] - u[i])
+            else:
+                penalty = 0.0
+            term = width + penalty
+        except (
+            OverflowError,
+            ValueError,
+            ZeroDivisionError,
+        ) as exc:
+            raise non_finite(exc) from exc
+        if (
+            not math.isfinite(width)
+            or not math.isfinite(penalty)
+            or not math.isfinite(term)
+        ):
+            raise non_finite(None)
+        try:
+            weighted_term = w[i] * term
+        except (OverflowError, ValueError) as exc:
+            raise non_finite(exc) from exc
+        if not math.isfinite(weighted_term):
+            raise non_finite(None)
+        terms.append(weighted_term)
+
+    try:
+        total_loss = math.fsum(terms)
+    except (OverflowError, ValueError) as exc:
+        raise non_finite(exc) from exc
+    if not math.isfinite(total_loss):
+        raise non_finite(None)
+    try:
+        result = total_loss / total_weight
     except (OverflowError, ValueError, ZeroDivisionError) as exc:
         raise non_finite(exc) from exc
     if not math.isfinite(result):
