@@ -20219,6 +20219,14 @@ _SERIAL_KEYS_KMEANS = (
     "seed",
     "cluster_centers",
 )
+_SERIAL_KEYS_KMEDOIDS = (
+    "class",
+    "n_clusters",
+    "max_iter",
+    "n_features_in",
+    "medoid_indices",
+    "cluster_centers",
+)
 _SERIAL_KEYS_PCA = ("class", "mean", "components")
 _SERIAL_KEYS_LINEAR = ("class", "lr", "l2", "max_iter", "tol", "w", "b")
 _SERIAL_KEYS_LASSO = ("class", "alpha", "max_iter", "tol", "w", "b")
@@ -20961,7 +20969,7 @@ def _dumps_dbscan(model):
 
 
 def dumps(model):
-    """Serialize a fitted KMeans, PCA, LinearRegression,
+    """Serialize a fitted KMeans, KMedoids, PCA, LinearRegression,
     LogisticRegression, LassoRegression, ElasticNetRegression,
     MultinomialLogisticRegression, StandardScaler,
     DecisionTreeClassifier, DecisionTreeRegressor,
@@ -21075,6 +21083,20 @@ def dumps(model):
     ROUND_HALF_UP via ``Decimal(str(v))`` (negative zero becomes
     ``0.0000000000``), and the quantized text must convert back with
     ``float`` to exactly the original value or dumps raises ValueError.
+
+    For KMedoids the top-level keys are ``class``, ``n_clusters``,
+    ``max_iter``, ``n_features_in``, ``medoid_indices``,
+    ``cluster_centers`` in that order; ``class`` is ``"KMedoids"`` and
+    the three integer fields are positive JSON integers.
+    ``medoid_indices_`` is a JSON integer array of length
+    ``n_clusters`` whose entries are distinct non-negative integers, and
+    ``cluster_centers_`` is a non-empty rectangular
+    ``n_clusters`` by ``n_features_in`` array whose entries have type
+    exactly ``int`` or ``float`` (booleans rejected) and are finite.
+    Each center coordinate is quantized to 10 decimal places via
+    ``Decimal(str(v))`` with ROUND_HALF_UP (negative zero becomes
+    ``0.0000000000``); the quantized text must convert back with
+    ``float`` to exactly the original value.
 
     For LassoRegression the top-level keys are ``class``, ``alpha``,
     ``max_iter``, ``tol``, ``w``, ``b`` in that order; ``class`` is
@@ -21194,6 +21216,14 @@ def dumps(model):
             raise
         except Exception as exc:
             raise ValueError("invalid KMeans state") from exc
+
+    if isinstance(model, KMedoids):
+        try:
+            return _dumps_kmedoids(model)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("invalid KMedoids state") from exc
 
     if isinstance(model, PCA):
         try:
@@ -21368,7 +21398,8 @@ def dumps(model):
             raise ValueError("invalid IsolationForest state") from exc
 
     raise ValueError(
-        "dumps only supports fitted KMeans, PCA, LinearRegression, "
+        "dumps only supports fitted KMeans, KMedoids, PCA, "
+        "LinearRegression, "
         "LogisticRegression, LassoRegression, ElasticNetRegression, "
         "MultinomialLogisticRegression, "
         "StandardScaler, DecisionTreeClassifier, DecisionTreeRegressor, "
@@ -21434,6 +21465,86 @@ def _is_valid_tol(tol):
         return math.isfinite(tol) and tol > 0
     except OverflowError:
         return False
+
+
+def _dumps_kmedoids(model):
+    """Serialize a fitted KMedoids.
+
+    The top-level keys are ``class``, ``n_clusters``, ``max_iter``,
+    ``n_features_in``, ``medoid_indices``, ``cluster_centers`` in that
+    order; ``class`` is ``"KMedoids"`` and the three integer fields are
+    positive JSON integers. ``medoid_indices_`` must be a list of
+    ``n_clusters`` distinct non-negative exact integers.
+    ``cluster_centers_`` must be a non-empty rectangular
+    ``n_clusters`` by ``n_features_in`` list whose elements have type
+    exactly ``int`` or ``float`` (booleans rejected) and are finite; each
+    coordinate is quantized to 10 decimal places via
+    ``Decimal(str(v))`` with ROUND_HALF_UP (negative zero becomes
+    ``0.0000000000``), and the quantized text must convert back with
+    ``float`` to exactly the original value.
+    """
+    centers = model.cluster_centers_
+    indices = model.medoid_indices_
+    if centers is None or indices is None or model._n_features is None:
+        raise ValueError("KMedoids must be fitted before dumps is called")
+    n_clusters = model.n_clusters
+    max_iter = model.max_iter
+    # Re-validate the construction parameters exactly as __init__ does.
+    if (
+        type(n_clusters) is not int
+        or n_clusters <= 0
+        or type(max_iter) is not int
+        or max_iter <= 0
+    ):
+        raise ValueError("KMedoids has invalid construction parameters")
+    n_features = model._n_features
+    if type(n_features) is not int or n_features <= 0:
+        raise ValueError(
+            "KMedoids n_features_in must be a positive integer"
+        )
+    if not isinstance(indices, list) or len(indices) != n_clusters:
+        raise ValueError("medoid_indices_ must have length n_clusters")
+    seen_indices = set()
+    encoded_indices = []
+    for index in indices:
+        if type(index) is not int or index < 0:
+            raise ValueError(
+                "medoid indices must be distinct non-negative integers"
+            )
+        if index in seen_indices:
+            raise ValueError("medoid indices must be distinct")
+        seen_indices.add(index)
+        encoded_indices.append(str(index))
+    if not isinstance(centers, list) or len(centers) != n_clusters:
+        raise ValueError("number of medoid rows must equal n_clusters")
+    encoded_rows = []
+    for row in centers:
+        if not isinstance(row, list) or len(row) != n_features:
+            raise ValueError(
+                "cluster_centers_ must be a non-empty rectangular "
+                "n_clusters by n_features_in array"
+            )
+        encoded_rows.append(
+            "["
+            + ",".join(
+                _quantize_lasso_number(v, "cluster center coordinate")
+                for v in row
+            )
+            + "]"
+        )
+    return (
+        '{"class":"KMedoids","n_clusters":'
+        + str(n_clusters)
+        + ',"max_iter":'
+        + str(max_iter)
+        + ',"n_features_in":'
+        + str(n_features)
+        + ',"medoid_indices":['
+        + ",".join(encoded_indices)
+        + '],"cluster_centers":['
+        + ",".join(encoded_rows)
+        + "]}"
+    )
 
 
 def _dumps_pca(model):
@@ -23048,6 +23159,64 @@ def _load_kmeans(pairs):
     return model
 
 
+def _load_kmedoids(pairs):
+    keys = tuple(key for key, _ in pairs)
+    if keys != _SERIAL_KEYS_KMEDOIDS:
+        raise ValueError(
+            "KMedoids JSON must have exactly the serialized keys "
+            "in the serialized order"
+        )
+    data = _convert(pairs)
+
+    class_name = data["class"]
+    if not isinstance(class_name, str) or class_name != "KMedoids":
+        raise ValueError('class must be "KMedoids"')
+
+    n_clusters = _expect_int(data["n_clusters"], "n_clusters")
+    max_iter = _expect_int(data["max_iter"], "max_iter")
+    n_features = _expect_int(data["n_features_in"], "n_features_in")
+    if n_clusters <= 0:
+        raise ValueError("n_clusters must be greater than 0")
+    if max_iter <= 0:
+        raise ValueError("max_iter must be greater than 0")
+    if n_features <= 0:
+        raise ValueError("n_features_in must be greater than 0")
+
+    indices_node = data["medoid_indices"]
+    if not isinstance(indices_node, list) or len(indices_node) != n_clusters:
+        raise ValueError("medoid_indices must have length n_clusters")
+    indices = []
+    seen_indices = set()
+    for entry in indices_node:
+        index = _expect_int(entry, "medoid_indices element")
+        if index < 0:
+            raise ValueError("medoid indices must be non-negative")
+        if index in seen_indices:
+            raise ValueError("medoid indices must be distinct")
+        seen_indices.add(index)
+        indices.append(index)
+
+    centers_node = data["cluster_centers"]
+    if not isinstance(centers_node, list) or len(centers_node) != n_clusters:
+        raise ValueError("number of medoid rows must equal n_clusters")
+    centers = []
+    for row in centers_node:
+        if not isinstance(row, list) or len(row) != n_features:
+            raise ValueError(
+                "cluster_centers must be a non-empty rectangular "
+                "n_clusters by n_features_in array"
+            )
+        centers.append(
+            [_expect_fixed(v, "cluster center coordinate") for v in row]
+        )
+
+    model = KMedoids(n_clusters=n_clusters, max_iter=max_iter)
+    model.medoid_indices_ = list(indices)
+    model.cluster_centers_ = [list(row) for row in centers]
+    model._n_features = n_features
+    return model
+
+
 def _load_pca(pairs):
     keys = tuple(key for key, _ in pairs)
     if keys != _SERIAL_KEYS_PCA:
@@ -24072,7 +24241,7 @@ def _load_dbscan(pairs):
 
 
 def loads(text):
-    """Reconstruct a fitted KMeans, PCA, LinearRegression,
+    """Reconstruct a fitted KMeans, KMedoids, PCA, LinearRegression,
     LogisticRegression, LassoRegression, ElasticNetRegression,
     MultinomialLogisticRegression, StandardScaler,
     DecisionTreeClassifier, DecisionTreeRegressor,
@@ -24092,7 +24261,10 @@ def loads(text):
     parse failures, booleans, exponent notation, non-finite values, or
     illegal parameters -- raises ValueError. The returned model is
     independent of the input and fitted; KMeans recovers its column
-    count from centroid width, the linear models from the length of
+    count from centroid width, KMedoids from ``n_features_in`` with its
+    ``medoid_indices`` and ``cluster_centers`` lists copied rather than
+    shared (distinct non-negative integer medoid indices and finite
+    fixed 10-decimal center coordinates), the linear models from the length of
     ``w``, LassoRegression likewise from the length of its non-empty
     ``w`` (copied rather than shared) with strictly positive
     ``alpha``/``tol`` and a positive ``max_iter``,
@@ -24163,6 +24335,13 @@ def loads(text):
     if class_entry == "KMeans":
         try:
             return _load_kmeans(pairs)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("malformed serialized model") from exc
+    if class_entry == "KMedoids":
+        try:
+            return _load_kmedoids(pairs)
         except ValueError:
             raise
         except Exception as exc:
