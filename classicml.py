@@ -82,7 +82,8 @@ Exports:
     f1_score -- F1 entry of precision_recall_fscore_support.
     roc_curve -- false/true positive rates and thresholds for a binary
         score ranking.
-    roc_auc_score -- trapezoidal area under the roc_curve.
+    roc_auc_score -- trapezoidal area under the roc_curve, with
+        standardized partial AUC over a bounded false positive range.
     det_curve -- false positive/false negative rates and ascending
         thresholds for a binary score ranking.
     precision_recall_curve -- precision/recall pairs at descending score
@@ -9847,38 +9848,137 @@ def roc_curve(y_true, y_score, pos_label=1, sample_weight=None):
     return fpr, tpr, thresholds
 
 
-def roc_auc_score(y_true, y_score, pos_label=1, sample_weight=None):
+def roc_auc_score(
+    y_true, y_score, pos_label=1, sample_weight=None, max_fpr=None
+) -> float:
     """Return the area under :func:`roc_curve` for the same arguments.
 
-    Validation and exceptions are exactly those of :func:`roc_curve`.
-    The area is the ``math.fsum`` -- in curve order -- of the trapezoid
-    terms ``(fpr[k + 1] - fpr[k]) * (tpr[k] + tpr[k + 1]) / 2`` over
-    adjacent curve points; an exact zero result is normalized to ``0.0``.
-    Overflow, invalid operations, or non-finite intermediate values
-    raise FloatingPointError.
+    Validation of ``y_true``, ``y_score``, ``pos_label``, and
+    ``sample_weight`` -- including weighted ROC computation and tied-score
+    grouping -- and its exceptions are exactly those of
+    :func:`roc_curve`. ``max_fpr`` must be ``None`` or a value of type
+    exactly ``int`` or ``float`` (booleans rejected) that is finite and
+    satisfies ``0 < max_fpr <= 1``; otherwise ValueError. An
+    OverflowError raised while checking finiteness is treated as a
+    ValueError as well.
 
-    The return value is a float. The inputs are not modified.
-    Deterministic: same inputs, same result.
+    With ``max_fpr`` equal to ``None`` or to ``1``, the result is the
+    ``math.fsum`` -- in curve order -- of the trapezoid terms
+    ``(fpr[k + 1] - fpr[k]) * (tpr[k] + tpr[k + 1]) / 2`` over adjacent
+    curve points.
+
+    With ``0 < max_fpr < 1``, letting ``k`` be the first index with
+    ``fpr[k] > max_fpr``, the true positive rate is linearly interpolated
+    at ``max_fpr`` between the curve points at ``k - 1`` and ``k``; that
+    point is appended to the points at indices ``0`` through ``k - 1``
+    and the trapezoidal area ``A`` over them is summed with
+    ``math.fsum``. The standardized partial AUC returned is
+    ``0.5 * (1 + (A - Amin) / (Amax - Amin))`` where
+    ``Amin = max_fpr ** 2 / 2`` and ``Amax = max_fpr``.
+
+    If interpolation or any arithmetic, power, or ``math.fsum`` after
+    validation raises OverflowError, ValueError, or ZeroDivisionError, or
+    any intermediate value is non-finite, FloatingPointError is raised.
+    An exact zero result is normalized to ``0.0``. The return value is a
+    float. The inputs are not modified. Deterministic: same inputs, same
+    result.
     """
     fpr, tpr, _ = roc_curve(
         y_true, y_score, pos_label=pos_label, sample_weight=sample_weight
     )
-    terms = []
-    for k in range(len(fpr) - 1):
+    if max_fpr is not None:
+        if type(max_fpr) not in (int, float):
+            raise ValueError(
+                "max_fpr must be None or a finite non-boolean number "
+                "greater than 0 and less than or equal to 1"
+            )
+        # math.isfinite raises OverflowError for ints too large to convert
+        # to float; such values fail the finite requirement.
         try:
-            term = (fpr[k + 1] - fpr[k]) * (tpr[k] + tpr[k + 1]) / 2
+            max_fpr_finite = math.isfinite(max_fpr)
+        except OverflowError as exc:
+            raise ValueError(
+                "max_fpr must be None or a finite non-boolean number "
+                "greater than 0 and less than or equal to 1"
+            ) from exc
+        if not max_fpr_finite or not (0.0 < max_fpr <= 1.0):
+            raise ValueError(
+                "max_fpr must be None or a finite non-boolean number "
+                "greater than 0 and less than or equal to 1"
+            )
+
+    if max_fpr is None or max_fpr == 1:
+        terms = []
+        for k in range(len(fpr) - 1):
+            try:
+                term = (
+                    (fpr[k + 1] - fpr[k])
+                    * (tpr[k] + tpr[k + 1])
+                    / 2
+                )
+            except (OverflowError, ValueError, ZeroDivisionError) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during roc auc "
+                    "computation"
+                ) from exc
+            if not math.isfinite(term):
+                raise FloatingPointError(
+                    "non-finite value encountered during roc auc "
+                    "computation"
+                )
+            terms.append(term)
+        try:
+            auc = math.fsum(terms)
         except (OverflowError, ValueError) as exc:
             raise FloatingPointError(
                 "non-finite value encountered during roc auc computation"
             ) from exc
+        if not math.isfinite(auc):
+            raise FloatingPointError(
+                "non-finite value encountered during roc auc computation"
+            )
+        if auc == 0:
+            auc = 0.0
+        return auc
+
+    # k is the first index at which fpr exceeds max_fpr; the curve's
+    # final fpr is exactly 1.0, so k exists with k - 1 >= 0.
+    k = 0
+    while fpr[k] <= max_fpr:
+        k += 1
+    try:
+        fraction = (max_fpr - fpr[k - 1]) / (fpr[k] - fpr[k - 1])
+        tpr_at_fpr = tpr[k - 1] + (tpr[k] - tpr[k - 1]) * fraction
+        if not math.isfinite(fraction) or not math.isfinite(tpr_at_fpr):
+            raise FloatingPointError(
+                "non-finite value encountered during roc auc computation"
+            )
+        terms = []
+        for j in range(k - 1):
+            term = (
+                (fpr[j + 1] - fpr[j]) * (tpr[j + 1] + tpr[j]) / 2
+            )
+            if not math.isfinite(term):
+                raise FloatingPointError(
+                    "non-finite value encountered during roc auc "
+                    "computation"
+                )
+            terms.append(term)
+        term = (
+            (max_fpr - fpr[k - 1]) * (tpr_at_fpr + tpr[k - 1]) / 2
+        )
         if not math.isfinite(term):
             raise FloatingPointError(
                 "non-finite value encountered during roc auc computation"
             )
         terms.append(term)
-    try:
-        auc = math.fsum(terms)
-    except (OverflowError, ValueError) as exc:
+        area = math.fsum(terms)
+        area_min = max_fpr ** 2 / 2
+        area_max = max_fpr
+        auc = 0.5 * (
+            1.0 + (area - area_min) / (area_max - area_min)
+        )
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
         raise FloatingPointError(
             "non-finite value encountered during roc auc computation"
         ) from exc
