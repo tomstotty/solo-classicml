@@ -17,6 +17,9 @@ Exports:
         using Gini impurity splits.
     RandomForestClassifier -- deterministic bagged forest of Gini decision
         trees with per-node random feature subsampling.
+    ExtraTreesClassifier -- deterministic extremely-randomized forest of
+        Gini decision trees using all samples per tree with per-node
+        random feature and threshold selection.
     AdaBoostClassifier -- deterministic discrete AdaBoost of decision
         stumps over +/-1 labels.
     GradientBoostingRegressor -- deterministic gradient boosting for
@@ -252,6 +255,7 @@ __all__ = [
     "DecisionTreeRegressor",
     "RandomForestRegressor",
     "RandomForestClassifier",
+    "ExtraTreesClassifier",
     "AdaBoostClassifier",
     "GradientBoostingRegressor",
     "GradientBoostingClassifier",
@@ -2191,6 +2195,159 @@ class RandomForestClassifier:
         return results
 
 
+class ExtraTreesClassifier:
+    """Deterministic extremely-randomized forest of Gini classifiers.
+
+    The forest holds ``n_estimators`` unconstrained decision trees. Unlike
+    ``RandomForestClassifier``, every tree is grown on all ``n`` training
+    samples (no bootstrap draws). Node labels are the majority label (ties
+    go to the smallest label), a split sends ``x <= t`` left, a candidate's
+    score is
+    ``(|L| * gini(L) + |R| * gini(R)) / |S|``, only scores strictly below
+    the parent Gini are accepted, the best candidate is the first in
+    ascending ``(score, feature index, t)`` order, and a node becomes a
+    leaf when it is pure or no candidate split improves the Gini.
+
+    Randomness comes from a single ``random.Random(seed)`` stream consumed
+    in tree order. At every non-pure node in left-before-right recursion
+    order, ``sorted(rng.sample(range(p), max_features))`` -- where ``p`` is
+    the number of training features -- selects the features examined at
+    that node. Pure nodes consume no randomness. For each selected
+    feature, its ascending distinct values
+    among the node's samples are recorded as ``V``; a constant feature
+    yields no candidate and consumes no randomness. Otherwise a single
+    ``rng.randrange(len(V) - 1)`` call picks the index ``k`` and the
+    threshold is ``V[k]`` (so the maximum value is never a threshold).
+    Prediction votes over the trees in order for each input row; ties go
+    to the smallest label. ``fit`` first clears any previously fitted
+    state, so a failed fit leaves the model unfitted. The inputs are not
+    modified and the same arguments always give the same result.
+    """
+
+    def __init__(self, n_estimators=10, max_features=1, seed=0):
+        if type(n_estimators) is not int:
+            raise ValueError("n_estimators must be an integer")
+        if n_estimators <= 0:
+            raise ValueError("n_estimators must be greater than 0")
+        if type(max_features) is not int:
+            raise ValueError("max_features must be an integer")
+        if max_features <= 0:
+            raise ValueError("max_features must be greater than 0")
+        if type(seed) is not int:
+            raise ValueError("seed must be an integer")
+
+        self.n_estimators = n_estimators
+        self.max_features = max_features
+        self.seed = seed
+        self._trees = None
+        self._n_features = None
+
+    def fit(self, X, y) -> ExtraTreesClassifier:
+        self._trees = None
+        self._n_features = None
+        width = _check_tree_matrix(X)
+        _check_label_vector(y, len(X))
+        if self.max_features > width:
+            raise ValueError(
+                "max_features must not exceed the number of training features"
+            )
+
+        n = len(X)
+        rng = random.Random(self.seed)
+        trees = []
+        for _ in range(self.n_estimators):
+            # Each tree uses every sample exactly once: no bootstrap.
+            indices = list(range(n))
+            trees.append(self._build(X, y, indices, width, rng))
+
+        self._trees = trees
+        self._n_features = width
+        return self
+
+    def _build(self, X, y, indices, width, rng):
+        labels = [y[i] for i in indices]
+        node = _DecisionTreeNode(_majority_label(labels))
+
+        pure = True
+        first = labels[0]
+        for label in labels:
+            if label != first:
+                pure = False
+                break
+        if pure:
+            return node
+
+        # One feature draw per non-pure node, in recursion order.
+        features = sorted(rng.sample(range(width), self.max_features))
+
+        parent_gini = _gini_impurity(labels)
+        n = len(indices)
+        best = None  # (score, feature index, threshold)
+        for j in features:
+            values = sorted(set(X[i][j] for i in indices))
+            if len(values) < 2:
+                # A constant feature offers no split and consumes no
+                # threshold draw.
+                continue
+            # One random threshold per selected non-constant feature.
+            threshold = values[rng.randrange(len(values) - 1)]
+            left_labels = []
+            right_labels = []
+            for i in indices:
+                if X[i][j] <= threshold:
+                    left_labels.append(y[i])
+                else:
+                    right_labels.append(y[i])
+            score = (
+                len(left_labels) * _gini_impurity(left_labels)
+                + len(right_labels) * _gini_impurity(right_labels)
+            ) / n
+            if score < parent_gini and (
+                best is None or (score, j, threshold) < best
+            ):
+                best = (score, j, threshold)
+        if best is None:
+            return node
+
+        _, feature, threshold = best
+        left_indices = [i for i in indices if X[i][feature] <= threshold]
+        right_indices = [i for i in indices if X[i][feature] > threshold]
+        node.feature = feature
+        node.threshold = threshold
+        node.left = self._build(X, y, left_indices, width, rng)
+        node.right = self._build(X, y, right_indices, width, rng)
+        return node
+
+    def predict(self, X) -> list[int]:
+        if self._trees is None:
+            raise ValueError("model must be fitted before predict is called")
+        width = _check_tree_matrix(X)
+        if width != self._n_features:
+            raise ValueError(
+                "X must have the same number of features as the training data"
+            )
+
+        results = []
+        for row in X:
+            counts = {}
+            for tree in self._trees:
+                node = tree
+                while node.feature is not None:
+                    if row[node.feature] <= node.threshold:
+                        node = node.left
+                    else:
+                        node = node.right
+                counts[node.label] = counts.get(node.label, 0) + 1
+            best_label = None
+            best_count = -1
+            for label in sorted(counts):
+                if counts[label] > best_count:
+                    best_count = counts[label]
+                    best_label = label
+            results.append(best_label)
+        return results
+
+
 class _IsolationTreeNode:
     """Node of an isolation tree; leaves store only the sample count."""
 
@@ -2693,7 +2850,23 @@ class IsolationForest:
             repeats = []
             for _ in range(n_repeats):
                 idx = list(range(n))
-                rng.shuffle(idx)
+                try:
+                    rng.shuffle(idx)
+                except FloatingPointError:
+                    raise
+                except (
+                    OverflowError,
+                    ValueError,
+                    ZeroDivisionError,
+                ) as exc:
+                    # The shuffle is part of the computation rather than a
+                    # score_samples call, so its arithmetic errors are
+                    # reported as FloatingPointError like every other
+                    # non-scoring step.
+                    raise FloatingPointError(
+                        "non-finite value encountered during isolation forest"
+                        " scoring"
+                    ) from exc
                 permuted = permuted_matrix(j, idx, column)
                 # Exceptions from score_samples (including
                 # FloatingPointError) propagate unchanged, so this call
@@ -20642,7 +20815,9 @@ def dumps(model):
     exactly as ``__init__`` performs the checks (``n_estimators`` a
     positive JSON integer, ``max_samples`` a JSON integer of at least
     2, ``contamination`` the string ``"auto"`` or a finite exact
-    int/float in ``(0, 0.5]`` quantized to 10 decimal places, and
+    int/float in ``(0, 0.5]`` quantized to 10 decimal places (the
+    quantized text must convert back with ``float`` to exactly the
+    original value), and
     ``seed`` a JSON integer), ``n_features_in`` is a positive JSON
     integer, and the decision ``threshold`` is a finite float
     quantized to 10 decimal places via ``Decimal(str(v))`` with
@@ -21735,8 +21910,11 @@ def _dumps_isolation_forest(model):
     class is ``"IsolationForest"``, the four construction fields
     (``n_estimators``, ``max_samples``, ``contamination``, ``seed``) are
     re-validated exactly as ``__init__`` performs the checks,
-    ``n_features_in`` is a positive JSON integer, the decision
-    ``threshold`` is a finite float quantized to 10 decimals, and the
+    ``n_features_in`` is a positive JSON integer, a numeric
+    ``contamination`` is quantized to 10 decimals and the quantized text
+    must convert back with ``float`` to exactly the original value, the
+    decision ``threshold`` is a finite float quantized to 10 decimals,
+    and the
     ``trees`` array holds exactly n_estimators node trees encoded by
     ``_encode_isolation_node``. The fitted state must match the
     construction parameters in shape.
@@ -21779,6 +21957,10 @@ def _dumps_isolation_forest(model):
             raise ValueError(
                 "contamination must remain in (0, 0.5] after quantization"
                 " to 10 decimals"
+            )
+        if quantized_contamination != contamination:
+            raise ValueError(
+                "contamination must equal its 10-decimal quantization"
             )
     else:
         raise ValueError(
