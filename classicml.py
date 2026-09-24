@@ -188,6 +188,8 @@ Exports:
         multi-interval weighted interval score combining a median
         absolute-error term with central prediction intervals at
         strictly increasing coverage levels.
+    concordance_index -- weighted Harrell's concordance index between
+        event times and risk scores over comparable sample pairs.
     dumps -- serialize a fitted KMeans/PCA/linear/scaler/tree/forest
         model (including MultinomialLogisticRegression,
         AgglomerativeClustering, and DBSCAN) to whitespace-free JSON
@@ -319,6 +321,7 @@ __all__ = [
     "energy_score",
     "interval_score",
     "weighted_interval_score",
+    "concordance_index",
     "dumps",
     "loads",
 ]
@@ -18176,6 +18179,186 @@ def weighted_interval_score(y, m, lo, hi, a, w=None) -> float:
 # ``from __future__ import annotations`` stores annotations as strings;
 # expose the builtin ``float`` as the runtime return annotation.
 weighted_interval_score.__annotations__["return"] = float
+
+
+def concordance_index(event_time, risk_score, event_observed=None, sample_weight=None) -> float:
+    """Return the (optionally weighted) concordance index.
+
+    ``event_time`` and ``risk_score`` must be non-empty lists of equal
+    length whose elements are finite values of type exactly ``int`` or
+    ``float`` (booleans are rejected); every event time must be
+    non-negative. ``event_observed`` must be ``None`` or a list of the
+    same length whose elements are exactly the integers ``0`` or ``1``
+    (booleans are rejected); ``None`` is treated as all ones.
+    ``sample_weight`` must be ``None`` or a list of the same length
+    whose elements are finite non-negative values of type exactly
+    ``int`` or ``float``; ``None`` is treated as all ``1.0``. Any
+    container, length, type, range, or finiteness violation (including
+    ``OverflowError`` raised by ``math.isfinite``) raises ValueError.
+
+    After validation the values are converted to ``float``. Pairs are
+    scanned with ``i`` outer and ``j`` inner for ``i < j``: a pair is
+    comparable only when the earlier time belongs to a sample with an
+    observed event (``time_i < time_j`` and ``event_i == 1``, or
+    symmetrically); pairs with equal times or whose earlier sample has
+    no observed event are ignored. For a comparable pair with earlier
+    event sample ``a`` and other sample ``b``, ``q = w_a * w_b`` adds
+    ``q`` to the concordant weight when ``risk_a > risk_b``, ``0.5 * q``
+    when the risks are equal, and nothing otherwise; ``q`` always adds
+    to the total weight. ``math.fsum`` computes the total weight ``W``
+    and the concordant weight ``C``; ``W <= 0`` raises ValueError,
+    otherwise the result is ``C / W``. Overflow, invalid operations, or
+    division by zero during the post-validation conversion, arithmetic,
+    or summation, and non-finite intermediate values or results, raise
+    FloatingPointError.
+
+    An exact zero result is normalized to positive ``0.0``. The return
+    value is a float. The inputs are not modified. Deterministic: same
+    inputs, same result.
+    """
+    n = _check_metric_vectors(event_time, risk_score)
+    for name, values in (("event_time", event_time), ("risk_score", risk_score)):
+        for value in values:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "%s must contain only finite non-boolean numbers" % name
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "%s must contain only finite non-boolean numbers" % name
+                ) from exc
+            if not finite:
+                raise ValueError(
+                    "%s must contain only finite non-boolean numbers" % name
+                )
+    for value in event_time:
+        if value < 0:
+            raise ValueError("event_time must contain only non-negative values")
+
+    if event_observed is None:
+        events = [1] * n
+    else:
+        if not isinstance(event_observed, list):
+            raise ValueError("event_observed must be None or a list")
+        if len(event_observed) != n:
+            raise ValueError(
+                "event_observed must have the same length as event_time"
+            )
+        events = []
+        for value in event_observed:
+            if type(value) is not int or value not in (0, 1):
+                raise ValueError("event_observed must contain only 0 or 1")
+            events.append(value)
+
+    if sample_weight is None:
+        weights = [1.0] * n
+    else:
+        if not isinstance(sample_weight, list):
+            raise ValueError("sample_weight must be None or a list")
+        if len(sample_weight) != n:
+            raise ValueError(
+                "sample_weight must have the same length as event_time"
+            )
+        weights = []
+        for value in sample_weight:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "sample_weight must contain only finite non-boolean numbers"
+                )
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "sample_weight must contain only finite non-boolean numbers"
+                ) from exc
+            if not finite:
+                raise ValueError(
+                    "sample_weight must contain only finite non-boolean numbers"
+                )
+            if value < 0:
+                raise ValueError(
+                    "sample_weight must contain only non-negative values"
+                )
+            weights.append(value)
+
+    def non_finite():
+        return FloatingPointError(
+            "non-finite value encountered during concordance index"
+        )
+
+    times = []
+    risks = []
+    for i in range(n):
+        try:
+            time_value = float(event_time[i])
+            risk_value = float(risk_score[i])
+            weight_value = float(weights[i])
+        except (OverflowError, ValueError) as exc:
+            raise non_finite() from exc
+        if not math.isfinite(time_value):
+            raise non_finite()
+        if not math.isfinite(risk_value):
+            raise non_finite()
+        if not math.isfinite(weight_value):
+            raise non_finite()
+        times.append(time_value)
+        risks.append(risk_value)
+        weights[i] = weight_value
+
+    total_terms = []
+    concordant_terms = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            if times[i] < times[j] and events[i] == 1:
+                a, b = i, j
+            elif times[j] < times[i] and events[j] == 1:
+                a, b = j, i
+            else:
+                continue
+            try:
+                q = weights[a] * weights[b]
+            except (OverflowError, ValueError) as exc:
+                raise non_finite() from exc
+            if not math.isfinite(q):
+                raise non_finite()
+            total_terms.append(q)
+            if risks[a] > risks[b]:
+                concordant_terms.append(q)
+            elif risks[a] == risks[b]:
+                concordant_terms.append(0.5 * q)
+
+    try:
+        total_weight = math.fsum(total_terms)
+    except (OverflowError, ValueError) as exc:
+        raise non_finite() from exc
+    if not math.isfinite(total_weight):
+        raise non_finite()
+    if total_weight <= 0:
+        raise ValueError("no comparable pairs with positive total weight")
+    try:
+        concordant_weight = math.fsum(concordant_terms)
+    except (OverflowError, ValueError) as exc:
+        raise non_finite() from exc
+    if not math.isfinite(concordant_weight):
+        raise non_finite()
+    try:
+        result = concordant_weight / total_weight
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        raise non_finite() from exc
+    if not math.isfinite(result):
+        raise non_finite()
+    if result == 0:
+        return 0.0
+    return result
+
+
+# ``from __future__ import annotations`` stores annotations as strings;
+# expose the builtin ``float`` as the runtime return annotation.
+concordance_index.__annotations__["return"] = float
 
 
 _SERIAL_KEYS_KMEANS = (
