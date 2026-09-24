@@ -1852,6 +1852,100 @@ class RandomForestRegressor:
             results.append(_positive_zero(prediction))
         return results
 
+    def permutation_importance(self, X, y, n_repeats=5, seed=0):
+        """Return permutation importance for every training feature.
+
+        The baseline score is ``b = mean_squared_error(y, predict(X))``.
+        A fresh ``random.Random(seed)`` drives the permutations in
+        feature-outer, repeat-inner order: for each feature ``j`` and each
+        repeat, a new ``idx = list(range(n))`` is shuffled, a copy of ``X``
+        is made, and its column ``j`` is replaced so that row ``i`` receives
+        ``X[idx[i]][j]``; the recorded score is the mean squared error on
+        the permuted copy minus ``b``.
+
+        The model must already be fitted. ``X`` must be a non-empty
+        rectangular ``list`` of non-empty rows and ``y`` an equal-length
+        ``list``; their elements must be finite values of type exactly
+        ``int`` or ``float`` (booleans are rejected), and ``X`` must have
+        the same number of features as the training data. ``n_repeats``
+        must be a positive integer and ``seed`` an integer (exact types).
+
+        Returns ``(mean, std, raw)`` where ``mean`` and ``std`` are float
+        lists and ``raw`` a list of float lists in feature order, each in
+        repeat order; ``mean[j] = fsum(raw[j]) / n_repeats`` and
+        ``std[j] = sqrt(fsum((v - mean[j]) ** 2) / n_repeats)``, the
+        population standard deviation. Exact zeros (of either sign) are
+        normalized to positive ``0.0``. The model and the inputs are not
+        modified. Overflow, invalid operations, and non-finite values
+        encountered during the computation raise FloatingPointError.
+        """
+        if self._trees is None:
+            raise ValueError(
+                "model must be fitted before permutation_importance is called"
+            )
+        try:
+            width = _check_gradient_matrix(X)
+            _check_gradient_target(y, len(X))
+        except OverflowError as exc:
+            # An int too large to convert to float failed its finiteness
+            # check: still a rejected input, hence ValueError.
+            raise ValueError(
+                "X and y must contain only finite non-boolean numbers"
+            ) from exc
+        if width != self._n_features:
+            raise ValueError(
+                "X must have the same number of features as the training data"
+            )
+        if type(n_repeats) is not int or n_repeats <= 0:
+            raise ValueError("n_repeats must be a positive integer")
+        if type(seed) is not int:
+            raise ValueError("seed must be an integer")
+
+        n = len(X)
+        try:
+            baseline = mean_squared_error(y, self.predict(X))
+            rng = random.Random(seed)
+            raw = []
+            mean = []
+            std = []
+            for j in range(width):
+                scores = []
+                for _ in range(n_repeats):
+                    idx = list(range(n))
+                    rng.shuffle(idx)
+                    permuted = [row[:] for row in X]
+                    for i in range(n):
+                        permuted[i][j] = X[idx[i]][j]
+                    loss = mean_squared_error(y, self.predict(permuted))
+                    score = loss - baseline
+                    if not math.isfinite(score):
+                        raise FloatingPointError(
+                            "non-finite value encountered during random "
+                            "forest regression"
+                        )
+                    scores.append(_positive_zero(score))
+                raw.append(scores)
+
+                average = math.fsum(scores) / n_repeats
+                deviation = math.sqrt(
+                    math.fsum((v - average) ** 2 for v in scores)
+                    / n_repeats
+                )
+                if not math.isfinite(average) or not math.isfinite(deviation):
+                    raise FloatingPointError(
+                        "non-finite value encountered during random forest "
+                        "regression"
+                    )
+                mean.append(_positive_zero(average))
+                std.append(_positive_zero(deviation))
+        except FloatingPointError:
+            raise
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during random forest regression"
+            ) from exc
+        return mean, std, raw
+
 
 class RandomForestClassifier:
     """Deterministic bagged forest of Gini decision-tree classifiers.
