@@ -237,6 +237,7 @@ __all__ = [
     "d2_tweedie_score",
     "precision_recall_fscore_support",
     "confusion_matrix",
+    "multilabel_confusion_matrix",
     "precision_score",
     "recall_score",
     "f1_score",
@@ -9296,6 +9297,129 @@ def confusion_matrix(y_true, y_pred, sample_weight=None, normalize=None):
                 matrix[r][c], grand_total
             )
     return normalized
+
+
+def multilabel_confusion_matrix(
+    y_true, y_pred, labels=None, sample_weight=None
+) -> list:
+    """Compute one ``[[TN, FP], [FN, TP]]`` confusion matrix per label.
+
+    ``y_true`` and ``y_pred`` must be non-empty lists of equal length whose
+    elements have type exactly ``int`` (booleans are rejected). When
+    ``labels`` is ``None`` the labels are the sorted union of the labels
+    appearing in either vector, in ascending order; otherwise ``labels``
+    must be a non-empty list of distinct values of type exactly ``int``
+    (booleans are rejected), kept in the given order, and may include
+    labels that never appear or omit labels that do. ``sample_weight``
+    must be ``None`` or a list of the same length whose elements are
+    finite non-negative values of type exactly ``int`` or ``float``
+    (booleans are rejected). Any violation -- including the finiteness
+    checks, which raise OverflowError for integers too large to convert
+    to float -- raises ValueError.
+
+    For each label ``c`` the matrix is ``[[TN, FP], [FN, TP]]``: TN counts
+    samples that are ``c`` on neither side, FP samples predicted ``c`` but
+    not truly ``c``, FN samples truly ``c`` but not predicted ``c``, and
+    TP samples that are ``c`` on both sides. Without weights the four
+    cells hold exact ``int`` counts. With weights each cell sums the
+    weights of its samples, converted to float, with ``math.fsum`` in
+    sample order; empty cells and exact zero sums are ``+0.0``. Overflow
+    or an invalid operation during a weight sum, or a non-finite sum,
+    raises FloatingPointError.
+
+    The matrices are returned as a three-level list in label order. The
+    inputs are not modified. Deterministic: same inputs, same result.
+    """
+    n = _check_metric_vectors(y_true, y_pred)
+    for value in y_true:
+        if type(value) is not int:
+            raise ValueError("y_true must contain only integers")
+    for value in y_pred:
+        if type(value) is not int:
+            raise ValueError("y_pred must contain only integers")
+
+    if labels is None:
+        label_order = sorted(set(y_true) | set(y_pred))
+    else:
+        if not isinstance(labels, list) or len(labels) == 0:
+            raise ValueError("labels must be a non-empty list of integers")
+        label_order = []
+        seen = set()
+        for value in labels:
+            if type(value) is not int or value in seen:
+                raise ValueError(
+                    "labels must contain only distinct integers"
+                )
+            seen.add(value)
+            label_order.append(value)
+
+    weighted = sample_weight is not None
+    if weighted:
+        if not isinstance(sample_weight, list) or len(sample_weight) != n:
+            raise ValueError(
+                "sample_weight must be a list with the same length as the "
+                "label vectors"
+            )
+        for value in sample_weight:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                ) from exc
+            if not finite or value < 0:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+
+    result = []
+    if weighted:
+        # Per-cell weight lists, accumulated in sample order, so each cell
+        # is reduced with math.fsum in that exact order.
+        for c in label_order:
+            terms = [[[] for _ in range(2)] for _ in range(2)]
+            for i in range(n):
+                terms[y_true[i] == c][y_pred[i] == c].append(
+                    float(sample_weight[i])
+                )
+            matrix = [[0.0, 0.0], [0.0, 0.0]]
+            for r in range(2):
+                for k in range(2):
+                    cell_terms = terms[r][k]
+                    if not cell_terms:
+                        continue
+                    try:
+                        total = math.fsum(cell_terms)
+                    except (OverflowError, ValueError) as exc:
+                        raise FloatingPointError(
+                            "non-finite value encountered during "
+                            "multilabel confusion matrix"
+                        ) from exc
+                    if not math.isfinite(total):
+                        raise FloatingPointError(
+                            "non-finite value encountered during "
+                            "multilabel confusion matrix"
+                        )
+                    # math.fsum of exact zeros returns 0.0; normalize a
+                    # negative-zero result to +0.0.
+                    matrix[r][k] = total + 0.0
+            result.append(matrix)
+    else:
+        for c in label_order:
+            matrix = [[0, 0], [0, 0]]
+            for i in range(n):
+                matrix[y_true[i] == c][y_pred[i] == c] += 1
+            result.append(matrix)
+    return result
 
 
 def precision_score(
