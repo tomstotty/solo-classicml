@@ -14560,6 +14560,15 @@ _SERIAL_KEYS_KMEANS = (
 _SERIAL_KEYS_PCA = ("class", "mean", "components")
 _SERIAL_KEYS_LINEAR = ("class", "lr", "l2", "max_iter", "tol", "w", "b")
 _SERIAL_KEYS_LASSO = ("class", "alpha", "max_iter", "tol", "w", "b")
+_SERIAL_KEYS_ELASTICNET = (
+    "class",
+    "alpha",
+    "l1_ratio",
+    "max_iter",
+    "tol",
+    "w",
+    "b",
+)
 _SERIAL_KEYS_MULTINOMIAL = (
     "class",
     "lr",
@@ -15274,7 +15283,7 @@ def _dumps_dbscan(model):
 
 def dumps(model):
     """Serialize a fitted KMeans, PCA, LinearRegression,
-    LogisticRegression, LassoRegression,
+    LogisticRegression, LassoRegression, ElasticNetRegression,
     MultinomialLogisticRegression, StandardScaler,
     DecisionTreeClassifier, DecisionTreeRegressor,
     RandomForestClassifier, RandomForestRegressor, AdaBoostClassifier,
@@ -15398,6 +15407,23 @@ def dumps(model):
     not equal the original value, while the fixed ``w``/``b`` text must
     convert back to exactly the original finite value.
 
+    For ElasticNetRegression the top-level keys are ``class``,
+    ``alpha``, ``l1_ratio``, ``max_iter``, ``tol``, ``w``, ``b`` in
+    that order; ``class`` is ``"ElasticNetRegression"``, ``max_iter``
+    is a positive JSON integer, ``alpha``/``tol`` are strictly positive
+    exact ints (of any magnitude) or finite floats, and ``l1_ratio`` is
+    an exact int/float in the closed interval ``[0, 1]``. ``w`` is a
+    non-empty 1-D array whose elements and ``b`` are exact ints or
+    finite floats. Every number other than ``max_iter`` is quantized to
+    10 decimal places via ``Decimal(str(v))`` with ROUND_HALF_UP (never
+    through ``float`` first; negative zero becomes
+    ``0.0000000000``); the fixed ``alpha``/``tol`` text must convert
+    back with ``float`` to a finite strictly positive number and the
+    fixed ``l1_ratio`` text to a finite number in ``[0, 1]``, but none
+    of the three need equal the original value, while the fixed
+    ``w``/``b`` text must convert back to exactly the original finite
+    value.
+
     For MultinomialLogisticRegression the top-level keys are ``class``,
     ``lr``, ``l2``, ``max_iter``, ``tol``, ``classes``, ``W``, ``b`` in
     that order; ``class`` is ``"MultinomialLogisticRegression"``.
@@ -15485,6 +15511,14 @@ def dumps(model):
             raise
         except Exception as exc:
             raise ValueError("invalid LassoRegression state") from exc
+
+    if isinstance(model, ElasticNetRegression):
+        try:
+            return _dumps_elasticnet(model)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("invalid ElasticNetRegression state") from exc
 
     if isinstance(model, MultinomialLogisticRegression):
         try:
@@ -15612,7 +15646,7 @@ def dumps(model):
 
     raise ValueError(
         "dumps only supports fitted KMeans, PCA, LinearRegression, "
-        "LogisticRegression, LassoRegression, "
+        "LogisticRegression, LassoRegression, ElasticNetRegression, "
         "MultinomialLogisticRegression, "
         "StandardScaler, DecisionTreeClassifier, DecisionTreeRegressor, "
         "RandomForestClassifier, RandomForestRegressor, "
@@ -15875,6 +15909,87 @@ def _quantize_lasso_number(value, name, positive=False, require_equal=True):
     if positive and converted <= 0.0:
         raise ValueError("%s must be greater than 0" % name)
     return text
+
+
+def _dumps_elasticnet(model):
+    """Serialize a fitted ElasticNetRegression.
+
+    The top-level keys are ``class``, ``alpha``, ``l1_ratio``,
+    ``max_iter``, ``tol``, ``w``, ``b`` in that order; ``class`` is
+    ``"ElasticNetRegression"`` and ``max_iter`` is a positive JSON
+    integer. ``alpha``/``tol`` are strictly positive and ``l1_ratio``
+    lies in ``[0, 1]``; each is an exact int or a finite float (booleans
+    and subclasses rejected). ``w`` is a non-empty 1-D array whose
+    elements and ``b`` are exact ints or finite floats. Every value other
+    than ``max_iter`` is formatted via ``Decimal(str(v))`` quantized to
+    10 decimal places with ROUND_HALF_UP (negative zero becomes
+    ``0.0000000000``), never passing the original value through
+    ``float`` first. The fixed ``alpha``/``l1_ratio``/``tol`` text only
+    has to convert back with ``float`` to a finite number still inside
+    the parameter's legal range (it need not equal the original value);
+    the fixed ``w``/``b`` text must convert back with ``float`` to
+    exactly the original finite value, or dumps raises ValueError.
+    """
+    w = model.w
+    b = model.b
+    if w is None or b is None:
+        raise ValueError("model must be fitted before dumps is called")
+    alpha = model.alpha
+    l1_ratio = model.l1_ratio
+    tol = model.tol
+    max_iter = model.max_iter
+    # Re-validate the construction parameters exactly as __init__ does.
+    try:
+        _require_exact_positive_or_finite_float(alpha, "alpha")
+        _require_exact_unit_interval_number(l1_ratio, "l1_ratio")
+        _require_exact_positive_or_finite_float(tol, "tol")
+    except ValueError:
+        raise ValueError("model has invalid construction parameters")
+    if type(max_iter) is not int or max_iter <= 0:
+        raise ValueError("model has invalid construction parameters")
+
+    # alpha/l1_ratio/tol are quantized for display only: the fixed text
+    # only has to read back as a finite number inside the legal range,
+    # not as the original value. w/b are fitted state and must survive
+    # the round trip exactly.
+    alpha_text = _quantize_lasso_number(
+        alpha, "alpha", positive=True, require_equal=False
+    )
+    l1_ratio_text = _quantize_lasso_number(
+        l1_ratio, "l1_ratio", positive=False, require_equal=False
+    )
+    tol_text = _quantize_lasso_number(
+        tol, "tol", positive=True, require_equal=False
+    )
+    if not (0.0 <= float(l1_ratio_text) <= 1.0):
+        raise ValueError("l1_ratio must stay within [0, 1] after quantization")
+
+    if not isinstance(w, list) or len(w) == 0:
+        raise ValueError("w must be a non-empty list")
+    w_text = (
+        "["
+        + ",".join(
+            _quantize_lasso_number(value, "w element") for value in w
+        )
+        + "]"
+    )
+    b_text = _quantize_lasso_number(b, "b")
+
+    return (
+        '{"class":"ElasticNetRegression","alpha":'
+        + alpha_text
+        + ',"l1_ratio":'
+        + l1_ratio_text
+        + ',"max_iter":'
+        + str(max_iter)
+        + ',"tol":'
+        + tol_text
+        + ',"w":'
+        + w_text
+        + ',"b":'
+        + b_text
+        + "}"
+    )
 
 
 def _dumps_multinomial(model):
@@ -17140,6 +17255,50 @@ def _load_lasso(pairs):
     return model
 
 
+def _load_elasticnet(pairs):
+    keys = tuple(key for key, _ in pairs)
+    if keys != _SERIAL_KEYS_ELASTICNET:
+        raise ValueError(
+            "ElasticNetRegression JSON must have exactly the serialized "
+            "keys in the serialized order"
+        )
+    data = _convert(pairs)
+
+    class_entry = data["class"]
+    if not isinstance(class_entry, str) or class_entry != "ElasticNetRegression":
+        raise ValueError('class must be "ElasticNetRegression"')
+
+    alpha = _expect_fixed(data["alpha"], "alpha")
+    if alpha <= 0.0:
+        raise ValueError("alpha must be greater than 0")
+    l1_ratio = _expect_fixed(data["l1_ratio"], "l1_ratio")
+    if not (0.0 <= l1_ratio <= 1.0):
+        raise ValueError("l1_ratio must be in [0, 1]")
+    max_iter = _expect_int(data["max_iter"], "max_iter")
+    if max_iter < 1:
+        raise ValueError("max_iter must be at least 1")
+    tol = _expect_fixed(data["tol"], "tol")
+    if tol <= 0.0:
+        raise ValueError("tol must be greater than 0")
+
+    w_node = data["w"]
+    if not isinstance(w_node, list) or len(w_node) == 0:
+        raise ValueError("w must be a non-empty array")
+    w = [_expect_fixed(value, "w element") for value in w_node]
+
+    b = _expect_fixed(data["b"], "b")
+
+    model = ElasticNetRegression(
+        alpha=alpha,
+        l1_ratio=l1_ratio,
+        max_iter=max_iter,
+        tol=tol,
+    )
+    model.w = list(w)
+    model.b = b
+    return model
+
+
 def _load_multinomial(pairs):
     keys = tuple(key for key, _ in pairs)
     if keys != _SERIAL_KEYS_MULTINOMIAL:
@@ -17893,7 +18052,7 @@ def _load_dbscan(pairs):
 
 def loads(text):
     """Reconstruct a fitted KMeans, PCA, LinearRegression,
-    LogisticRegression, LassoRegression,
+    LogisticRegression, LassoRegression, ElasticNetRegression,
     MultinomialLogisticRegression, StandardScaler,
     DecisionTreeClassifier, DecisionTreeRegressor,
     RandomForestClassifier, RandomForestRegressor, AdaBoostClassifier,
@@ -17914,6 +18073,9 @@ def loads(text):
     ``w``, LassoRegression likewise from the length of its non-empty
     ``w`` (copied rather than shared) with strictly positive
     ``alpha``/``tol`` and a positive ``max_iter``,
+    ElasticNetRegression from the length of its non-empty ``w`` (copied
+    rather than shared) with strictly positive ``alpha``/``tol``,
+    ``l1_ratio`` in ``[0, 1]``, and a positive ``max_iter``,
     MultinomialLogisticRegression from the column count of ``W``
     (with its ``classes``/``W``/``b`` arrays copied rather than shared),
     StandardScaler/DecisionTreeClassifier/DecisionTreeRegressor/
@@ -17993,6 +18155,13 @@ def loads(text):
     if class_entry == "LassoRegression":
         try:
             return _load_lasso(pairs)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("malformed serialized model") from exc
+    if class_entry == "ElasticNetRegression":
+        try:
+            return _load_elasticnet(pairs)
         except ValueError:
             raise
         except Exception as exc:
