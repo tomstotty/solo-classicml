@@ -194,6 +194,10 @@ Exports:
         probability estimates at evaluation times, using the
         inverse-probability-of-censoring weighting with the Kaplan-Meier
         estimator of the censoring distribution.
+    cumulative_dynamic_auc -- cumulative/dynamic area under the ROC
+        curve of risk scores at evaluation times, using
+        inverse-probability-of-censoring weighting with the Kaplan-Meier
+        estimator of the censoring distribution.
     dumps -- serialize a fitted KMeans/PCA/linear/scaler/tree/forest
         model (including MultinomialLogisticRegression,
         AgglomerativeClustering, and DBSCAN) to whitespace-free JSON
@@ -327,6 +331,7 @@ __all__ = [
     "weighted_interval_score",
     "concordance_index",
     "integrated_brier_score",
+    "cumulative_dynamic_auc",
     "dumps",
     "loads",
 ]
@@ -18628,6 +18633,235 @@ def integrated_brier_score(
 # ``from __future__ import annotations`` stores annotations as strings;
 # expose the builtin ``float`` as the runtime return annotation.
 integrated_brier_score.__annotations__["return"] = float
+
+
+def cumulative_dynamic_auc(
+    event_time, event_observed, risk_score, times
+) -> list[float]:
+    """Return the cumulative/dynamic AUC of risk scores at each time.
+
+    ``event_time`` (``T``) must be a non-empty list of finite
+    non-negative values of type exactly ``int`` or ``float`` (booleans
+    are rejected). ``event_observed`` (``E``) must be a list of the same
+    length whose elements are exactly the integers ``0`` or ``1``
+    (booleans are rejected); ``1`` marks an observed event and ``0`` a
+    censoring. ``risk_score`` (``R``) must be a list of the same length
+    of finite values of type exactly ``int`` or ``float`` (booleans are
+    rejected). ``times`` (``t``) must be a non-empty list of finite
+    non-negative values of type exactly ``int`` or ``float`` in strictly
+    increasing order. Any container, length, type, range, ordering, or
+    finiteness violation (including ``OverflowError`` raised by
+    ``math.isfinite``) raises ValueError.
+
+    After validation all values are converted to ``float``. For the
+    sorted unique event times ``u``, the Kaplan-Meier estimator of the
+    censoring distribution is built as ``R = #(T >= u)``,
+    ``D = #(T == u and E == 0)`` and ``G(u) = G(u-) * (1 - D / R)``
+    starting from ``G = 1``; the values ``G(T_i-)`` are retained. At
+    each evaluation time ``t`` the cases are the samples with
+    ``E_i == 1`` and ``T_i <= t`` and the controls are the samples with
+    ``T_j > t``. With case weights ``w_i = 1 / G(T_i-)``, the
+    concordance ``C`` is the ``math.fsum``, cases outer and controls
+    inner, of ``w_i`` times ``1`` when ``R_i > R_j``, ``0.5`` when
+    ``R_i == R_j`` and ``0`` otherwise, and the weight total ``W`` is
+    the ``math.fsum`` of ``w_i`` repeated once per control; the result
+    at that time is ``C / W``. A time with no cases or no controls, a
+    required censoring probability less than or equal to zero, or a
+    total weight less than or equal to zero raises ValueError.
+
+    Overflow, invalid operations, or division by zero during the
+    post-validation conversion, the Kaplan-Meier computation, the
+    arithmetic, or the summation, and non-finite intermediate values or
+    results, raise FloatingPointError. An exact zero result is
+    normalized to positive ``0.0``. The return value is a list of
+    floats, one per evaluation time. The inputs are not modified.
+    Deterministic: same inputs, same result.
+    """
+    if not isinstance(event_time, list) or not isinstance(event_observed, list):
+        raise ValueError("event_time and event_observed must be lists")
+    if not isinstance(risk_score, list):
+        raise ValueError("risk_score must be a list")
+    n = len(event_time)
+    if n == 0:
+        raise ValueError("event_time must be a non-empty list")
+    if len(event_observed) != n:
+        raise ValueError(
+            "event_observed must have the same length as event_time"
+        )
+    if len(risk_score) != n:
+        raise ValueError(
+            "risk_score must have the same length as event_time"
+        )
+    for value in event_time:
+        if type(value) not in (int, float):
+            raise ValueError(
+                "event_time must contain only finite non-boolean numbers"
+            )
+        # math.isfinite raises OverflowError for ints too large to
+        # convert to float; such values fail the finite requirement.
+        try:
+            finite = math.isfinite(value)
+        except OverflowError as exc:
+            raise ValueError(
+                "event_time must contain only finite non-boolean numbers"
+            ) from exc
+        if not finite:
+            raise ValueError(
+                "event_time must contain only finite non-boolean numbers"
+            )
+        if value < 0:
+            raise ValueError("event_time must contain only non-negative values")
+    for value in event_observed:
+        if type(value) is not int or value not in (0, 1):
+            raise ValueError("event_observed must contain only 0 or 1")
+    for value in risk_score:
+        if type(value) not in (int, float):
+            raise ValueError(
+                "risk_score must contain only finite non-boolean numbers"
+            )
+        try:
+            finite = math.isfinite(value)
+        except OverflowError as exc:
+            raise ValueError(
+                "risk_score must contain only finite non-boolean numbers"
+            ) from exc
+        if not finite:
+            raise ValueError(
+                "risk_score must contain only finite non-boolean numbers"
+            )
+
+    if not isinstance(times, list) or len(times) == 0:
+        raise ValueError("times must be a non-empty list")
+    previous_time = None
+    for value in times:
+        if type(value) not in (int, float):
+            raise ValueError(
+                "times must contain only finite non-boolean numbers"
+            )
+        try:
+            finite = math.isfinite(value)
+        except OverflowError as exc:
+            raise ValueError(
+                "times must contain only finite non-boolean numbers"
+            ) from exc
+        if not finite:
+            raise ValueError(
+                "times must contain only finite non-boolean numbers"
+            )
+        if value < 0:
+            raise ValueError("times must contain only non-negative values")
+        if previous_time is not None and not value > previous_time:
+            raise ValueError("times must be strictly increasing")
+        previous_time = value
+
+    def non_finite():
+        return FloatingPointError(
+            "non-finite value encountered during cumulative dynamic auc"
+        )
+
+    try:
+        event_times = [float(value) for value in event_time]
+        risk_scores = [float(value) for value in risk_score]
+        eval_times = [float(value) for value in times]
+    except (OverflowError, ValueError) as exc:
+        raise non_finite() from exc
+    for value in event_times:
+        if not math.isfinite(value):
+            raise non_finite()
+    for value in risk_scores:
+        if not math.isfinite(value):
+            raise non_finite()
+    for value in eval_times:
+        if not math.isfinite(value):
+            raise non_finite()
+
+    # Kaplan-Meier estimator G of the censoring distribution:
+    # g_before[u] is G(u-) for each unique event time u.
+    unique_times = sorted(set(event_times))
+    g_before = {}
+    g = 1.0
+    for u in unique_times:
+        g_before[u] = g
+        at_risk = 0
+        censored = 0
+        for i in range(n):
+            if event_times[i] >= u:
+                at_risk += 1
+            if event_times[i] == u and event_observed[i] == 0:
+                censored += 1
+        try:
+            g = g * (1.0 - censored / at_risk)
+        except (OverflowError, ValueError, ZeroDivisionError) as exc:
+            raise non_finite() from exc
+        if not math.isfinite(g):
+            raise non_finite()
+
+    results = []
+    for t in eval_times:
+        cases = []
+        controls = []
+        for i in range(n):
+            if event_observed[i] == 1 and event_times[i] <= t:
+                cases.append(i)
+            if event_times[i] > t:
+                controls.append(i)
+        if not cases:
+            raise ValueError(
+                "each evaluation time must have at least one case"
+            )
+        if not controls:
+            raise ValueError(
+                "each evaluation time must have at least one control"
+            )
+        weights = []
+        for i in cases:
+            g_i = g_before[event_times[i]]
+            if g_i <= 0.0:
+                raise ValueError(
+                    "the censoring survival probability must be "
+                    "greater than 0"
+                )
+            try:
+                w_i = 1.0 / g_i
+            except (OverflowError, ValueError, ZeroDivisionError) as exc:
+                raise non_finite() from exc
+            if not math.isfinite(w_i):
+                raise non_finite()
+            weights.append(w_i)
+        concordance_terms = []
+        weight_terms = []
+        for i, w_i in zip(cases, weights):
+            for j in controls:
+                if risk_scores[i] > risk_scores[j]:
+                    contribution = 1.0
+                elif risk_scores[i] == risk_scores[j]:
+                    contribution = 0.5
+                else:
+                    contribution = 0.0
+                try:
+                    concordance_terms.append(w_i * contribution)
+                except OverflowError as exc:
+                    raise non_finite() from exc
+                weight_terms.append(w_i)
+        try:
+            concordance = math.fsum(concordance_terms)
+            weight_total = math.fsum(weight_terms)
+        except (OverflowError, ValueError) as exc:
+            raise non_finite() from exc
+        if not math.isfinite(concordance) or not math.isfinite(weight_total):
+            raise non_finite()
+        if weight_total <= 0.0:
+            raise ValueError("the total case weight must be greater than 0")
+        try:
+            auc = concordance / weight_total
+        except (OverflowError, ValueError, ZeroDivisionError) as exc:
+            raise non_finite() from exc
+        if not math.isfinite(auc):
+            raise non_finite()
+        if auc == 0:
+            auc = 0.0
+        results.append(auc)
+    return results
 
 
 _SERIAL_KEYS_KMEANS = (
