@@ -98,6 +98,8 @@ Exports:
     multiclass_log_loss -- weighted multiclass logistic (cross-entropy)
         loss over a probability matrix with one column per class, using
         the probability of the true class clamped away from zero.
+    multiclass_brier_score_loss -- weighted multiclass Brier score loss
+        over a probability matrix with one column per class.
     hinge_loss -- weighted binary hinge loss of a +/-1 label vector and
         a real-valued score vector.
     logit_loss -- weighted binary logistic (cross-entropy) loss of a
@@ -247,6 +249,7 @@ __all__ = [
     "brier_score_loss",
     "log_loss",
     "multiclass_log_loss",
+    "multiclass_brier_score_loss",
     "hinge_loss",
     "logit_loss",
     "multiclass_hinge_loss",
@@ -10806,6 +10809,211 @@ def multiclass_log_loss(y_true, y_prob, sample_weight=None) -> float:
     if not math.isfinite(total_loss) or not math.isfinite(loss):
         raise FloatingPointError(
             "non-finite value encountered during multiclass-log-loss "
+            "computation"
+        )
+    if loss == 0:
+        loss = 0.0
+    return loss
+
+
+def _multiclass_brier_score_loss_float(value):
+    """Convert a validated probability/weight to float; overflow, invalid
+    operations, and non-finite results raise FloatingPointError."""
+    try:
+        result = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during multiclass-brier-score "
+            "computation"
+        ) from exc
+    if not math.isfinite(result):
+        raise FloatingPointError(
+            "non-finite value encountered during multiclass-brier-score "
+            "computation"
+        )
+    return result
+
+
+def multiclass_brier_score_loss(y_true, y_prob, sample_weight=None) -> float:
+    """Compute the weighted multiclass Brier score loss.
+
+    ``y_true`` and ``y_prob`` must be non-empty lists of equal length.
+    ``y_true`` must contain values of type exactly ``int`` (booleans are
+    rejected) drawn from at least two distinct labels; the classes are the
+    sorted distinct labels, in ascending order, and each column of
+    ``y_prob`` corresponds to one class in that order. Every ``y_prob``
+    row must be a list whose length equals the number of classes and whose
+    elements are finite values in the closed interval ``[0, 1]`` with type
+    exactly ``int`` or ``float`` (booleans are rejected); the elements of
+    each row, in column order, must sum to exactly ``1.0`` under
+    ``math.fsum``. ``sample_weight`` must be ``None`` -- every sample then
+    weighs ``1.0`` -- or a list of the same length whose elements are
+    finite non-negative values of type exactly ``int`` or ``float``
+    (booleans are rejected). Any violation -- container, length, class,
+    shape, type, range, row-sum, or finiteness checks, including overflow
+    during those checks -- raises ValueError.
+
+    After validation, the probabilities and weights are converted to
+    ``float``. For each sample and class column, ``t`` is ``1.0`` when the
+    label equals that column's class and ``0.0`` otherwise, and the
+    per-sample squared error ``q`` is accumulated column by column with
+    ``math.fsum`` as the sum of ``(p - t) ** 2`` over the classes; the
+    class count is not divided out. The result is the quotient of two
+    ``math.fsum`` sums, both accumulated in input order -- one of
+    ``w_i * q_i``, the other of the ``w_i`` -- with an exact zero
+    normalized to ``0.0``. Overflow or an invalid operation during the
+    weight summation, a non-finite total weight, or a total weight that is
+    not greater than zero raises ValueError. Overflow or invalid
+    operations during the subsequent conversion, subtraction, squaring,
+    multiplication, summation, or division, and non-finite intermediate
+    values or results, raise FloatingPointError.
+
+    The return value is a float. The inputs are not modified.
+    Deterministic: same inputs, same result.
+    """
+    if not isinstance(y_true, list) or not isinstance(y_prob, list):
+        raise ValueError("y_true and y_prob must be lists")
+    if len(y_true) == 0 or len(y_prob) == 0:
+        raise ValueError("y_true and y_prob must be non-empty lists")
+    if len(y_true) != len(y_prob):
+        raise ValueError("y_true and y_prob must have the same length")
+    n = len(y_true)
+
+    for value in y_true:
+        if type(value) is not int:
+            raise ValueError("y_true must contain only integers")
+    classes = sorted(set(y_true))
+    if len(classes) < 2:
+        raise ValueError("y_true must contain at least two distinct classes")
+    n_classes = len(classes)
+    class_index = {label: j for j, label in enumerate(classes)}
+
+    for row in y_prob:
+        if not isinstance(row, list):
+            raise ValueError("y_prob rows must be lists")
+        if len(row) != n_classes:
+            raise ValueError(
+                "each y_prob row must have one entry per class"
+            )
+        for value in row:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "y_prob must contain only finite numbers in [0, 1]"
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "y_prob must contain only finite numbers in [0, 1]"
+                ) from exc
+            if not finite or value < 0 or value > 1:
+                raise ValueError(
+                    "y_prob must contain only finite numbers in [0, 1]"
+                )
+        # The columns of each row must describe a probability distribution.
+        try:
+            row_sum = math.fsum(row)
+        except OverflowError as exc:
+            raise ValueError(
+                "each y_prob row must sum to exactly 1.0"
+            ) from exc
+        if row_sum != 1.0:
+            raise ValueError(
+                "each y_prob row must sum to exactly 1.0"
+            )
+
+    if sample_weight is None:
+        weights = [1.0] * n
+    else:
+        if not isinstance(sample_weight, list) or len(sample_weight) != n:
+            raise ValueError(
+                "sample_weight must be a list with the same length as "
+                "y_true"
+            )
+        for value in sample_weight:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                ) from exc
+            if not finite or value < 0:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+        weights = [
+            _multiclass_brier_score_loss_float(value)
+            for value in sample_weight
+        ]
+
+    # The weights have just been converted to float, so summing them is
+    # still part of the input checks: overflow, invalid operations, a
+    # non-finite total, and a non-positive total all raise ValueError.
+    try:
+        total_weight = math.fsum(weights)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError("the total weight must be greater than 0") from exc
+    if not math.isfinite(total_weight) or total_weight <= 0.0:
+        raise ValueError("the total weight must be greater than 0")
+
+    error_terms = []
+    for i in range(n):
+        true_column = class_index[y_true[i]]
+        column_terms = []
+        for j in range(n_classes):
+            p = _multiclass_brier_score_loss_float(y_prob[i][j])
+            t = 1.0 if j == true_column else 0.0
+            try:
+                residual = p - t
+                column_term = residual ** 2
+            except (OverflowError, ValueError) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during "
+                    "multiclass-brier-score computation"
+                ) from exc
+            if not math.isfinite(column_term):
+                raise FloatingPointError(
+                    "non-finite value encountered during "
+                    "multiclass-brier-score computation"
+                )
+            column_terms.append(column_term)
+        try:
+            sample_error = math.fsum(column_terms)
+            term = weights[i] * sample_error
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during multiclass-brier-score "
+                "computation"
+            ) from exc
+        if not math.isfinite(sample_error) or not math.isfinite(term):
+            raise FloatingPointError(
+                "non-finite value encountered during multiclass-brier-score "
+                "computation"
+            )
+        error_terms.append(term)
+
+    try:
+        total_error = math.fsum(error_terms)
+        loss = total_error / total_weight
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during multiclass-brier-score "
+            "computation"
+        ) from exc
+    if not math.isfinite(total_error) or not math.isfinite(loss):
+        raise FloatingPointError(
+            "non-finite value encountered during multiclass-brier-score "
             "computation"
         )
     if loss == 0:
