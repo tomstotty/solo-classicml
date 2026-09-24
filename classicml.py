@@ -360,6 +360,7 @@ __all__ = [
     "isolation_forest_score",
     "local_outlier_factor_score",
     "optics_clustering",
+    "nmf",
     "dumps",
     "loads",
 ]
@@ -2925,6 +2926,158 @@ def optics_clustering(X, eps, min_samples=5) -> list[int]:
         raise FloatingPointError(
             "non-finite value encountered during optics clustering"
         ) from exc
+
+
+def nmf(X, n_components=2, max_iter=200, tol=1e-6, seed=0) -> tuple:
+    """Deterministic non-negative matrix factorization ``X ~= W @ H``.
+
+    ``X`` must be a non-empty rectangular ``list[list]`` of ``n`` rows and
+    ``p`` columns whose elements have type exactly ``int`` or ``float``
+    (booleans and subclasses rejected), are finite, and are ``>= 0``; an
+    OverflowError from the finiteness check on an oversized integer is
+    reported as ValueError like every other rejected value.
+    ``n_components`` (``r``) must be an exact positive ``int`` with
+    ``r <= min(n, p)``, ``max_iter`` an exact positive ``int``, ``tol`` a
+    finite non-boolean positive number, and ``seed`` an exact ``int``;
+    every violation raises ValueError.
+
+    With ``F = math.fsum`` and ``e = 1e-12``, ``W`` (``n x r``) and ``H``
+    (``r x p``) are initialized to ``random.Random(seed).random() + e``
+    drawn in row-then-column order, ``W`` first. Each round computes, from
+    the old factors and with all index loops ascending,
+    ``P_ij = F_l(W_il * H_lj)`` and then synchronously
+    ``H'_kj = H_kj * F_i(W_ik * X_ij) / max(F_i(W_ik * P_ij), e)``; it
+    then computes ``Q_ij = F_l(W_il * H'_lj)`` from the old ``W`` and the
+    new ``H'`` and synchronously
+    ``W'_ik = W_ik * F_j(H'_kj * X_ij) / max(F_j(H'_kj * Q_ij), e)``.
+    A round ends the iteration when the largest absolute coordinate change
+    across both factors is ``<= tol``; at most ``max_iter`` rounds run.
+    The returned ``(W, H)`` are float matrices with exact zeros normalized
+    to ``+0.0``. ``X`` is not modified and equal arguments give equal
+    results. An OverflowError or ValueError raised during the computation,
+    or any non-finite value, is reported as FloatingPointError.
+    """
+    if not isinstance(X, list) or len(X) == 0:
+        raise ValueError("X must be a non-empty list of rows")
+    width = None
+    for row in X:
+        if not isinstance(row, list) or len(row) == 0:
+            raise ValueError("X rows must be non-empty lists")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError("X must be rectangular")
+        for value in row:
+            try:
+                valid = (
+                    type(value) in (int, float)
+                    and math.isfinite(value)
+                    and value >= 0
+                )
+            except OverflowError as exc:
+                raise ValueError(
+                    "X must contain only finite non-boolean"
+                    " non-negative numbers"
+                ) from exc
+            if not valid:
+                raise ValueError(
+                    "X must contain only finite non-boolean"
+                    " non-negative numbers"
+                )
+    n = len(X)
+    p = width
+    r = n_components
+    if type(r) is not int or r <= 0 or r > min(n, p):
+        raise ValueError(
+            "n_components must be an exact positive int"
+            " no larger than min(n, p)"
+        )
+    if type(max_iter) is not int or max_iter <= 0:
+        raise ValueError("max_iter must be an exact positive int")
+    _require_exact_finite_positive(tol, "tol")
+    if type(seed) is not int:
+        raise ValueError("seed must be an exact int")
+
+    e = 1e-12
+    rng = random.Random(seed)
+    W = [[rng.random() + e for _ in range(r)] for _ in range(n)]
+    H = [[rng.random() + e for _ in range(p)] for _ in range(r)]
+
+    try:
+        for _ in range(max_iter):
+            P = [
+                [
+                    math.fsum(W[i][l] * H[l][j] for l in range(r))
+                    for j in range(p)
+                ]
+                for i in range(n)
+            ]
+            H_new = [
+                [
+                    H[k][j]
+                    * math.fsum(W[i][k] * X[i][j] for i in range(n))
+                    / max(
+                        math.fsum(W[i][k] * P[i][j] for i in range(n)), e
+                    )
+                    for j in range(p)
+                ]
+                for k in range(r)
+            ]
+            Q = [
+                [
+                    math.fsum(W[i][l] * H_new[l][j] for l in range(r))
+                    for j in range(p)
+                ]
+                for i in range(n)
+            ]
+            W_new = [
+                [
+                    W[i][k]
+                    * math.fsum(H_new[k][j] * X[i][j] for j in range(p))
+                    / max(
+                        math.fsum(H_new[k][j] * Q[i][j] for j in range(p)),
+                        e,
+                    )
+                    for k in range(r)
+                ]
+                for i in range(n)
+            ]
+            delta = 0.0
+            for i in range(n):
+                for k in range(r):
+                    change = abs(W_new[i][k] - W[i][k])
+                    if change > delta:
+                        delta = change
+            for k in range(r):
+                for j in range(p):
+                    change = abs(H_new[k][j] - H[k][j])
+                    if change > delta:
+                        delta = change
+            W = W_new
+            H = H_new
+            for i in range(n):
+                for k in range(r):
+                    if not math.isfinite(W[i][k]):
+                        raise FloatingPointError(
+                            "non-finite value encountered during nmf"
+                        )
+            for k in range(r):
+                for j in range(p):
+                    if not math.isfinite(H[k][j]):
+                        raise FloatingPointError(
+                            "non-finite value encountered during nmf"
+                        )
+            if delta <= tol:
+                break
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during nmf"
+        ) from exc
+
+    return (
+        [[_positive_zero(W[i][k]) for k in range(r)] for i in range(n)],
+        [[_positive_zero(H[k][j]) for j in range(p)] for k in range(r)],
+    )
 
 
 class IsolationForest:
