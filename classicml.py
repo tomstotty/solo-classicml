@@ -260,6 +260,7 @@ __all__ = [
     "RandomForestRegressor",
     "RandomForestClassifier",
     "ExtraTreesClassifier",
+    "ExtraTreesRegressor",
     "AdaBoostClassifier",
     "GradientBoostingRegressor",
     "GradientBoostingClassifier",
@@ -2351,6 +2352,199 @@ class ExtraTreesClassifier:
                     best_count = counts[label]
                     best_label = label
             results.append(best_label)
+        return results
+
+
+class ExtraTreesRegressor:
+    """Deterministic extremely-randomized forest of regression trees.
+
+    The forest holds ``n_estimators`` trees grown exactly as
+    ``DecisionTreeRegressor(max_depth=max_depth)`` except that at every
+    non-leaf node only a random subset of features is searched and each
+    searched feature offers a single random threshold. Unlike
+    ``RandomForestRegressor``, every tree is grown on all ``n`` training
+    samples (no bootstrap draws). Node values are sample-order
+    ``math.fsum`` means; a node becomes a leaf when it holds one sample,
+    when it reaches ``max_depth``, or when no candidate split strictly
+    improves the parent's squared-error loss; the ascending
+    ``(loss, feature index, t)`` tie-break follows the decision tree
+    rules.
+
+    Randomness comes from a single ``random.Random(seed)`` stream consumed
+    in tree order. In left-before-right recursion order, every node that
+    is neither a single-sample node nor a depth-limited node consumes
+    exactly one ``sorted(rng.sample(range(p), max_features))`` draw --
+    where ``p`` is the number of training features -- selecting the
+    features searched at that node; this includes nodes that then become
+    leaves because no selected feature offers a strict improvement.
+    Single-sample and depth-limited nodes consume no sample. For each
+    selected feature, its ascending distinct values among the node's
+    samples are recorded as ``V``; a constant feature yields no candidate
+    and consumes no randomness. Otherwise a single
+    ``rng.randrange(len(V) - 1)`` call picks the index ``k`` and the
+    threshold is ``V[k]`` (so the maximum value is never a threshold).
+    Prediction averages the tree leaves in tree order with
+    ``math.fsum(leaf_values) / n_estimators``. The same parameters and
+    inputs always give the same result.
+    """
+
+    def __init__(self, n_estimators=10, max_depth=None, max_features=1,
+                 seed=0):
+        if type(n_estimators) is not int:
+            raise ValueError("n_estimators must be an integer")
+        if n_estimators <= 0:
+            raise ValueError("n_estimators must be greater than 0")
+        if max_depth is not None:
+            if type(max_depth) is not int or max_depth < 1:
+                raise ValueError(
+                    "max_depth must be None or a positive integer"
+                )
+        if type(max_features) is not int:
+            raise ValueError("max_features must be an integer")
+        if max_features <= 0:
+            raise ValueError("max_features must be greater than 0")
+        if type(seed) is not int:
+            raise ValueError("seed must be an integer")
+
+        self.n_estimators = n_estimators
+        self.max_depth = max_depth
+        self.max_features = max_features
+        self.seed = seed
+        self._trees = None
+        self._n_features = None
+
+    def fit(self, X, y):
+        # Clear the previous fit up front so that a failed validation or
+        # computation leaves the model unfitted.
+        self._trees = None
+        self._n_features = None
+        try:
+            width = _check_gradient_matrix(X)
+            _check_gradient_target(y, len(X))
+        except OverflowError as exc:
+            # An int too large to convert to float failed its finiteness
+            # check: still a rejected input, hence ValueError.
+            raise ValueError(
+                "X and y must contain only finite non-boolean numbers"
+            ) from exc
+        if self.max_features > width:
+            raise ValueError(
+                "max_features must not exceed the number of training features"
+            )
+
+        n = len(X)
+        rng = random.Random(self.seed)
+        trees = []
+        for _ in range(self.n_estimators):
+            # Each tree uses every sample exactly once: no bootstrap.
+            indices = list(range(n))
+            trees.append(self._build(X, y, indices, 0, width, rng))
+
+        self._trees = trees
+        self._n_features = width
+        return self
+
+    def _build(self, X, y, indices, depth, width, rng):
+        targets = [y[i] for i in indices]
+        node = _DecisionTreeRegressorNode(_regressor_tree_mean(targets))
+
+        if len(indices) == 1:
+            return node
+        if self.max_depth is not None and depth >= self.max_depth:
+            return node
+
+        features = sorted(rng.sample(range(width), self.max_features))
+
+        parent_loss = _regressor_tree_loss(targets, node.value)
+        best = None  # (loss, feature index, threshold)
+        for j in features:
+            values = sorted(set(X[i][j] for i in indices))
+            if len(values) < 2:
+                # A constant feature offers no split and consumes no
+                # threshold draw.
+                continue
+            # One random threshold per selected non-constant feature.
+            t = values[rng.randrange(len(values) - 1)]
+            left_targets = []
+            right_targets = []
+            for i in indices:
+                if X[i][j] <= t:
+                    left_targets.append(y[i])
+                else:
+                    right_targets.append(y[i])
+            left_mean = _regressor_tree_mean(left_targets)
+            right_mean = _regressor_tree_mean(right_targets)
+            left_loss = _regressor_tree_loss(left_targets, left_mean)
+            right_loss = _regressor_tree_loss(right_targets, right_mean)
+            try:
+                loss = left_loss + right_loss
+            except (OverflowError, ValueError) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during extra trees "
+                    "regression"
+                ) from exc
+            if not math.isfinite(loss):
+                raise FloatingPointError(
+                    "non-finite value encountered during extra trees "
+                    "regression"
+                )
+            if loss < parent_loss and (
+                best is None or (loss, j, t) < best
+            ):
+                best = (loss, j, t)
+        if best is None:
+            return node
+
+        _, feature, threshold = best
+        left_indices = [i for i in indices if X[i][feature] <= threshold]
+        right_indices = [i for i in indices if X[i][feature] > threshold]
+        node.feature = feature
+        node.threshold = threshold
+        node.left = self._build(
+            X, y, left_indices, depth + 1, width, rng
+        )
+        node.right = self._build(
+            X, y, right_indices, depth + 1, width, rng
+        )
+        return node
+
+    def predict(self, X) -> list[float]:
+        if self._trees is None:
+            raise ValueError("model must be fitted before predict is called")
+        try:
+            width = _check_gradient_matrix(X)
+        except OverflowError as exc:
+            raise ValueError(
+                "X must contain only finite non-boolean numbers"
+            ) from exc
+        if width != self._n_features:
+            raise ValueError(
+                "X must have the same number of features as the training data"
+            )
+        results = []
+        for row in X:
+            values = []
+            for tree in self._trees:
+                node = tree
+                while node.feature is not None:
+                    if row[node.feature] <= node.threshold:
+                        node = node.left
+                    else:
+                        node = node.right
+                values.append(node.value)
+            try:
+                prediction = math.fsum(values) / self.n_estimators
+            except (OverflowError, ValueError, ZeroDivisionError) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during extra trees "
+                    "regression"
+                ) from exc
+            if not math.isfinite(prediction):
+                raise FloatingPointError(
+                    "non-finite value encountered during extra trees "
+                    "regression"
+                )
+            results.append(_positive_zero(prediction))
         return results
 
 
