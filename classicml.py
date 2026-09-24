@@ -251,6 +251,7 @@ __all__ = [
     "average_precision_score",
     "calibration_curve",
     "expected_calibration_error",
+    "adaptive_calibration_error",
     "brier_score_loss",
     "log_loss",
     "multiclass_log_loss",
@@ -10547,7 +10548,7 @@ def expected_calibration_error(
 
     try:
         total_weight = math.fsum(weights)
-    except (OverflowError, ValueError) as exc:
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
         raise FloatingPointError(
             "non-finite value encountered during calibration computation"
         ) from exc
@@ -10602,7 +10603,227 @@ def expected_calibration_error(
             bin_weight = math.fsum(w_terms)
             pos_weight = math.fsum(pos_terms)
             prob_weight = math.fsum(wp_terms)
-        except (OverflowError, ValueError) as exc:
+        except (OverflowError, ValueError, ZeroDivisionError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during calibration "
+                "computation"
+            ) from exc
+        if (
+            not math.isfinite(bin_weight)
+            or not math.isfinite(pos_weight)
+            or not math.isfinite(prob_weight)
+        ):
+            raise FloatingPointError(
+                "non-finite value encountered during calibration "
+                "computation"
+            )
+        if bin_weight == 0.0:
+            continue
+        try:
+            fraction = pos_weight / bin_weight
+            mean_prob = prob_weight / bin_weight
+            gap = abs(fraction - mean_prob)
+            contribution = bin_weight * gap
+        except (
+            OverflowError,
+            ValueError,
+            ZeroDivisionError,
+        ) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during calibration "
+                "computation"
+            ) from exc
+        if (
+            not math.isfinite(fraction)
+            or not math.isfinite(mean_prob)
+            or not math.isfinite(gap)
+            or not math.isfinite(contribution)
+        ):
+            raise FloatingPointError(
+                "non-finite value encountered during calibration "
+                "computation"
+            )
+        contributions.append(contribution)
+
+    try:
+        weighted_gap = math.fsum(contributions)
+        result = weighted_gap / total_weight
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during calibration computation"
+        ) from exc
+    if not math.isfinite(weighted_gap) or not math.isfinite(result):
+        raise FloatingPointError(
+            "non-finite value encountered during calibration computation"
+        )
+    if result == 0:
+        result = 0.0
+    return result
+
+
+def adaptive_calibration_error(
+    y_true, y_prob, n_bins=5, pos_label=1, sample_weight=None
+):
+    """Compute the weighted adaptive (equal-count) calibration error.
+
+    ``y_true`` and ``y_prob`` must be non-empty lists of equal length.
+    ``y_true`` must contain values of type exactly ``int`` (booleans are
+    rejected) drawn from exactly two distinct labels, and ``pos_label``
+    must be an exact ``int`` equal to one of them; the other label is the
+    negative class. ``y_prob`` must contain finite values in the closed
+    interval ``[0, 1]`` whose type is exactly ``int`` or ``float``
+    (booleans are rejected; the only accepted ``int`` values are ``0``
+    and ``1``). ``n_bins`` must be a positive exact ``int`` not greater
+    than the number of samples. ``sample_weight`` must be ``None`` --
+    every sample then weighs ``1.0`` -- or a list of the same length
+    whose elements are finite non-negative values of type exactly
+    ``int`` or ``float`` (booleans are rejected). The total weight must
+    be greater than zero. Any violation (including overflow during the
+    finiteness checks) raises ValueError.
+
+    Samples are ordered by ``(y_prob[i], i)`` ascending, so ties in
+    probability are split by the original index. Bin ``r`` (starting at
+    0) takes the sorted positions ``[floor(r * n / n_bins),
+    floor((r + 1) * n / n_bins))``. Within a bin, samples are
+    accumulated in that order with ``math.fsum`` to obtain the total
+    weight ``W``, the positive-class weight ``T``, and the weighted
+    probability sum ``P`` (the ``math.fsum`` of the ``w * p`` products).
+    Bins with ``W == 0`` are omitted; for each retained bin the gap is
+    ``abs(T / W - P / W)``. Bins are visited in ascending bin number and
+    their ``W * gap`` contributions are accumulated with ``math.fsum``;
+    the result is that sum divided by the total weight of all samples,
+    with an exact zero normalized to ``0.0``. Overflow, invalid
+    operations during post-validation conversion or arithmetic, division
+    by zero, and non-finite intermediate values or results raise
+    FloatingPointError.
+
+    The return value is a float. The inputs are not modified.
+    Deterministic: same inputs, same result.
+    """
+    if not isinstance(y_true, list) or not isinstance(y_prob, list):
+        raise ValueError("y_true and y_prob must be lists")
+    if len(y_true) == 0 or len(y_prob) == 0:
+        raise ValueError("y_true and y_prob must be non-empty lists")
+    if len(y_true) != len(y_prob):
+        raise ValueError("y_true and y_prob must have the same length")
+    n = len(y_true)
+
+    for value in y_true:
+        if type(value) is not int:
+            raise ValueError("y_true must contain only integers")
+    if type(pos_label) is not int:
+        raise ValueError("pos_label must be an integer")
+    labels = set(y_true)
+    if len(labels) != 2 or pos_label not in labels:
+        raise ValueError(
+            "y_true must contain exactly two distinct labels with "
+            "pos_label among them"
+        )
+
+    for value in y_prob:
+        if type(value) not in (int, float):
+            raise ValueError(
+                "y_prob must contain only finite numbers in [0, 1]"
+            )
+        # math.isfinite raises OverflowError for ints too large to
+        # convert to float; such values fail the finite requirement.
+        try:
+            finite = math.isfinite(value)
+        except OverflowError as exc:
+            raise ValueError(
+                "y_prob must contain only finite numbers in [0, 1]"
+            ) from exc
+        if not finite or value < 0 or value > 1:
+            raise ValueError(
+                "y_prob must contain only finite numbers in [0, 1]"
+            )
+
+    if type(n_bins) is not int or n_bins < 1:
+        raise ValueError("n_bins must be a positive integer")
+    if n_bins > n:
+        raise ValueError("n_bins must not exceed the number of samples")
+
+    if sample_weight is None:
+        weights = [1.0] * n
+    else:
+        if not isinstance(sample_weight, list) or len(sample_weight) != n:
+            raise ValueError(
+                "sample_weight must be a list with the same length as "
+                "y_true"
+            )
+        for value in sample_weight:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                ) from exc
+            if not finite or value < 0:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+        weights = [_cal_float(value) for value in sample_weight]
+
+    try:
+        total_weight = math.fsum(weights)
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during calibration computation"
+        ) from exc
+    if not math.isfinite(total_weight):
+        raise FloatingPointError(
+            "non-finite value encountered during calibration computation"
+        )
+    if total_weight <= 0.0:
+        raise ValueError("the total weight must be greater than 0")
+
+    # Sort sample indices by (probability, original index) so that ties
+    # are split by the original index; bin r takes the sorted positions
+    # [r * n // n_bins, (r + 1) * n // n_bins), which is never empty
+    # because n_bins <= n.
+    order = sorted(range(n), key=lambda i: (y_prob[i], i))
+
+    contributions = []
+    for r in range(n_bins):
+        start = r * n // n_bins
+        end = (r + 1) * n // n_bins
+        w_terms = []
+        pos_terms = []
+        wp_terms = []
+        for k in range(start, end):
+            i = order[k]
+            w = weights[i]
+            p = y_prob[i]
+            try:
+                wp = w * p
+            except (OverflowError, ValueError, ZeroDivisionError) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during calibration "
+                    "computation"
+                ) from exc
+            if isinstance(wp, float) and not math.isfinite(wp):
+                raise FloatingPointError(
+                    "non-finite value encountered during calibration "
+                    "computation"
+                )
+            w_terms.append(w)
+            if y_true[i] == pos_label:
+                pos_terms.append(w)
+            wp_terms.append(wp)
+        try:
+            bin_weight = math.fsum(w_terms)
+            pos_weight = math.fsum(pos_terms)
+            prob_weight = math.fsum(wp_terms)
+        except (OverflowError, ValueError, ZeroDivisionError) as exc:
             raise FloatingPointError(
                 "non-finite value encountered during calibration "
                 "computation"
