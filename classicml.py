@@ -83,6 +83,8 @@ Exports:
     roc_curve -- false/true positive rates and thresholds for a binary
         score ranking.
     roc_auc_score -- trapezoidal area under the roc_curve.
+    det_curve -- false positive/false negative rates and ascending
+        thresholds for a binary score ranking.
     precision_recall_curve -- precision/recall pairs at descending score
         thresholds for a binary score ranking.
     average_precision_score -- stepwise area under the
@@ -238,6 +240,7 @@ __all__ = [
     "fbeta_score",
     "roc_curve",
     "roc_auc_score",
+    "det_curve",
     "precision_recall_curve",
     "average_precision_score",
     "calibration_curve",
@@ -9749,6 +9752,143 @@ def roc_auc_score(y_true, y_score, pos_label=1, sample_weight=None):
     if auc == 0:
         auc = 0.0
     return auc
+
+
+def _det_float(value):
+    """Convert a validated score/weight to float; overflow, invalid
+    operations, and non-finite results raise FloatingPointError."""
+    try:
+        result = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during det computation"
+        ) from exc
+    if not math.isfinite(result):
+        raise FloatingPointError(
+            "non-finite value encountered during det computation"
+        )
+    return result
+
+
+def det_curve(y_true, y_score, pos_label=1, sample_weight=None) -> tuple:
+    """Compute false positive/false negative rates at ascending thresholds.
+
+    ``y_true`` and ``y_score`` must be non-empty lists of equal length.
+    ``y_true`` must contain values of type exactly ``int`` (booleans are
+    rejected) drawn from exactly two distinct labels, and ``pos_label``
+    must be an exact ``int`` equal to one of them; the other label is the
+    negative class. ``y_score`` must contain finite values of type exactly
+    ``int`` or ``float`` (booleans are rejected). ``sample_weight`` must be
+    ``None`` -- every sample then weighs ``1.0`` -- or a list of the same
+    length whose elements are finite non-negative values of type exactly
+    ``int`` or ``float``. The total weight of each class must be greater
+    than zero. Any violation raises ValueError.
+
+    The thresholds are the distinct score values in ascending order, each
+    converted to ``float``; samples sharing a score always form one
+    threshold group. At a threshold ``t`` every sample whose score is
+    greater than or equal to ``t`` is judged positive: ``FP`` is the
+    ``math.fsum`` -- taken in input order -- of the weights of the
+    negative-class samples judged positive, and ``FN`` is the analogous
+    sum for positive-class samples judged negative (score below ``t``).
+    ``FPR`` is ``FP`` divided by the total negative-class weight and
+    ``FNR`` is ``FN`` divided by the total positive-class weight. An exact
+    zero rate is normalized to ``0.0``. Overflow, invalid operations, or
+    non-finite intermediate values after validation raise
+    FloatingPointError.
+
+    The return value is ``(fpr, fnr, thresholds)``, three equally long
+    lists of floats. The inputs are not modified. Deterministic: same
+    inputs, same result.
+    """
+    n = _check_roc_vectors(y_true, y_score)
+    for value in y_true:
+        if type(value) is not int:
+            raise ValueError("y_true must contain only integers")
+    if type(pos_label) is not int:
+        raise ValueError("pos_label must be an integer")
+    labels = set(y_true)
+    if len(labels) != 2 or pos_label not in labels:
+        raise ValueError(
+            "y_true must contain exactly two distinct labels with "
+            "pos_label among them"
+        )
+    for value in y_score:
+        _check_finite_score(value, "y_score")
+
+    if sample_weight is None:
+        weights = [1.0] * n
+    else:
+        if not isinstance(sample_weight, list) or len(sample_weight) != n:
+            raise ValueError(
+                "sample_weight must be a list with the same length as "
+                "y_true"
+            )
+        for value in sample_weight:
+            _check_finite_score(value, "sample_weight")
+            if value < 0:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+        weights = [_det_float(value) for value in sample_weight]
+
+    pos_terms_total = []
+    neg_terms_total = []
+    for i in range(n):
+        if y_true[i] == pos_label:
+            pos_terms_total.append(weights[i])
+        else:
+            neg_terms_total.append(weights[i])
+    try:
+        pos_total = math.fsum(pos_terms_total)
+        neg_total = math.fsum(neg_terms_total)
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during det computation"
+        ) from exc
+    if not math.isfinite(pos_total) or not math.isfinite(neg_total):
+        raise FloatingPointError(
+            "non-finite value encountered during det computation"
+        )
+    if pos_total <= 0.0 or neg_total <= 0.0:
+        raise ValueError(
+            "the total weight of each class must be greater than 0"
+        )
+
+    thresholds = [_det_float(value) for value in sorted(set(y_score))]
+
+    fprs = []
+    fnrs = []
+    for threshold in thresholds:
+        fp_terms = []
+        fn_terms = []
+        for i in range(n):
+            if y_score[i] >= threshold:
+                if y_true[i] != pos_label:
+                    fp_terms.append(weights[i])
+            elif y_true[i] == pos_label:
+                fn_terms.append(weights[i])
+        try:
+            fp = math.fsum(fp_terms)
+            fn = math.fsum(fn_terms)
+            fpr_value = fp / neg_total
+            fnr_value = fn / pos_total
+        except (OverflowError, ValueError, ZeroDivisionError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during det computation"
+            ) from exc
+        if not math.isfinite(fpr_value) or not math.isfinite(fnr_value):
+            raise FloatingPointError(
+                "non-finite value encountered during det computation"
+            )
+        if fpr_value == 0:
+            fpr_value = 0.0
+        if fnr_value == 0:
+            fnr_value = 0.0
+        fprs.append(fpr_value)
+        fnrs.append(fnr_value)
+    return fprs, fnrs, thresholds
 
 
 def _pr_float(value):
