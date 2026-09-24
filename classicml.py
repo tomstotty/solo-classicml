@@ -190,6 +190,11 @@ Exports:
         strictly increasing coverage levels.
     concordance_index -- weighted Harrell's concordance index between
         event times and risk scores over comparable sample pairs.
+    integrated_brier_score -- time-integrated Brier score of survival
+        probability predictions against right-censored event times,
+        inverse-probability-of-censoring weighted with the Kaplan-Meier
+        estimate of the censoring distribution and trapezoidally
+        integrated over strictly increasing evaluation times.
     dumps -- serialize a fitted KMeans/PCA/linear/scaler/tree/forest
         model (including MultinomialLogisticRegression,
         AgglomerativeClustering, and DBSCAN) to whitespace-free JSON
@@ -322,6 +327,7 @@ __all__ = [
     "interval_score",
     "weighted_interval_score",
     "concordance_index",
+    "integrated_brier_score",
     "dumps",
     "loads",
 ]
@@ -18359,6 +18365,265 @@ def concordance_index(event_time, risk_score, event_observed=None, sample_weight
 # ``from __future__ import annotations`` stores annotations as strings;
 # expose the builtin ``float`` as the runtime return annotation.
 concordance_index.__annotations__["return"] = float
+
+
+def integrated_brier_score(event_time, event_observed, survival_prob, times) -> float:
+    """Return the integrated Brier score of survival predictions.
+
+    ``event_time`` must be a non-empty list of finite non-negative
+    values of type exactly ``int`` or ``float`` (booleans are rejected).
+    ``event_observed`` must be a list of the same length whose elements
+    are exactly the integers ``0`` or ``1`` (booleans are rejected).
+    ``times`` must be a list of at least two finite non-negative values
+    of type exactly ``int`` or ``float`` (booleans are rejected), in
+    strictly increasing order. ``survival_prob`` must be a rectangular
+    list of lists with one row per sample and one column per entry of
+    ``times``; every entry is a finite value of type exactly ``int`` or
+    ``float`` (booleans are rejected) in ``[0, 1]`` and the entries of
+    every row must be non-increasing. Any container, length, shape,
+    type, range, ordering, or finiteness violation (including
+    ``OverflowError`` raised by ``math.isfinite``) raises ValueError.
+
+    After validation all values are converted to ``float``. For the
+    distinct event times ``u`` in ascending order, the Kaplan-Meier
+    estimate ``G`` of the censoring distribution starts at ``1`` and is
+    updated as ``G(u) = G(u-) * (1 - D / R)``, where ``R`` is the number
+    of samples with ``T >= u`` and ``D`` the number with ``T == u`` and
+    ``E == 0`` (a censoring); a required value ``G <= 0`` raises
+    ValueError. For each evaluation time ``t_j`` the Brier score is
+
+        B_j = fsum(E_i * I(T_i <= t_j) * S_ij**2 / G(T_i-)
+                   + I(T_i > t_j) * (1 - S_ij)**2 / G(t_j)
+                   for i in ascending order) / len(T),
+
+    where ``G(T_i-)`` is the value of ``G`` just before the event time
+    of sample ``i`` and ``G(t_j)`` is the value at ``t_j`` (the value
+    just before the next distinct event time after ``t_j``); a required
+    value ``G <= 0`` raises ValueError. The integrated score is the
+    trapezoidal sum
+    ``fsum((t_{j+1} - t_j) * (B_j + B_{j+1}) / 2)`` divided by
+    ``t_last - t_first``. Overflow, invalid operations, or division by
+    zero during the post-validation conversion, arithmetic, or
+    ``math.fsum`` steps, and non-finite intermediate values or results,
+    raise FloatingPointError.
+
+    An exact zero result is normalized to positive ``0.0``. The return
+    value is a float. The inputs are not modified. Deterministic: same
+    inputs, same result.
+    """
+    if not isinstance(event_time, list) or len(event_time) == 0:
+        raise ValueError("event_time must be a non-empty list")
+    n = len(event_time)
+
+    if not isinstance(event_observed, list) or len(event_observed) != n:
+        raise ValueError(
+            "event_observed must be a list with the same length as event_time"
+        )
+    if not isinstance(times, list) or len(times) < 2:
+        raise ValueError(
+            "times must be a list of at least two strictly increasing values"
+        )
+    m = len(times)
+    if not isinstance(survival_prob, list) or len(survival_prob) != n:
+        raise ValueError(
+            "survival_prob must be a matrix with one row per sample and "
+            "one column per entry of times"
+        )
+
+    for name, values, non_negative in (
+        ("event_time", event_time, True),
+        ("times", times, True),
+    ):
+        previous = None
+        for value in values:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    name + " must contain only finite non-boolean numbers"
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    name + " must contain only finite non-boolean numbers"
+                ) from exc
+            if not finite:
+                raise ValueError(
+                    name + " must contain only finite non-boolean numbers"
+                )
+            if non_negative and value < 0:
+                raise ValueError(name + " must contain only non-negative values")
+            if name == "times" and previous is not None and not value > previous:
+                raise ValueError(
+                    "times must be a list of strictly increasing values"
+                )
+            previous = value
+
+    for value in event_observed:
+        if type(value) is not int or value not in (0, 1):
+            raise ValueError("event_observed must contain only 0 or 1")
+
+    for row in survival_prob:
+        if not isinstance(row, list) or len(row) != m:
+            raise ValueError(
+                "survival_prob must be a rectangular matrix with one row "
+                "per sample and one column per entry of times"
+            )
+        previous = None
+        for value in row:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "survival_prob must contain only finite non-boolean "
+                    "numbers in [0, 1]"
+                )
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "survival_prob must contain only finite non-boolean "
+                    "numbers in [0, 1]"
+                ) from exc
+            if not finite or not 0 <= value <= 1:
+                raise ValueError(
+                    "survival_prob must contain only finite non-boolean "
+                    "numbers in [0, 1]"
+                )
+            if previous is not None and value > previous:
+                raise ValueError(
+                    "survival_prob rows must be non-increasing"
+                )
+            previous = value
+
+    def non_finite():
+        return FloatingPointError(
+            "non-finite value encountered during integrated Brier score"
+        )
+
+    try:
+        T = [float(value) for value in event_time]
+        t = [float(value) for value in times]
+        S = [[float(value) for value in row] for row in survival_prob]
+    except (OverflowError, ValueError) as exc:
+        raise non_finite() from exc
+    for values in (T, t):
+        for value in values:
+            if not math.isfinite(value):
+                raise non_finite()
+    for row in S:
+        for value in row:
+            if not math.isfinite(value):
+                raise non_finite()
+    E = list(event_observed)
+
+    def divide(numerator, denominator):
+        if denominator <= 0.0:
+            raise ValueError(
+                "Kaplan-Meier censoring estimate must stay positive where "
+                "it is needed"
+            )
+        try:
+            quotient = numerator / denominator
+        except (OverflowError, ValueError, ZeroDivisionError) as exc:
+            raise non_finite() from exc
+        if not math.isfinite(quotient):
+            raise non_finite()
+        return quotient
+
+    # Kaplan-Meier estimate of the censoring distribution. ``starts`` maps
+    # each distinct event time u to G(u-), the value just before u;
+    # ``after`` maps u to G(u), the value just after the update at u.
+    distinct = sorted(set(T))
+    starts = {}
+    after = {}
+    g = 1.0
+    for u in distinct:
+        starts[u] = g
+        at_risk = 0
+        censored = 0
+        for i in range(n):
+            if T[i] >= u:
+                at_risk += 1
+                if T[i] == u and E[i] == 0:
+                    censored += 1
+        # R >= 1 for every distinct event time, so this only raises if the
+        # required G value is non-positive.
+        drop = divide(float(censored), float(at_risk))
+        try:
+            g = g * (1.0 - drop)
+        except (OverflowError, ValueError) as exc:
+            raise non_finite() from exc
+        if not math.isfinite(g):
+            raise non_finite()
+        after[u] = g
+
+    def g_before(value):
+        """G(value-): the estimate just before the next distinct event
+        time not smaller than value."""
+        for u in distinct:
+            if value < u:
+                return starts[u]
+        return after[distinct[-1]]
+
+    brier = []
+    span = t[-1] - t[0]
+    if not math.isfinite(span) or span <= 0.0:
+        # Validation guarantees strictly increasing non-negative times, so
+        # a non-positive span here is a non-finite arithmetic failure.
+        raise non_finite()
+    for j in range(m):
+        tj = t[j]
+        gj = g_before(tj)
+        terms = []
+        for i in range(n):
+            s = S[i][j]
+            try:
+                s2 = s ** 2
+                c2 = (1.0 - s) ** 2
+            except (OverflowError, ValueError) as exc:
+                raise non_finite() from exc
+            if not math.isfinite(s2) or not math.isfinite(c2):
+                raise non_finite()
+            if E[i] == 1 and T[i] <= tj:
+                term = divide(float(E[i]) * s2, starts[T[i]])
+            elif T[i] > tj:
+                term = divide(c2, gj)
+            else:
+                term = 0.0
+            if not math.isfinite(term):
+                raise non_finite()
+            terms.append(term)
+        try:
+            summed = math.fsum(terms)
+            bj = summed / float(n)
+        except (OverflowError, ValueError, ZeroDivisionError) as exc:
+            raise non_finite() from exc
+        brier.append(bj)
+
+    areas = []
+    for j in range(m - 1):
+        try:
+            area = (t[j + 1] - t[j]) * (brier[j] + brier[j + 1]) / 2
+        except (OverflowError, ValueError) as exc:
+            raise non_finite() from exc
+        if not math.isfinite(area):
+            raise non_finite()
+        areas.append(area)
+    try:
+        total = math.fsum(areas)
+        result = total / span
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        raise non_finite() from exc
+    if not math.isfinite(result):
+        raise non_finite()
+    if result == 0:
+        return 0.0
+    return result
+
+
+# ``from __future__ import annotations`` stores annotations as strings;
+# expose the builtin ``float`` as the runtime return annotation.
+integrated_brier_score.__annotations__["return"] = float
 
 
 _SERIAL_KEYS_KMEANS = (
