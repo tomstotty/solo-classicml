@@ -141,6 +141,8 @@ Exports:
         label vectors, computed from an exact integer contingency table.
     balanced_accuracy_score -- weighted mean per-class recall of two
         integer label vectors, optionally adjusted for chance.
+    geometric_mean_score -- weighted geometric mean per-class recall of
+        two integer label vectors, with a correction for zero recalls.
     top_k_accuracy_score -- weighted fraction of samples whose true class
         is among the k highest-scoring columns of a score matrix.
     ndcg_score -- normalized discounted cumulative gain at k between a
@@ -277,6 +279,7 @@ __all__ = [
     "matthews_corrcoef",
     "cohen_kappa_score",
     "balanced_accuracy_score",
+    "geometric_mean_score",
     "top_k_accuracy_score",
     "ndcg_score",
     "discounted_cumulative_gain_score",
@@ -9972,6 +9975,11 @@ def roc_auc_score(
     return auc
 
 
+# ``from __future__ import annotations`` stores annotations as strings;
+# expose the builtin ``float`` as the runtime return annotation.
+roc_auc_score.__annotations__["return"] = float
+
+
 def _det_float(value):
     """Convert a validated score/weight to float; overflow, invalid
     operations, and non-finite results raise FloatingPointError."""
@@ -14050,6 +14058,189 @@ def balanced_accuracy_score(y_true, y_pred, sample_weight=None,
     if result == 0:
         return 0.0
     return result
+
+
+def _geometric_mean_float(value):
+    """Convert a validated number to float; overflow, invalid operations,
+    and non-finite results raise FloatingPointError."""
+    try:
+        result = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during geometric mean"
+        ) from exc
+    if not math.isfinite(result):
+        raise FloatingPointError(
+            "non-finite value encountered during geometric mean"
+        )
+    return result
+
+
+def geometric_mean_score(
+    y_true, y_pred, correction=0.0, sample_weight=None
+) -> float:
+    """Return the geometric mean of the per-class recalls.
+
+    Both ``y_true`` and ``y_pred`` must be non-empty lists of equal
+    length whose elements are exactly ``int`` (booleans are rejected),
+    and ``y_true`` must hold at least two distinct classes.
+    ``correction`` must be a finite value of type exactly ``int`` or
+    ``float`` (booleans are rejected) with ``0 <= correction <= 1``.
+    ``sample_weight`` must be ``None`` -- every sample then weighs
+    ``1.0`` -- or a list of the same length whose elements are finite
+    non-negative values of type exactly ``int`` or ``float`` (booleans
+    are rejected). Any container, length, type, range, or finiteness
+    violation (including ``OverflowError`` raised by the finiteness
+    checks) raises ValueError. The inputs are not modified.
+
+    The classes ``C`` are the distinct values of ``y_true`` in ascending
+    order; labels appearing only in ``y_pred`` merely count as
+    misclassifications. After validation the weights and ``correction``
+    are converted to ``float``; in class order, and in sample order
+    within each class, ``math.fsum`` computes for each class the total
+    weight ``W`` of its samples and the weight ``T`` of its correctly
+    predicted samples. A class with ``W <= 0`` raises ValueError. With
+    ``r = T / W`` per class, a zero ``r`` is replaced by ``correction``;
+    if any ``r`` is still zero the result is positive ``0.0``. Otherwise
+    the result is ``math.exp`` of the mean -- in class order, via
+    ``math.fsum`` -- of ``math.log(r)`` over the classes. Overflow,
+    invalid operations, or division by zero during the post-validation
+    conversion, summation, division, logarithm, or exponentiation, and
+    non-finite intermediate values or results, raise
+    FloatingPointError.
+
+    The return value is a float. Deterministic: same inputs, same
+    result.
+    """
+    n = _check_metric_vectors(y_true, y_pred)
+    for value in y_true:
+        if type(value) is not int:
+            raise ValueError("y_true must contain only integers")
+    for value in y_pred:
+        if type(value) is not int:
+            raise ValueError("y_pred must contain only integers")
+
+    classes = sorted(set(y_true))
+    if len(classes) < 2:
+        raise ValueError("y_true must contain at least two classes")
+    index = {label: k for k, label in enumerate(classes)}
+    k = len(classes)
+
+    if type(correction) not in (int, float):
+        raise ValueError(
+            "correction must be a finite non-boolean number in [0, 1]"
+        )
+    # math.isfinite raises OverflowError for ints too large to convert
+    # to float; such values fail the finite requirement.
+    try:
+        finite = math.isfinite(correction)
+    except OverflowError as exc:
+        raise ValueError(
+            "correction must be a finite non-boolean number in [0, 1]"
+        ) from exc
+    if not finite or not (0 <= correction <= 1):
+        raise ValueError(
+            "correction must be a finite non-boolean number in [0, 1]"
+        )
+
+    if sample_weight is None:
+        weights = [1.0] * n
+    else:
+        if not isinstance(sample_weight, list) or len(sample_weight) != n:
+            raise ValueError(
+                "sample_weight must be a list with the same length as "
+                "y_true"
+            )
+        for value in sample_weight:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+            # math.isfinite raises OverflowError for ints too large to
+            # convert to float; such values fail the finite requirement.
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                ) from exc
+            if not finite or value < 0:
+                raise ValueError(
+                    "sample_weight must contain only finite non-negative "
+                    "non-boolean numbers"
+                )
+        weights = [
+            _geometric_mean_float(value) for value in sample_weight
+        ]
+
+    correction_value = _geometric_mean_float(correction)
+
+    true_terms = [[] for _ in range(k)]
+    correct_terms = [[] for _ in range(k)]
+    for i in range(n):
+        j = index[y_true[i]]
+        true_terms[j].append(weights[i])
+        if y_pred[i] == y_true[i]:
+            correct_terms[j].append(weights[i])
+
+    def non_finite(exc):
+        return FloatingPointError(
+            "non-finite value encountered during geometric mean"
+        )
+
+    recalls = []
+    for j in range(k):
+        try:
+            total = math.fsum(true_terms[j])
+            correct = math.fsum(correct_terms[j])
+        except (OverflowError, ValueError) as exc:
+            raise non_finite(exc) from exc
+        if not math.isfinite(total) or not math.isfinite(correct):
+            raise non_finite(None)
+        if total <= 0.0:
+            raise ValueError(
+                "every class must have a positive total weight"
+            )
+        try:
+            recall = correct / total
+        except (OverflowError, ValueError, ZeroDivisionError) as exc:
+            raise non_finite(exc) from exc
+        if not math.isfinite(recall):
+            raise non_finite(None)
+        if recall == 0:
+            recall = correction_value
+        recalls.append(recall)
+
+    for recall in recalls:
+        if recall == 0:
+            return 0.0
+
+    log_terms = []
+    for recall in recalls:
+        try:
+            log_value = math.log(recall)
+        except (OverflowError, ValueError) as exc:
+            raise non_finite(exc) from exc
+        if not math.isfinite(log_value):
+            raise non_finite(None)
+        log_terms.append(log_value)
+
+    try:
+        result = math.exp(math.fsum(log_terms) / k)
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        raise non_finite(exc) from exc
+    if not math.isfinite(result):
+        raise non_finite(None)
+    if result == 0:
+        return 0.0
+    return result
+
+
+# ``from __future__ import annotations`` stores annotations as strings;
+# expose the builtin ``float`` as the runtime return annotation.
+geometric_mean_score.__annotations__["return"] = float
 
 
 def top_k_accuracy_score(y_true, y_score, k=2, sample_weight=None) -> float:
