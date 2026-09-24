@@ -265,6 +265,7 @@ __all__ = [
     "ElasticNetRegression",
     "StandardScaler",
     "KMeans",
+    "KMedoids",
     "PCA",
     "DBSCAN",
     "AgglomerativeClustering",
@@ -4898,6 +4899,197 @@ class KMeans:
                 distances.append(distance)
             results.append(distances)
         return results
+
+    def fit_predict(self, X):
+        self.fit(X)
+        return self.predict(X)
+
+
+def _euclidean_distance(a, b):
+    """Euclidean distance ``sqrt(math.fsum((a[j] - b[j]) ** 2))`` between
+    two equal-length rows, accumulated in ascending column order.
+
+    Every subtraction, squaring, summation, and square-root step is
+    checked; overflow, invalid operations, and non-finite intermediate
+    values raise FloatingPointError.
+    """
+    terms = []
+    for j in range(len(a)):
+        try:
+            diff = a[j] - b[j]
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during distance computation"
+            ) from exc
+        if isinstance(diff, float) and not math.isfinite(diff):
+            raise FloatingPointError(
+                "non-finite value encountered during distance computation"
+            )
+        try:
+            square = diff ** 2
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during distance computation"
+            ) from exc
+        if isinstance(square, float) and not math.isfinite(square):
+            raise FloatingPointError(
+                "non-finite value encountered during distance computation"
+            )
+        terms.append(square)
+    try:
+        total = math.fsum(terms)
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during distance computation"
+        ) from exc
+    if not math.isfinite(total):
+        raise FloatingPointError(
+            "non-finite value encountered during distance computation"
+        )
+    try:
+        result = math.sqrt(total)
+    except (OverflowError, ValueError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during distance computation"
+        ) from exc
+    if not math.isfinite(result):
+        raise FloatingPointError(
+            "non-finite value encountered during distance computation"
+        )
+    return result
+
+
+class KMedoids:
+    """Deterministic k-medoids clustering (PAM-style swap-free updates).
+
+    The distance between two rows is
+    ``d(a, b) = sqrt(math.fsum((a[j] - b[j]) ** 2))`` accumulated in
+    ascending column order. The first medoid is sample 0; each subsequent
+    medoid is the not-yet-chosen sample whose minimum distance to the
+    already chosen medoids is largest (ties go to the smallest sample
+    index). Each round assigns every sample, in row order, to the nearest
+    medoid (ties go to the smallest medoid position), then synchronously
+    replaces each cluster's medoid with the member minimizing the
+    ``math.fsum`` sum of distances to the cluster's members accumulated
+    in input order (ties go to the smallest original sample index);
+    empty clusters keep their previous medoid. Rounds stop when the
+    medoid indices are unchanged, after at most ``max_iter`` rounds.
+    Neither ``fit`` nor ``predict`` modifies its input. The same
+    parameters and inputs always give the same result.
+
+    ``fit_predict`` fits and then returns the prediction labels as a
+    fresh list; an exception raised by ``fit`` propagates unchanged.
+    """
+
+    def __init__(self, n_clusters=8, max_iter=300):
+        if type(n_clusters) is not int:
+            raise ValueError("n_clusters must be an integer")
+        if n_clusters <= 0:
+            raise ValueError("n_clusters must be greater than 0")
+        if type(max_iter) is not int:
+            raise ValueError("max_iter must be an integer")
+        if max_iter <= 0:
+            raise ValueError("max_iter must be greater than 0")
+
+        self.n_clusters = n_clusters
+        self.max_iter = max_iter
+        self.medoid_indices_ = None
+        self.cluster_centers_ = None
+        self._n_features = None
+
+    @staticmethod
+    def _assign(row, medoids):
+        """Return the position of the medoid closest to ``row``; ties go
+        to the smallest medoid position."""
+        best_index = 0
+        best_distance = None
+        for k in range(len(medoids)):
+            distance = _euclidean_distance(row, medoids[k])
+            if best_distance is None or distance < best_distance:
+                best_distance = distance
+                best_index = k
+        return best_index
+
+    def fit(self, X):
+        self.medoid_indices_ = None
+        self.cluster_centers_ = None
+        self._n_features = None
+
+        width = _check_exact_matrix(X)
+        n = len(X)
+        if self.n_clusters > n:
+            raise ValueError(
+                "n_clusters must not exceed the number of samples"
+            )
+
+        medoid_indices = [0]
+        while len(medoid_indices) < self.n_clusters:
+            best_index = None
+            best_distance = None
+            for i in range(n):
+                if i in medoid_indices:
+                    continue
+                nearest = None
+                for m in medoid_indices:
+                    distance = _euclidean_distance(X[i], X[m])
+                    if nearest is None or distance < nearest:
+                        nearest = distance
+                if best_distance is None or nearest > best_distance:
+                    best_distance = nearest
+                    best_index = i
+            medoid_indices.append(best_index)
+
+        for _ in range(self.max_iter):
+            medoids = [X[m] for m in medoid_indices]
+            clusters = [[] for _ in range(self.n_clusters)]
+            for i in range(n):
+                clusters[self._assign(X[i], medoids)].append(i)
+
+            new_indices = []
+            for k in range(self.n_clusters):
+                members = clusters[k]
+                if not members:
+                    new_indices.append(medoid_indices[k])
+                    continue
+                best_member = None
+                best_total = None
+                for i in members:
+                    try:
+                        total = math.fsum(
+                            _euclidean_distance(X[i], X[j]) for j in members
+                        )
+                    except (OverflowError, ValueError) as exc:
+                        raise FloatingPointError(
+                            "non-finite value encountered during fit"
+                        ) from exc
+                    if not math.isfinite(total):
+                        raise FloatingPointError(
+                            "non-finite value encountered during fit"
+                        )
+                    if best_total is None or total < best_total:
+                        best_total = total
+                        best_member = i
+                new_indices.append(best_member)
+
+            if new_indices == medoid_indices:
+                break
+            medoid_indices = new_indices
+
+        self.medoid_indices_ = list(medoid_indices)
+        self.cluster_centers_ = [list(X[m]) for m in medoid_indices]
+        self._n_features = width
+        return self
+
+    def predict(self, X):
+        if self.medoid_indices_ is None:
+            raise ValueError("model must be fitted before predict is called")
+        width = _check_exact_matrix(X)
+        if width != self._n_features:
+            raise ValueError(
+                "X must have the same number of features as the training data"
+            )
+
+        return [self._assign(row, self.cluster_centers_) for row in X]
 
     def fit_predict(self, X):
         self.fit(X)
