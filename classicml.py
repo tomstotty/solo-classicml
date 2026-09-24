@@ -20615,7 +20615,8 @@ def dumps(model):
     LogisticRegression, LassoRegression, ElasticNetRegression,
     MultinomialLogisticRegression, StandardScaler,
     DecisionTreeClassifier, DecisionTreeRegressor,
-    RandomForestClassifier, RandomForestRegressor, AdaBoostClassifier,
+    RandomForestClassifier, ExtraTreesClassifier,
+    RandomForestRegressor, AdaBoostClassifier,
     GradientBoostingRegressor, GradientBoostingClassifier,
     GaussianMixture, KNeighborsRegressor,
     KNeighborsClassifier, AgglomerativeClustering, DBSCAN, or
@@ -20654,6 +20655,8 @@ def dumps(model):
     ``n_estimators``, ``max_features``, ``seed``, ``n_features_in``,
     ``trees`` in that order, with exactly ``n_estimators`` trees whose
     nodes use the same node encoding as DecisionTreeClassifier.
+    ExtraTreesClassifier uses this exact same format, differing only in
+    ``class`` being ``"ExtraTreesClassifier"``.
 
     For RandomForestRegressor the top-level keys are ``class``,
     ``n_estimators``, ``max_depth``, ``max_features``, ``seed``,
@@ -20902,11 +20905,19 @@ def dumps(model):
 
     if isinstance(model, RandomForestClassifier):
         try:
-            return _dumps_forest(model)
+            return _dumps_forest(model, "RandomForestClassifier")
         except ValueError:
             raise
         except Exception as exc:
             raise ValueError("invalid RandomForestClassifier state") from exc
+
+    if isinstance(model, ExtraTreesClassifier):
+        try:
+            return _dumps_forest(model, "ExtraTreesClassifier")
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("invalid ExtraTreesClassifier state") from exc
 
     if isinstance(model, RandomForestRegressor):
         try:
@@ -21011,7 +21022,8 @@ def dumps(model):
         "LogisticRegression, LassoRegression, ElasticNetRegression, "
         "MultinomialLogisticRegression, "
         "StandardScaler, DecisionTreeClassifier, DecisionTreeRegressor, "
-        "RandomForestClassifier, RandomForestRegressor, "
+        "RandomForestClassifier, ExtraTreesClassifier, "
+        "RandomForestRegressor, "
         "AdaBoostClassifier, GradientBoostingRegressor, "
         "GradientBoostingClassifier, "
         "GaussianMixture, KNeighborsRegressor, "
@@ -21656,22 +21668,23 @@ def _encode_tree_node(node, n_features):
     )
 
 
-def _dumps_forest(model):
-    """Serialize a fitted RandomForestClassifier.
+def _dumps_forest(model, class_name):
+    """Serialize a fitted RandomForestClassifier or ExtraTreesClassifier.
 
     The top-level keys are class, n_estimators, max_features, seed,
     n_features_in, trees in that order; n_estimators and n_features_in are
     positive JSON integers, 1 <= max_features <= n_features_in, and the
     ``trees`` array holds exactly n_estimators node trees encoded by
-    ``_encode_tree_node``. The construction parameters are re-validated
-    exactly as ``__init__`` performs the checks, and the fitted state must
-    match them in shape.
+    ``_encode_tree_node``. The two classes share this format exactly,
+    differing only in the ``class`` string. The construction parameters
+    are re-validated exactly as ``__init__`` performs the checks, and the
+    fitted state must match them in shape.
     """
     trees = model._trees
     n_features = model._n_features
     if trees is None or n_features is None:
         raise ValueError(
-            "RandomForestClassifier must be fitted before dumps is called"
+            class_name + " must be fitted before dumps is called"
         )
     n_estimators = model.n_estimators
     max_features = model.max_features
@@ -21684,7 +21697,7 @@ def _dumps_forest(model):
         or type(seed) is not int
     ):
         raise ValueError(
-            "RandomForestClassifier has invalid construction parameters"
+            class_name + " has invalid construction parameters"
         )
     if type(n_features) is not int or n_features <= 0:
         raise ValueError("n_features_in must be a positive integer")
@@ -21698,7 +21711,7 @@ def _dumps_forest(model):
         _encode_tree_node(tree, n_features) for tree in trees
     ) + "]"
     return (
-        '{"class":"RandomForestClassifier","n_estimators":'
+        '{"class":"' + class_name + '","n_estimators":'
         + str(n_estimators)
         + ',"max_features":'
         + str(max_features)
@@ -22997,18 +23010,21 @@ def _load_tree_node(node, n_features):
     return result
 
 
-def _load_forest(pairs):
+def _load_forest(pairs, class_name):
     keys = tuple(key for key, _ in pairs)
     if keys != _SERIAL_KEYS_FOREST:
         raise ValueError(
-            "RandomForestClassifier JSON must have exactly the serialized "
+            class_name + " JSON must have exactly the serialized "
             "keys in the serialized order"
         )
     data = _convert(pairs)
 
-    class_name = data["class"]
-    if not isinstance(class_name, str) or class_name != "RandomForestClassifier":
-        raise ValueError('class must be "RandomForestClassifier"')
+    class_entry_name = data["class"]
+    if (
+        not isinstance(class_entry_name, str)
+        or class_entry_name != class_name
+    ):
+        raise ValueError('class must be "' + class_name + '"')
 
     n_estimators = _expect_int(data["n_estimators"], "n_estimators")
     if n_estimators <= 0:
@@ -23028,11 +23044,18 @@ def _load_forest(pairs):
         raise ValueError("trees must have length n_estimators")
     trees = [_load_tree_node(tree, n_features) for tree in trees_node]
 
-    model = RandomForestClassifier(
-        n_estimators=n_estimators,
-        max_features=max_features,
-        seed=seed,
-    )
+    if class_name == "ExtraTreesClassifier":
+        model = ExtraTreesClassifier(
+            n_estimators=n_estimators,
+            max_features=max_features,
+            seed=seed,
+        )
+    else:
+        model = RandomForestClassifier(
+            n_estimators=n_estimators,
+            max_features=max_features,
+            seed=seed,
+        )
     model._trees = trees
     model._n_features = n_features
     return model
@@ -23703,7 +23726,8 @@ def loads(text):
     LogisticRegression, LassoRegression, ElasticNetRegression,
     MultinomialLogisticRegression, StandardScaler,
     DecisionTreeClassifier, DecisionTreeRegressor,
-    RandomForestClassifier, RandomForestRegressor, AdaBoostClassifier,
+    RandomForestClassifier, ExtraTreesClassifier,
+    RandomForestRegressor, AdaBoostClassifier,
     GradientBoostingRegressor, GradientBoostingClassifier,
     GaussianMixture, KNeighborsRegressor, KNeighborsClassifier,
     AgglomerativeClustering, DBSCAN, or IsolationForest from text
@@ -23729,7 +23753,8 @@ def loads(text):
     MultinomialLogisticRegression from the column count of ``W``
     (with its ``classes``/``W``/``b`` arrays copied rather than shared),
     StandardScaler/DecisionTreeClassifier/DecisionTreeRegressor/
-    RandomForestClassifier/RandomForestRegressor from ``n_features_in``,
+    RandomForestClassifier/ExtraTreesClassifier/RandomForestRegressor
+    from ``n_features_in``,
     AdaBoostClassifier from ``n_features_in``,
     GradientBoostingRegressor/GradientBoostingClassifier from
     ``n_features_in``,
@@ -23850,7 +23875,14 @@ def loads(text):
             raise ValueError("malformed serialized model") from exc
     if class_entry == "RandomForestClassifier":
         try:
-            return _load_forest(pairs)
+            return _load_forest(pairs, "RandomForestClassifier")
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("malformed serialized model") from exc
+    if class_entry == "ExtraTreesClassifier":
+        try:
+            return _load_forest(pairs, "ExtraTreesClassifier")
         except ValueError:
             raise
         except Exception as exc:
