@@ -36,6 +36,8 @@ Exports:
         two-dimensional data.
     DBSCAN -- deterministic density-based clustering with an epsilon
         neighborhood and a minimum core-point sample count.
+    optics_clustering -- deterministic OPTICS-style ordering clustering
+        using core and reachability distances with an epsilon cutoff.
     AgglomerativeClustering -- deterministic bottom-up clustering with
         single, complete, or average linkage.
     GaussianMixture -- deterministic one-dimensional Gaussian mixture
@@ -265,6 +267,7 @@ __all__ = [
     "KMeans",
     "PCA",
     "DBSCAN",
+    "optics_clustering",
     "AgglomerativeClustering",
     "GaussianMixture",
     "IsolationForest",
@@ -5152,6 +5155,196 @@ class DBSCAN:
     def fit_predict(self, X):
         self.fit(X)
         return list(self.labels_)
+
+
+def optics_clustering(X, eps, min_samples=5):
+    """Deterministic OPTICS-style ordering with reachability clustering.
+
+    Distance is ``sqrt(math.fsum((X[i][k] - X[j][k]) ** 2))`` with the
+    squares accumulated in ascending column order. Each point's core
+    distance is the ``min_samples``-th smallest distance to any point
+    (including itself), ties broken by ascending point index. Processing
+    restarts from the smallest unprocessed index; after a point is
+    processed, each still-unprocessed point's reachability distance is
+    strictly lowered to ``max(core distance, distance)``, and the next
+    processed point is always the unprocessed candidate with the smallest
+    ``(reachability distance, index)`` pair. Labels are assigned in
+    processing order: at a segment start, or when the reachability
+    distance exceeds ``eps``, a point with core distance at most ``eps``
+    starts a new cluster numbered from zero, otherwise it is noise
+    (``-1``); every other point joins the current cluster. The input is
+    not modified. Any overflow or non-finite value encountered during the
+    validated arithmetic raises ``FloatingPointError``. No randomness is
+    used.
+    """
+
+    _check_exact_matrix(X)
+    n = len(X)
+
+    if type(eps) not in (int, float):
+        raise ValueError(
+            "eps must be a finite non-boolean int or float greater than 0"
+        )
+    try:
+        eps_finite = math.isfinite(eps)
+    except OverflowError:
+        # math.isfinite raises OverflowError on exact ints too large to
+        # convert to float; an exact positive int is still valid.
+        eps_finite = type(eps) is int
+    if not eps_finite or eps <= 0:
+        raise ValueError(
+            "eps must be a finite non-boolean int or float greater than 0"
+        )
+    if (
+        type(min_samples) is not int
+        or isinstance(min_samples, bool)
+        or min_samples < 2
+        or min_samples > n
+    ):
+        raise ValueError(
+            "min_samples must be an integer with 2 <= min_samples <= len(X)"
+        )
+
+    def distance(i, j):
+        """Euclidean distance via math.fsum in column order; overflow or a
+        non-finite intermediate or result raises FloatingPointError."""
+        row_a = X[i]
+        row_b = X[j]
+        terms = []
+        for k in range(len(row_a)):
+            try:
+                diff = row_a[k] - row_b[k]
+            except (OverflowError, ValueError, ZeroDivisionError) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during distance computation"
+                ) from exc
+            if isinstance(diff, float) and not math.isfinite(diff):
+                raise FloatingPointError(
+                    "non-finite value encountered during distance computation"
+                )
+            try:
+                square = diff ** 2
+            except (OverflowError, ValueError, ZeroDivisionError) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during distance computation"
+                ) from exc
+            if isinstance(square, float) and not math.isfinite(square):
+                raise FloatingPointError(
+                    "non-finite value encountered during distance computation"
+                )
+            terms.append(square)
+        try:
+            total = math.fsum(terms)
+        except (OverflowError, ValueError, ZeroDivisionError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during distance computation"
+            ) from exc
+        if isinstance(total, float) and not math.isfinite(total) or total < 0:
+            raise FloatingPointError(
+                "non-finite value encountered during distance computation"
+            )
+        try:
+            result = math.sqrt(total)
+        except (OverflowError, ValueError, ZeroDivisionError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during distance computation"
+            ) from exc
+        if not math.isfinite(result):
+            raise FloatingPointError(
+                "non-finite value encountered during distance computation"
+            )
+        return result
+
+    # Full pairwise distance matrix; symmetry makes the upper triangle
+    # reuse the lower, but each value is produced by the validated formula.
+    dist = [[None] * n for _ in range(n)]
+    for i in range(n):
+        dist[i][i] = distance(i, i)
+        for j in range(i + 1, n):
+            value = distance(i, j)
+            dist[i][j] = value
+            dist[j][i] = value
+
+    # Core distance of each point: the min_samples-th entry of all points
+    # sorted by (distance, index).
+    core_distances = [
+        sorted((dist[i][j], j) for j in range(n))[min_samples - 1][0]
+        for i in range(n)
+    ]
+
+    labels = [-1] * n
+    # Reachability is undefined until set the first time (None).
+    reachable = [None] * n
+    unprocessed = set(range(n))
+    next_label = 0
+    current_label = -1
+
+    while unprocessed:
+        # Within a segment the candidate with the smallest
+        # (reachability, index) is taken; when no candidate has a defined
+        # reachability a new segment starts at the smallest index.
+        candidate = None
+        candidate_key = None
+        for q in unprocessed:
+            if reachable[q] is None:
+                continue
+            key = (reachable[q], q)
+            if candidate_key is None or key < candidate_key:
+                candidate = q
+                candidate_key = key
+        if candidate is None:
+            p = min(unprocessed)
+            segment_start = True
+        else:
+            p = candidate
+            segment_start = False
+
+        unprocessed.remove(p)
+        core_p = core_distances[p]
+
+        # Label assignment in processing order. A segment start always
+        # decides between a fresh cluster and noise; short-circuiting
+        # means a possibly-undefined reachability is never compared then.
+        reach_p = reachable[p]
+        try:
+            if segment_start:
+                starts_boundary = True
+            else:
+                starts_boundary = reach_p > eps
+        except (OverflowError, ValueError, ZeroDivisionError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during clustering"
+            ) from exc
+        if starts_boundary:
+            try:
+                core_within = core_p <= eps
+            except (OverflowError, ValueError, ZeroDivisionError) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during clustering"
+                ) from exc
+            if core_within:
+                current_label = next_label
+                next_label += 1
+            else:
+                current_label = -1
+        labels[p] = current_label
+
+        # Strictly lower each unprocessed point's reachability with
+        # max(core distance of p, distance(p, q)).
+        for q in unprocessed:
+            dist_pq = dist[p][q]
+            try:
+                new_reach = core_p if core_p > dist_pq else dist_pq
+                old_reach = reachable[q]
+                lower = old_reach is None or new_reach < old_reach
+            except (OverflowError, ValueError, ZeroDivisionError) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during clustering"
+                ) from exc
+            if lower:
+                reachable[q] = new_reach
+
+    return labels
 
 
 class AgglomerativeClustering:
