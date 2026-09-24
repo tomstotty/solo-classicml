@@ -214,6 +214,8 @@ Exports:
     local_outlier_factor_score -- deterministic local outlier factor of
         each row of a finite real matrix from reachability distances
         averaged over the tie-inclusive k-nearest neighborhoods.
+    optics_clustering -- deterministic OPTICS-style clustering of a
+        finite real matrix returning integer labels in input order.
     dumps -- serialize a fitted KMeans/PCA/linear/scaler/tree/forest
         model (including MultinomialLogisticRegression,
         AgglomerativeClustering, and DBSCAN) to whitespace-free JSON
@@ -353,6 +355,7 @@ __all__ = [
     "survival_brier_score",
     "isolation_forest_score",
     "local_outlier_factor_score",
+    "optics_clustering",
     "dumps",
     "loads",
 ]
@@ -2586,6 +2589,144 @@ def local_outlier_factor_score(X, n_neighbors=20) -> list[float]:
         raise FloatingPointError(
             "non-finite value encountered during local outlier factor"
             " scoring"
+        ) from exc
+
+
+def optics_clustering(X, eps, min_samples=5) -> list[int]:
+    """Return OPTICS-style cluster labels for the rows of ``X``.
+
+    ``X`` must be a non-empty rectangular matrix whose rows are
+    non-empty lists and whose elements have type exactly ``int`` or are
+    finite values of type exactly ``float`` (booleans and subclasses
+    are rejected), ``eps`` must be a positive exact ``int`` or a finite
+    positive ``float``, and ``min_samples`` must be an exact ``int``
+    with ``2 <= min_samples <= len(X)``; any violation raises
+    ValueError.
+
+    Let ``F = math.fsum``. The Euclidean distance is
+    ``d(i, j) = sqrt(F((X[i][k] - X[j][k]) ** 2))`` summed over columns
+    in ascending order, and the core distance of point ``i`` is the
+    ``min_samples``-th entry of all points sorted by ``(d(i, j), j)``
+    ascending. Reachability distances start undefined; each segment
+    starts at the smallest unprocessed index, and after processing
+    ``p`` every unprocessed ``q`` has its reachability distance
+    strictly lowered by ``max(core_distance[p], d(p, q))`` when that
+    value is smaller, with the next processed point always the
+    candidate with the smallest ``(reachability, q)`` until no
+    candidate remains. Labels are then assigned in processing order
+    and returned in input order: a segment head or a point whose
+    reachability distance exceeds ``eps`` opens a new cluster
+    (numbered upward from 0) when its core distance is at most ``eps``
+    and is labeled ``-1`` otherwise, and every other point joins the
+    current cluster. Any OverflowError, ValueError, ZeroDivisionError
+    or non-finite intermediate value or result after validation raises
+    FloatingPointError. ``X`` is not modified, only the standard
+    library is used, and the same arguments always give the same
+    result.
+    """
+    width = _check_tree_matrix(X)
+    if type(eps) is int:
+        if eps <= 0:
+            raise ValueError("eps must be positive")
+    elif type(eps) is float and math.isfinite(eps):
+        if eps <= 0.0:
+            raise ValueError("eps must be positive")
+    else:
+        raise ValueError(
+            "eps must be a positive int or a finite positive float"
+        )
+    if type(min_samples) is not int:
+        raise ValueError("min_samples must be an integer")
+    n = len(X)
+    if min_samples < 2 or min_samples > n:
+        raise ValueError(
+            "min_samples must satisfy 2 <= min_samples <= len(X)"
+        )
+
+    try:
+        distances = [[0.0] * n for _ in range(n)]
+        for i in range(n):
+            row = distances[i]
+            for j in range(i + 1, n):
+                d_ij = math.sqrt(
+                    math.fsum(
+                        (X[i][k] - X[j][k]) ** 2 for k in range(width)
+                    )
+                )
+                if not math.isfinite(d_ij):
+                    raise FloatingPointError(
+                        "non-finite value encountered during optics"
+                        " clustering"
+                    )
+                row[j] = d_ij
+                distances[j][i] = d_ij
+
+        core = [0.0] * n
+        for i in range(n):
+            row = distances[i]
+            ordered = sorted(range(n), key=lambda j: (row[j], j))
+            core[i] = row[ordered[min_samples - 1]]
+            if not math.isfinite(core[i]):
+                raise FloatingPointError(
+                    "non-finite value encountered during optics"
+                    " clustering"
+                )
+
+        processed = [False] * n
+        reach = [None] * n
+        segment_head = [False] * n
+        order = []
+        remaining = n
+        while remaining:
+            p = 0
+            while processed[p]:
+                p += 1
+            segment_head[p] = True
+            while True:
+                processed[p] = True
+                order.append(p)
+                remaining -= 1
+                row = distances[p]
+                core_p = core[p]
+                best = -1
+                best_reach = None
+                for q in range(n):
+                    if processed[q]:
+                        continue
+                    r = max(core_p, row[q])
+                    if not math.isfinite(r):
+                        raise FloatingPointError(
+                            "non-finite value encountered during optics"
+                            " clustering"
+                        )
+                    rq = reach[q]
+                    if rq is None or r < rq:
+                        reach[q] = r
+                        rq = r
+                    if best_reach is None or rq < best_reach:
+                        best_reach = rq
+                        best = q
+                if best < 0:
+                    break
+                p = best
+
+        labels = [0] * n
+        current = -1
+        next_cluster = 0
+        for p in order:
+            if segment_head[p] or reach[p] > eps:
+                if core[p] <= eps:
+                    current = next_cluster
+                    next_cluster += 1
+                    labels[p] = current
+                else:
+                    labels[p] = -1
+            else:
+                labels[p] = current
+        return labels
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during optics clustering"
         ) from exc
 
 
