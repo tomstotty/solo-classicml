@@ -288,6 +288,7 @@ __all__ = [
     "DBSCAN",
     "AgglomerativeClustering",
     "GaussianMixture",
+    "GaussianNB",
     "IsolationForest",
     "NMF",
     "TruncatedSVD",
@@ -7153,6 +7154,227 @@ class GaussianMixture:
                 "model must be fitted before bic is called"
             )
         return self._information_criterion(X, math.log)
+
+
+def _check_gaussian_target(y, n):
+    """Validate a target vector of exact ints with the same length as X
+    (booleans and subclasses are rejected) containing at least two
+    distinct classes."""
+    if not isinstance(y, list) or len(y) != n:
+        raise ValueError("y must be a list with the same length as X")
+    classes = set()
+    for value in y:
+        if type(value) is not int:
+            raise ValueError("y must contain only exact integers")
+        classes.add(value)
+    if len(classes) < 2:
+        raise ValueError("y must contain at least two distinct classes")
+
+
+class GaussianNB:
+    """Deterministic Gaussian naive Bayes classifier.
+
+    The classes are the distinct labels of ``y`` in ascending order. For
+    every class and every column the mean ``mu`` is ``math.fsum`` of the
+    column values (taken in input order) divided by the class count, and
+    the population variance ``v`` is ``math.fsum`` of the squared
+    deviations from ``mu`` (again in input order) divided by the class
+    count. The same computation over every sample yields one overall
+    variance per column, and the smoothing epsilon is
+    ``e = var_smoothing * max(1.0, *overall column variances)``. The
+    fitted state is, in class order, the per-column means, the per-column
+    smoothed variances ``v + e``, the class priors ``count / n``, and the
+    number of columns.
+
+    Prediction scores every row for every class in column order with
+    ``l = log(prior) - 0.5 * fsum(log(2*pi*v) + (x - mu)**2 / v)`` and
+    returns the class with the largest ``l``; ties resolve to the smaller
+    class. No randomness is used and the inputs are never modified.
+    """
+
+    def __init__(self, var_smoothing=1e-9):
+        _require_exact_finite_positive(var_smoothing, "var_smoothing")
+
+        self.var_smoothing = var_smoothing
+        self._classes = None
+        self._means = None
+        self._variances = None
+        self._priors = None
+        self._n_features = None
+
+    def fit(self, X, y):
+        # Clear the previous fit up front so that a failed validation or
+        # computation leaves the model unfitted.
+        self._classes = None
+        self._means = None
+        self._variances = None
+        self._priors = None
+        self._n_features = None
+        try:
+            width = _check_gradient_matrix(X)
+            _check_gaussian_target(y, len(X))
+        except OverflowError as exc:
+            # An int too large to convert to float failed its finiteness
+            # check: still a rejected input, hence ValueError.
+            raise ValueError(
+                "X and y must contain only finite non-boolean numbers"
+            ) from exc
+
+        n = len(X)
+        classes = sorted(set(y))
+        overall_variances = [
+            self._column_stats([row[j] for row in X], n)[1]
+            for j in range(width)
+        ]
+        try:
+            epsilon = self.var_smoothing * max(
+                [1.0] + overall_variances
+            )
+        except (OverflowError, ValueError, ZeroDivisionError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during Gaussian naive Bayes"
+            ) from exc
+        if not math.isfinite(epsilon):
+            raise FloatingPointError(
+                "non-finite value encountered during Gaussian naive Bayes"
+            )
+        epsilon = _positive_zero(epsilon)
+
+        means = []
+        variances = []
+        priors = []
+        for cls in classes:
+            rows = [X[i] for i in range(n) if y[i] == cls]
+            count = len(rows)
+            class_means = []
+            class_variances = []
+            for j in range(width):
+                mean, variance = self._column_stats(
+                    [row[j] for row in rows], count
+                )
+                try:
+                    smoothed = variance + epsilon
+                except (OverflowError, ValueError, ZeroDivisionError) as exc:
+                    raise FloatingPointError(
+                        "non-finite value encountered during Gaussian naive "
+                        "Bayes"
+                    ) from exc
+                if not math.isfinite(smoothed):
+                    raise FloatingPointError(
+                        "non-finite value encountered during Gaussian naive "
+                        "Bayes"
+                    )
+                class_means.append(mean)
+                class_variances.append(_positive_zero(smoothed))
+            means.append(class_means)
+            variances.append(class_variances)
+            priors.append(_positive_zero(count / n))
+
+        self._classes = classes
+        self._means = means
+        self._variances = variances
+        self._priors = priors
+        self._n_features = width
+        return self
+
+    @staticmethod
+    def _column_stats(values, count):
+        """Return the sample-order fsum mean and population variance of a
+        non-empty column of validated values."""
+        try:
+            mean = math.fsum(values) / count
+        except (OverflowError, ValueError, ZeroDivisionError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during Gaussian naive Bayes"
+            ) from exc
+        if not math.isfinite(mean):
+            raise FloatingPointError(
+                "non-finite value encountered during Gaussian naive Bayes"
+            )
+        mean = _positive_zero(mean)
+        try:
+            variance = (
+                math.fsum((value - mean) ** 2 for value in values) / count
+            )
+        except (OverflowError, ValueError, ZeroDivisionError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during Gaussian naive Bayes"
+            ) from exc
+        if not math.isfinite(variance):
+            raise FloatingPointError(
+                "non-finite value encountered during Gaussian naive Bayes"
+            )
+        return mean, _positive_zero(variance)
+
+    def predict(self, X) -> list[int]:
+        if self._classes is None:
+            raise ValueError("model must be fitted before predict is called")
+        try:
+            width = _check_gradient_matrix(X)
+        except OverflowError as exc:
+            raise ValueError(
+                "X must contain only finite non-boolean numbers"
+            ) from exc
+        if width != self._n_features:
+            raise ValueError(
+                "X must have the same number of features as the training data"
+            )
+
+        results = []
+        for row in X:
+            best_class = None
+            best_log_joint = None
+            for k, cls in enumerate(self._classes):
+                terms = []
+                for j in range(width):
+                    mean = self._means[k][j]
+                    variance = self._variances[k][j]
+                    try:
+                        difference = row[j] - mean
+                        squared = difference ** 2
+                        ratio = squared / variance
+                        term = math.log(2 * math.pi * variance) + ratio
+                    except (
+                        OverflowError,
+                        ValueError,
+                        ZeroDivisionError,
+                    ) as exc:
+                        raise FloatingPointError(
+                            "non-finite value encountered during Gaussian "
+                            "naive Bayes"
+                        ) from exc
+                    if not math.isfinite(term):
+                        raise FloatingPointError(
+                            "non-finite value encountered during Gaussian "
+                            "naive Bayes"
+                        )
+                    terms.append(_positive_zero(term))
+                try:
+                    log_joint = (
+                        math.log(self._priors[k]) - 0.5 * math.fsum(terms)
+                    )
+                except (
+                    OverflowError,
+                    ValueError,
+                    ZeroDivisionError,
+                ) as exc:
+                    raise FloatingPointError(
+                        "non-finite value encountered during Gaussian naive "
+                        "Bayes"
+                    ) from exc
+                if not math.isfinite(log_joint):
+                    raise FloatingPointError(
+                        "non-finite value encountered during Gaussian naive "
+                        "Bayes"
+                    )
+                log_joint = _positive_zero(log_joint)
+                # Classes are visited in ascending order, so keeping the
+                # first maximum resolves ties toward the smaller class.
+                if best_log_joint is None or log_joint > best_log_joint:
+                    best_log_joint = log_joint
+                    best_class = cls
+            results.append(best_class)
+        return results
 
 
 def _check_metric_vectors(y_true, y_pred):
