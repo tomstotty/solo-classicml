@@ -21443,6 +21443,15 @@ _SERIAL_KEYS_GAUSSIAN = (
     "means",
     "variances",
 )
+_SERIAL_KEYS_GAUSSIAN_NB = (
+    "class",
+    "var_smoothing",
+    "n_features_in",
+    "classes",
+    "means",
+    "variances",
+    "priors",
+)
 _SERIAL_KEYS_NMF = (
     "class",
     "n_components",
@@ -22489,7 +22498,7 @@ def dumps(model):
     RandomForestClassifier, ExtraTreesClassifier,
     RandomForestRegressor, ExtraTreesRegressor, AdaBoostClassifier,
     GradientBoostingRegressor, GradientBoostingClassifier,
-    GaussianMixture, KNeighborsRegressor,
+    GaussianMixture, GaussianNB, KNeighborsRegressor,
     KNeighborsClassifier, AgglomerativeClustering, DBSCAN,
     IsolationForest, KMedoids, NMF, or TruncatedSVD model to compact
     JSON text.
@@ -22586,6 +22595,22 @@ def dumps(model):
     ROUND_HALF_UP (negative zero becomes ``0.000000000000``); weights
     must be positive, means finite, and variances at least ``1e-12``,
     with neither weights nor variances quantizing to zero.
+
+    For GaussianNB the top-level keys are ``class``, ``var_smoothing``,
+    ``n_features_in``, ``classes``, ``means``, ``variances``, ``priors``
+    in that order; ``class`` is ``"GaussianNB"`` and ``n_features_in``
+    is a positive JSON integer. ``classes`` is an ascending list of at
+    least two distinct JSON integers; ``means`` and ``variances`` are
+    rectangular ``K`` by ``n_features_in`` matrices and ``priors`` has
+    length ``K``, where ``K`` is the number of classes.
+    ``var_smoothing`` and every element of the three arrays have type
+    exactly ``int`` or ``float`` (booleans rejected) and are finite;
+    ``var_smoothing``, the variances, and the priors are strictly
+    positive. Each value is quantized to 12 decimal places via
+    ``Decimal(str(v))`` with ROUND_HALF_UP (negative zero becomes
+    ``0.000000000000``); ``var_smoothing`` must remain positive after
+    quantization, and the fixed text of every array element must
+    convert back with ``float`` to exactly the original value.
 
     For KNeighborsRegressor the top-level keys are ``class``,
     ``n_neighbors``, ``weights``, ``n_features_in``, ``X``, ``y`` in
@@ -22901,6 +22926,14 @@ def dumps(model):
         except Exception as exc:
             raise ValueError("invalid GaussianMixture state") from exc
 
+    if isinstance(model, GaussianNB):
+        try:
+            return _dumps_gaussian_nb(model)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("invalid GaussianNB state") from exc
+
     if isinstance(model, KNeighborsRegressor):
         try:
             return _dumps_knn_regressor(model)
@@ -22980,7 +23013,7 @@ def dumps(model):
         "RandomForestRegressor, ExtraTreesRegressor, "
         "AdaBoostClassifier, GradientBoostingRegressor, "
         "GradientBoostingClassifier, "
-        "GaussianMixture, KNeighborsRegressor, "
+        "GaussianMixture, GaussianNB, KNeighborsRegressor, "
         "KNeighborsClassifier, AgglomerativeClustering, DBSCAN, "
         "IsolationForest, KMedoids, NMF, and TruncatedSVD models"
     )
@@ -24441,6 +24474,176 @@ def _quantize_gaussian_value(value, name, positive=False):
     return token
 
 
+def _quantize_nb_value(value, name, positive=False):
+    """Quantize one GaussianNB array element to 12 fixed decimals.
+
+    The element must have type exactly ``int`` or ``float`` (booleans and
+    subclasses rejected) and be finite; strictly positive arrays must
+    stay positive. Quantization is ``Decimal(str(v)).quantize(1E-12,
+    ROUND_HALF_UP)`` (never through ``float`` first; negative zero
+    normalizes to ``0.000000000000``), and the fixed text must convert
+    back with ``float`` to exactly the original value.
+    """
+    if isinstance(value, bool) or type(value) not in (int, float):
+        raise ValueError("%s elements must be int or float" % name)
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("%s elements must be finite numbers" % name) from exc
+    if not math.isfinite(number):
+        raise ValueError("%s elements must be finite numbers" % name)
+    if positive and number <= 0.0:
+        raise ValueError("%s elements must be strictly positive" % name)
+    with localcontext() as ctx:
+        ctx.prec = 400
+        decimal_value = Decimal(str(value)).quantize(
+            _QUANTUM12, rounding=ROUND_HALF_UP
+        )
+    token = (
+        "0.000000000000" if decimal_value == 0 else format(decimal_value, "f")
+    )
+    if float(token) != value:
+        raise ValueError(
+            "%s value does not round-trip at 12 decimal places" % name
+        )
+    return token
+
+
+def _quantize_nb_smoothing(value):
+    """Quantize GaussianNB's strictly positive ``var_smoothing`` to 12
+    fixed decimals; unlike the fitted arrays the fixed text need not
+    equal the original value but must read back as a positive float."""
+    with localcontext() as ctx:
+        ctx.prec = 400
+        decimal_value = Decimal(str(value)).quantize(
+            _QUANTUM12, rounding=ROUND_HALF_UP
+        )
+    if decimal_value <= 0:
+        raise ValueError(
+            "var_smoothing must remain positive after quantization to 12 "
+            "decimals"
+        )
+    token = format(decimal_value, "f")
+    if float(token) <= 0.0:
+        raise ValueError(
+            "var_smoothing must remain positive after quantization to 12 "
+            "decimals"
+        )
+    return token
+
+
+def _dumps_gaussian_nb(model):
+    """Serialize a fitted GaussianNB.
+
+    The top-level keys are class, var_smoothing, n_features_in, classes,
+    means, variances, priors in that order; ``class`` is ``"GaussianNB"``
+    and ``n_features_in`` is a positive JSON integer. ``classes`` is an
+    ascending list of at least two distinct JSON integers, ``means`` and
+    ``variances`` are rectangular ``K`` by ``n_features_in`` matrices (K
+    the number of classes), and ``priors`` has length K. The smoothing
+    parameter and every array element have type exactly ``int`` or
+    ``float`` (booleans rejected) and are finite; var_smoothing,
+    variances, and priors are strictly positive. Each value is quantized
+    to 12 decimal places with ROUND_HALF_UP via ``Decimal(str(v))``
+    (negative zero becomes ``0.000000000000``); var_smoothing must stay
+    positive after quantization, and every fixed array element must
+    convert back with ``float`` to exactly the original value.
+    """
+    classes = model._classes
+    means = model._means
+    variances = model._variances
+    priors = model._priors
+    n_features = model._n_features
+    if (
+        classes is None
+        or means is None
+        or variances is None
+        or priors is None
+        or n_features is None
+    ):
+        raise ValueError(
+            "GaussianNB must be fitted before dumps is called"
+        )
+    var_smoothing = model.var_smoothing
+    # Re-validate the construction parameter exactly as __init__ does.
+    if isinstance(var_smoothing, bool) or type(var_smoothing) not in (
+        int,
+        float,
+    ):
+        raise ValueError("GaussianNB has invalid construction parameters")
+    try:
+        smoothing = float(var_smoothing)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "GaussianNB has invalid construction parameters"
+        ) from exc
+    if not math.isfinite(smoothing) or smoothing <= 0.0:
+        raise ValueError("GaussianNB has invalid construction parameters")
+
+    if type(n_features) is not int or n_features <= 0:
+        raise ValueError("n_features_in must be a positive integer")
+    if not isinstance(classes, list) or len(classes) < 2:
+        raise ValueError(
+            "classes_ must be a list of at least two integers"
+        )
+    for index, value in enumerate(classes):
+        if type(value) is not int:
+            raise ValueError("classes_ elements must be exact integers")
+        if index > 0 and value <= classes[index - 1]:
+            raise ValueError(
+                "classes_ must be ascending distinct integers"
+            )
+    k = len(classes)
+
+    for array, name in ((means, "means_"), (variances, "variances_")):
+        if not isinstance(array, list) or len(array) != k:
+            raise ValueError("%s must have one row per class" % name)
+        for row in array:
+            if not isinstance(row, list) or len(row) != n_features:
+                raise ValueError(
+                    "%s must be a K by n_features_in matrix" % name
+                )
+    if not isinstance(priors, list) or len(priors) != k:
+        raise ValueError("priors_ must have one entry per class")
+
+    smoothing_text = _quantize_nb_smoothing(var_smoothing)
+    classes_text = "[" + ",".join(str(value) for value in classes) + "]"
+    means_text = "[" + ",".join(
+        "["
+        + ",".join(_quantize_nb_value(value, "means_") for value in row)
+        + "]"
+        for row in means
+    ) + "]"
+    variances_text = "[" + ",".join(
+        "["
+        + ",".join(
+            _quantize_nb_value(value, "variances_", positive=True)
+            for value in row
+        )
+        + "]"
+        for row in variances
+    ) + "]"
+    priors_text = "[" + ",".join(
+        _quantize_nb_value(value, "priors_", positive=True)
+        for value in priors
+    ) + "]"
+    return (
+        '{"class":"GaussianNB","var_smoothing":'
+        + smoothing_text
+        + ',"n_features_in":'
+        + str(n_features)
+        + ',"classes":'
+        + classes_text
+        + ',"means":'
+        + means_text
+        + ',"variances":'
+        + variances_text
+        + ',"priors":'
+        + priors_text
+        + "}"
+    )
+
+
 _JSON_INT_RE = re.compile(r"^(0|-?[1-9][0-9]*)$")
 _JSON_FLOAT_RE = re.compile(r"^-?(0|[1-9][0-9]*)\.[0-9]{10}$")
 _JSON_FLOAT12_RE = re.compile(r"^-?(0|[1-9][0-9]*)\.[0-9]{12}$")
@@ -25590,6 +25793,82 @@ def _load_gaussian(pairs):
     return model
 
 
+def _load_gaussian_nb(pairs):
+    keys = tuple(key for key, _ in pairs)
+    if keys != _SERIAL_KEYS_GAUSSIAN_NB:
+        raise ValueError(
+            "GaussianNB JSON must have exactly the serialized keys "
+            "in the serialized order"
+        )
+    data = _convert(pairs)
+
+    class_name = data["class"]
+    if not isinstance(class_name, str) or class_name != "GaussianNB":
+        raise ValueError('class must be "GaussianNB"')
+
+    var_smoothing = _expect_fixed12(data["var_smoothing"], "var_smoothing")
+    if var_smoothing <= 0.0:
+        raise ValueError("var_smoothing must be greater than 0")
+
+    n_features = _expect_int(data["n_features_in"], "n_features_in")
+    if n_features <= 0:
+        raise ValueError("n_features_in must be greater than 0")
+
+    classes_node = data["classes"]
+    if not isinstance(classes_node, list) or len(classes_node) < 2:
+        raise ValueError(
+            "classes must be an array of at least two integers"
+        )
+    classes = []
+    for index, entry in enumerate(classes_node):
+        value = _expect_int(entry, "classes element")
+        if index > 0 and value <= classes[-1]:
+            raise ValueError("classes must be ascending distinct integers")
+        classes.append(value)
+    k = len(classes)
+
+    means = _expect_gaussian_nb_matrix(
+        data["means"], k, n_features, "means"
+    )
+    variances = _expect_gaussian_nb_matrix(
+        data["variances"], k, n_features, "variances"
+    )
+    for row in variances:
+        for value in row:
+            if value <= 0.0:
+                raise ValueError("variances elements must be greater than 0")
+
+    priors = _expect_fixed12_vector(data["priors"], k, "priors")
+    for value in priors:
+        if value <= 0.0:
+            raise ValueError("priors elements must be greater than 0")
+
+    model = GaussianNB(var_smoothing=var_smoothing)
+    # Fresh nested lists so the fitted state never shares storage with
+    # the parsed payload.
+    model._classes = list(classes)
+    model._means = [list(row) for row in means]
+    model._variances = [list(row) for row in variances]
+    model._priors = list(priors)
+    model._n_features = n_features
+    return model
+
+
+def _expect_gaussian_nb_matrix(node, rows, width, name):
+    if not isinstance(node, list) or len(node) != rows:
+        raise ValueError("%s must have one row per class" % name)
+    matrix = []
+    for row in node:
+        if not isinstance(row, list) or len(row) != width:
+            raise ValueError(
+                "%s must be a rectangular K by n_features_in matrix" % name
+            )
+        matrix.append(
+            [_expect_fixed12(value, name + " element") for value in row]
+        )
+    return matrix
+
+
 def _load_nmf(pairs):
     keys = tuple(key for key, _ in pairs)
     if keys != _SERIAL_KEYS_NMF:
@@ -25965,7 +26244,7 @@ def loads(text):
     RandomForestClassifier, ExtraTreesClassifier,
     RandomForestRegressor, ExtraTreesRegressor, AdaBoostClassifier,
     GradientBoostingRegressor, GradientBoostingClassifier,
-    GaussianMixture, KNeighborsRegressor, KNeighborsClassifier,
+    GaussianMixture, GaussianNB, KNeighborsRegressor, KNeighborsClassifier,
     AgglomerativeClustering, DBSCAN, IsolationForest, KMedoids, NMF, or
     TruncatedSVD from text produced by dumps.
 
@@ -25973,8 +26252,8 @@ def loads(text):
     ``str`` holding compact JSON with no whitespace, no duplicate keys,
     the exact key sets in order, JSON integers for integer parameters,
     10-decimal fixed-point numbers for floats (12-decimal for
-    GaussianMixture, NMF, and TruncatedSVD), and consistent array
-    shapes. Anything else --
+    GaussianMixture, GaussianNB, NMF, and TruncatedSVD), and consistent
+    array shapes. Anything else --
     including non-str input (str subclasses included), empty strings,
     parse failures, booleans, exponent notation, non-finite values, or
     illegal parameters -- raises ValueError. The returned model is
@@ -26046,6 +26325,16 @@ def loads(text):
     and its lists are copied rather than shared, so ``transform`` and
     ``inverse_transform`` work and mutating the parsed data can never
     reach the model.
+    GaussianNB is reconstructed from a strictly positive fixed
+    12-decimal ``var_smoothing`` and ``n_features_in`` (a positive JSON
+    integer), an ascending list of at least two distinct JSON integer
+    ``classes``, rectangular ``K`` by ``n_features_in`` fixed
+    12-decimal ``means`` and ``variances`` matrices (variances strictly
+    positive), and a strictly positive ``priors`` array of length
+    ``K``; the restored model is fitted and its classes and nested
+    lists are freshly copied rather than shared, so predictions agree
+    value-for-value with the original and mutating the parsed data can
+    never reach the model.
     The argument is not modified.
     """
     if type(text) is not str or len(text) == 0:
@@ -26197,6 +26486,13 @@ def loads(text):
     if class_entry == "GaussianMixture":
         try:
             return _load_gaussian(pairs)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("malformed serialized model") from exc
+    if class_entry == "GaussianNB":
+        try:
+            return _load_gaussian_nb(pairs)
         except ValueError:
             raise
         except Exception as exc:
