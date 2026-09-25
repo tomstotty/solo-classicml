@@ -49,6 +49,11 @@ Exports:
         reducer: fit/fit_transform use ``nmf`` to learn ``H``, and
         transform refits ``W`` for new rows by multiplicative updates
         from an all-ones start.
+    TruncatedSVD -- reusable deterministic truncated singular value
+        decomposition reducer: fit/fit_transform use ``truncated_svd``
+        to learn ``V`` and the singular values, transform projects new
+        rows onto ``V``, and inverse_transform maps coefficient rows
+        back into the feature space.
     accuracy_score -- fraction of positions where two integer label
         vectors agree.
     mean_squared_error -- weighted mean of squared element-wise
@@ -285,6 +290,7 @@ __all__ = [
     "GaussianMixture",
     "IsolationForest",
     "NMF",
+    "TruncatedSVD",
     "accuracy_score",
     "mean_squared_error",
     "root_mean_squared_error",
@@ -3319,6 +3325,206 @@ def truncated_svd(X, n_components=2, max_iter=100, tol=1e-8) -> tuple:
         raise FloatingPointError(
             "non-finite value encountered during truncated_svd"
         ) from exc
+
+
+# The future-annotations import stores the return annotation as the
+# string "tuple"; pin the runtime annotation to the builtin itself.
+truncated_svd.__annotations__["return"] = tuple
+
+
+class TruncatedSVD:
+    """Reusable deterministic truncated singular value decomposition
+    reducer.
+
+    The construction parameters follow ``truncated_svd`` exactly:
+    ``n_components`` and ``max_iter`` must be exact positive integers
+    and ``tol`` must be a finite non-boolean positive number; any
+    violation raises ValueError.
+
+    ``components_`` (the ``r`` by ``p`` matrix ``V``),
+    ``singular_values_`` (the ``r`` saved ``sqrt(lam)`` values) and
+    ``n_features_in_`` (``p``) are ``None`` initially and after a
+    failed fit. ``fit(X)`` first clears the fitted state and then calls
+    ``truncated_svd`` with ``X`` and the construction parameters,
+    saving ``V``, ``S`` and the number of columns; a failure
+    (including a FloatingPointError from ``truncated_svd``) leaves the
+    model unfitted, and ``fit`` returns ``self``. ``fit_transform(X)``
+    fits the same way and returns the ``Z`` that ``truncated_svd``
+    produced.
+
+    ``transform(X)`` projects the rows of ``X`` onto the fitted
+    ``V``. Calling it before fitting, with ``X`` that does not satisfy
+    the ``truncated_svd`` matrix rules, or with a number of columns
+    different from the training data raises ValueError. With
+    ``F = math.fsum`` and every index summed in ascending order, the
+    result ``Z`` has ``Z[i][c] = F(X[i][j] * V[c][j] for j in
+    range(p))``.
+
+    ``inverse_transform(Z)`` maps coefficient rows back into the
+    feature space. Calling it before fitting raises ValueError. ``Z``
+    must be a non-empty rectangular matrix whose rows are non-empty
+    lists, whose width is ``n_components`` and whose elements have type
+    exactly ``int`` or are finite values of type exactly ``float``;
+    any violation raises ValueError. The result ``X`` has
+    ``X[i][j] = F(Z[i][c] * V[c][j] for c in range(r))``.
+
+    Both transforms return brand-new float matrices with zero written
+    as ``+0.0``. Any OverflowError, ValueError or ZeroDivisionError
+    raised after validation by the arithmetic, or any non-finite value
+    produced, raises FloatingPointError. No method modifies its inputs,
+    the transforms do not change the fitted state, only the standard
+    library is used, and the same arguments always give the same
+    result.
+    """
+
+    def __init__(self, n_components=2, max_iter=100, tol=1e-8):
+        if type(n_components) is not int:
+            raise ValueError("n_components must be an integer")
+        if n_components <= 0:
+            raise ValueError("n_components must be greater than 0")
+        if type(max_iter) is not int:
+            raise ValueError("max_iter must be an integer")
+        if max_iter <= 0:
+            raise ValueError("max_iter must be greater than 0")
+        tol = _checked_parameter(tol, "tol")
+        if tol <= 0:
+            raise ValueError("tol must be greater than 0")
+        self.n_components = n_components
+        self.max_iter = max_iter
+        self.tol = tol
+        self.components_ = None
+        self.singular_values_ = None
+        self.n_features_in_ = None
+
+    def fit(self, X) -> TruncatedSVD:
+        """Fit ``V`` and ``S`` from ``X`` via ``truncated_svd`` and
+        return ``self``."""
+        self.components_ = None
+        self.singular_values_ = None
+        self.n_features_in_ = None
+        Z, V, S = truncated_svd(
+            X,
+            n_components=self.n_components,
+            max_iter=self.max_iter,
+            tol=self.tol,
+        )
+        self.components_ = V
+        self.singular_values_ = S
+        self.n_features_in_ = len(V[0])
+        return self
+
+    def fit_transform(self, X) -> list[list[float]]:
+        """Fit from ``X`` and return the projected matrix ``Z``."""
+        self.components_ = None
+        self.singular_values_ = None
+        self.n_features_in_ = None
+        Z, V, S = truncated_svd(
+            X,
+            n_components=self.n_components,
+            max_iter=self.max_iter,
+            tol=self.tol,
+        )
+        self.components_ = V
+        self.singular_values_ = S
+        self.n_features_in_ = len(V[0])
+        return Z
+
+    def transform(self, X) -> list[list[float]]:
+        """Return brand-new projections of the rows of ``X`` onto the
+        fitted ``V``."""
+        if self.components_ is None or self.n_features_in_ is None:
+            raise ValueError(
+                "TruncatedSVD must be fitted before transform is called"
+            )
+        try:
+            width = _check_matrix_exact(X)
+        except OverflowError as exc:
+            raise ValueError(
+                "X must contain only finite non-boolean numbers"
+            ) from exc
+        if width != self.n_features_in_:
+            raise ValueError(
+                "X must have the same number of columns as the training"
+                " data"
+            )
+
+        V = self.components_
+        n = len(X)
+        p = width
+        r = self.n_components
+        F = math.fsum
+        Z = []
+        try:
+            for i in range(n):
+                row = []
+                for c in range(r):
+                    value = F(X[i][j] * V[c][j] for j in range(p))
+                    if not math.isfinite(value):
+                        raise FloatingPointError(
+                            "non-finite value encountered during transform"
+                        )
+                    row.append(_positive_zero(value))
+                Z.append(row)
+        except (OverflowError, ValueError, ZeroDivisionError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during transform"
+            ) from exc
+        return Z
+
+    def inverse_transform(self, Z) -> list[list[float]]:
+        """Return a brand-new feature-space matrix reconstructed from
+        the coefficient rows of ``Z`` and the fitted ``V``."""
+        if self.components_ is None or self.n_features_in_ is None:
+            raise ValueError(
+                "TruncatedSVD must be fitted before inverse_transform"
+                " is called"
+            )
+        if not isinstance(Z, list) or len(Z) == 0:
+            raise ValueError("Z must be a non-empty list of rows")
+        width = None
+        for row in Z:
+            if not isinstance(row, list) or len(row) == 0:
+                raise ValueError("Z rows must be non-empty lists")
+            if width is None:
+                width = len(row)
+            elif len(row) != width:
+                raise ValueError("Z must be rectangular")
+            for value in row:
+                if type(value) is int:
+                    continue
+                if type(value) is float and math.isfinite(value):
+                    continue
+                raise ValueError(
+                    "Z must contain only finite non-boolean numbers"
+                )
+        if width != self.n_components:
+            raise ValueError(
+                "Z must have the same number of columns as n_components"
+            )
+
+        V = self.components_
+        n = len(Z)
+        p = self.n_features_in_
+        r = self.n_components
+        F = math.fsum
+        X = []
+        try:
+            for i in range(n):
+                row = []
+                for j in range(p):
+                    value = F(Z[i][c] * V[c][j] for c in range(r))
+                    if not math.isfinite(value):
+                        raise FloatingPointError(
+                            "non-finite value encountered during"
+                            " inverse_transform"
+                        )
+                    row.append(_positive_zero(value))
+                X.append(row)
+        except (OverflowError, ValueError, ZeroDivisionError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during inverse_transform"
+            ) from exc
+        return X
 
 
 class NMF:
