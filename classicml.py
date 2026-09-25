@@ -7189,7 +7189,10 @@ class GaussianNB:
     Prediction scores every row for every class in column order with
     ``l = log(prior) - 0.5 * fsum(log(2*pi*v) + (x - mu)**2 / v)`` and
     returns the class with the largest ``l``; ties resolve to the smaller
-    class. No randomness is used and the inputs are never modified.
+    class. ``predict_log_proba`` and ``predict_proba`` instead normalize the
+    per-class log joints of every row into log probabilities and
+    probabilities, with columns in ascending class order. No randomness is
+    used and the inputs are never modified.
     """
 
     def __init__(self, var_smoothing=1e-9):
@@ -7374,6 +7377,202 @@ class GaussianNB:
                     best_log_joint = log_joint
                     best_class = cls
             results.append(best_class)
+        return results
+
+    def _check_proba_matrix(self, X):
+        """Validate a prediction matrix exactly as ``predict`` does and
+        return its column count."""
+        try:
+            width = _check_gradient_matrix(X)
+        except OverflowError as exc:
+            raise ValueError(
+                "X must contain only finite non-boolean numbers"
+            ) from exc
+        if width != self._n_features:
+            raise ValueError(
+                "X must have the same number of features as the training "
+                "data"
+            )
+        return width
+
+    def _row_log_joints(self, row, width):
+        """Return the per-class log joints of one validated row, in class
+        order, using the same computation as ``predict``."""
+        joints = []
+        for k in range(len(self._classes)):
+            terms = []
+            for j in range(width):
+                mean = self._means[k][j]
+                variance = self._variances[k][j]
+                try:
+                    difference = row[j] - mean
+                    squared = difference ** 2
+                    ratio = squared / variance
+                    term = math.log(2 * math.pi * variance) + ratio
+                except (
+                    OverflowError,
+                    ValueError,
+                    ZeroDivisionError,
+                ) as exc:
+                    raise FloatingPointError(
+                        "non-finite value encountered during Gaussian naive "
+                        "Bayes"
+                    ) from exc
+                if not math.isfinite(term):
+                    raise FloatingPointError(
+                        "non-finite value encountered during Gaussian naive "
+                        "Bayes"
+                    )
+                terms.append(_positive_zero(term))
+            try:
+                log_joint = (
+                    math.log(self._priors[k]) - 0.5 * math.fsum(terms)
+                )
+            except (
+                OverflowError,
+                ValueError,
+                ZeroDivisionError,
+            ) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during Gaussian naive "
+                    "Bayes"
+                ) from exc
+            if not math.isfinite(log_joint):
+                raise FloatingPointError(
+                    "non-finite value encountered during Gaussian naive "
+                    "Bayes"
+                )
+            joints.append(_positive_zero(log_joint))
+        return joints
+
+    def predict_log_proba(self, X) -> list[list[float]]:
+        """Return the per-class log probabilities of every row of ``X``.
+
+        The columns follow the fitted classes in ascending order. For each
+        row the log joints ``l`` are computed as in ``predict``; with
+        ``a = max(l)`` and ``s = fsum(exp(l_k - a))`` over the classes in
+        order, each returned value is ``l_k - a - log(s)``.
+        """
+        if self._classes is None:
+            raise ValueError(
+                "model must be fitted before predict_log_proba is called"
+            )
+        width = self._check_proba_matrix(X)
+
+        results = []
+        for row in X:
+            joints = self._row_log_joints(row, width)
+            shift = max(joints)
+            differences = []
+            for joint in joints:
+                try:
+                    difference = joint - shift
+                except (
+                    OverflowError,
+                    ValueError,
+                    ZeroDivisionError,
+                ) as exc:
+                    raise FloatingPointError(
+                        "non-finite value encountered during Gaussian naive "
+                        "Bayes"
+                    ) from exc
+                if not math.isfinite(difference):
+                    raise FloatingPointError(
+                        "non-finite value encountered during Gaussian naive "
+                        "Bayes"
+                    )
+                differences.append(difference)
+            exponentials = []
+            for difference in differences:
+                try:
+                    exponential = math.exp(difference)
+                except (
+                    OverflowError,
+                    ValueError,
+                    ZeroDivisionError,
+                ) as exc:
+                    raise FloatingPointError(
+                        "non-finite value encountered during Gaussian naive "
+                        "Bayes"
+                    ) from exc
+                if not math.isfinite(exponential):
+                    raise FloatingPointError(
+                        "non-finite value encountered during Gaussian naive "
+                        "Bayes"
+                    )
+                exponentials.append(exponential)
+            try:
+                total = math.fsum(exponentials)
+                log_total = math.log(total)
+            except (
+                OverflowError,
+                ValueError,
+                ZeroDivisionError,
+            ) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during Gaussian naive "
+                    "Bayes"
+                ) from exc
+            if not math.isfinite(total) or not math.isfinite(log_total):
+                raise FloatingPointError(
+                    "non-finite value encountered during Gaussian naive "
+                    "Bayes"
+                )
+            log_probabilities = []
+            for difference in differences:
+                try:
+                    log_probability = difference - log_total
+                except (
+                    OverflowError,
+                    ValueError,
+                    ZeroDivisionError,
+                ) as exc:
+                    raise FloatingPointError(
+                        "non-finite value encountered during Gaussian naive "
+                        "Bayes"
+                    ) from exc
+                if not math.isfinite(log_probability):
+                    raise FloatingPointError(
+                        "non-finite value encountered during Gaussian naive "
+                        "Bayes"
+                    )
+                log_probabilities.append(_positive_zero(log_probability))
+            results.append(log_probabilities)
+        return results
+
+    def predict_proba(self, X) -> list[list[float]]:
+        """Return the per-class probabilities of every row of ``X``.
+
+        Each value is ``math.exp`` of the corresponding entry of
+        ``predict_log_proba``; the columns follow the fitted classes in
+        ascending order.
+        """
+        if self._classes is None:
+            raise ValueError(
+                "model must be fitted before predict_proba is called"
+            )
+        results = []
+        for log_probabilities in self.predict_log_proba(X):
+            probabilities = []
+            for log_probability in log_probabilities:
+                try:
+                    probability = math.exp(log_probability)
+                except (
+                    OverflowError,
+                    ValueError,
+                    ZeroDivisionError,
+                ) as exc:
+                    raise FloatingPointError(
+                        "non-finite value encountered during Gaussian naive "
+                        "Bayes"
+                    ) from exc
+                if not math.isfinite(probability):
+                    raise FloatingPointError(
+                        "non-finite value encountered during Gaussian naive "
+                        "Bayes"
+                    )
+                probabilities.append(_positive_zero(probability))
+            results.append(probabilities)
         return results
 
 
