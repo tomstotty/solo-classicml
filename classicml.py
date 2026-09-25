@@ -21230,6 +21230,15 @@ _SERIAL_KEYS_NMF = (
     "n_features_in",
     "components",
 )
+_SERIAL_KEYS_TRUNCATED_SVD = (
+    "class",
+    "n_components",
+    "max_iter",
+    "tol",
+    "n_features_in",
+    "components",
+    "singular_values",
+)
 _SERIAL_KEYS_FOREST = (
     "class",
     "n_estimators",
@@ -22088,6 +22097,185 @@ def _dumps_nmf(model):
     )
 
 
+def _quantize_svd_number(value, name, positive=False, require_equal=False):
+    """Quantize a TruncatedSVD value to its canonical 12-decimal JSON form.
+
+    The value must have type exactly ``int`` or ``float`` (booleans and
+    subclasses rejected); a float must be finite and (when ``positive``)
+    strictly greater than zero, while an int may have arbitrary magnitude
+    but must be strictly positive when requested. Quantization is
+    ``Decimal(str(v)).quantize(1E-12, ROUND_HALF_UP)`` with the value
+    never passed through ``float`` first; negative zero normalizes to
+    ``0.000000000000``. The fixed text must convert back with ``float``
+    to a finite value; strictly positive parameters must remain strictly
+    positive after quantization, and when ``require_equal`` is set (the
+    fitted-state arrays) the converted float must equal the original
+    value exactly.
+    """
+    if isinstance(value, bool) or type(value) not in (int, float):
+        raise ValueError("%s must be a finite non-boolean int or float" % name)
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError(
+                "%s must be a finite non-boolean int or float" % name
+            )
+        if positive and value <= 0.0:
+            raise ValueError("%s must be greater than 0" % name)
+    elif positive and value <= 0:
+        raise ValueError("%s must be greater than 0" % name)
+    token = str(value)
+    try:
+        with localcontext() as ctx:
+            ctx.prec = max(400, len(token.lstrip("-")) + 50)
+            quantized = Decimal(token).quantize(
+                _QUANTUM12, rounding=ROUND_HALF_UP
+            )
+    except (ArithmeticError, ValueError) as exc:
+        raise ValueError(
+            "%s must be a finite non-boolean int or float" % name
+        ) from exc
+    if positive and quantized <= 0:
+        raise ValueError(
+            "%s must remain positive after quantization to 12 decimals"
+            % name
+        )
+    text = "0.000000000000" if quantized == 0 else format(quantized, "f")
+    try:
+        converted = float(text)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError(
+            "%s fixed text must convert to a finite float" % name
+        ) from exc
+    if not math.isfinite(converted):
+        raise ValueError(
+            "%s fixed text must convert to a finite float" % name
+        )
+    if require_equal and converted != value:
+        raise ValueError(
+            "%s value does not round-trip at 12 decimal places" % name
+        )
+    return text
+
+
+def _dumps_truncated_svd(model):
+    """Serialize a fitted TruncatedSVD.
+
+    The top-level keys are ``class``, ``n_components``, ``max_iter``,
+    ``tol``, ``n_features_in``, ``components``, ``singular_values`` in
+    that order; ``class`` is ``"TruncatedSVD"``. ``n_components``,
+    ``max_iter`` and ``n_features_in`` are positive JSON integers.
+    ``tol`` is a finite non-boolean strictly positive exact int/float
+    and every element of ``components`` (a non-empty rectangular
+    ``n_components`` by ``n_features_in`` matrix) and
+    ``singular_values`` (a length-``n_components`` vector) is a finite
+    non-boolean exact int/float, with every singular value strictly
+    positive. ``tol`` and the array entries are quantized to 12 decimal
+    places via ``Decimal(str(v))`` with ROUND_HALF_UP (negative zero
+    becomes ``0.000000000000``); the quantized ``tol`` must stay
+    positive, and every fixed array text must convert back with
+    ``float`` to exactly the original value.
+    """
+    components = model.components_
+    singular_values = model.singular_values_
+    n_features_in = model.n_features_in_
+    if (
+        components is None
+        or singular_values is None
+        or n_features_in is None
+    ):
+        raise ValueError(
+            "TruncatedSVD must be fitted before dumps is called"
+        )
+
+    n_components = model.n_components
+    max_iter = model.max_iter
+    tol = model.tol
+    # Re-validate the construction parameters exactly as __init__ does.
+    if (
+        type(n_components) is not int
+        or n_components <= 0
+        or type(max_iter) is not int
+        or max_iter <= 0
+        or isinstance(tol, bool)
+        or not isinstance(tol, (int, float))
+    ):
+        raise ValueError(
+            "TruncatedSVD has invalid construction parameters"
+        )
+    try:
+        tol_finite = math.isfinite(tol)
+    except OverflowError:
+        tol_finite = False
+    if not tol_finite or tol <= 0:
+        raise ValueError(
+            "TruncatedSVD has invalid construction parameters"
+        )
+
+    if type(n_features_in) is not int or n_features_in <= 0:
+        raise ValueError("n_features_in must be a positive integer")
+    if not isinstance(components, list) or len(components) != n_components:
+        raise ValueError(
+            "components_ must have n_components non-empty rows"
+        )
+
+    rows_text = []
+    for row in components:
+        if not isinstance(row, list) or len(row) != n_features_in:
+            raise ValueError(
+                "components_ must be a rectangular n_components by "
+                "n_features_in matrix"
+            )
+        rows_text.append(
+            "["
+            + ",".join(
+                _quantize_svd_number(
+                    value, "components_ element", require_equal=True
+                )
+                for value in row
+            )
+            + "]"
+        )
+    components_text = "[" + ",".join(rows_text) + "]"
+
+    if not isinstance(singular_values, list) or len(
+        singular_values
+    ) != n_components:
+        raise ValueError(
+            "singular_values_ must have n_components entries"
+        )
+    singular_text = (
+        "["
+        + ",".join(
+            _quantize_svd_number(
+                value,
+                "singular_values_ element",
+                positive=True,
+                require_equal=True,
+            )
+            for value in singular_values
+        )
+        + "]"
+    )
+
+    tol_text = _quantize_svd_number(tol, "tol", positive=True)
+
+    return (
+        '{"class":"TruncatedSVD","n_components":'
+        + str(n_components)
+        + ',"max_iter":'
+        + str(max_iter)
+        + ',"tol":'
+        + tol_text
+        + ',"n_features_in":'
+        + str(n_features_in)
+        + ',"components":'
+        + components_text
+        + ',"singular_values":'
+        + singular_text
+        + "}"
+    )
+
+
 def dumps(model):
     """Serialize a fitted KMeans, PCA, LinearRegression,
     LogisticRegression, LassoRegression, ElasticNetRegression,
@@ -22098,7 +22286,8 @@ def dumps(model):
     GradientBoostingRegressor, GradientBoostingClassifier,
     GaussianMixture, KNeighborsRegressor,
     KNeighborsClassifier, AgglomerativeClustering, DBSCAN,
-    IsolationForest, KMedoids, or NMF model to compact JSON text.
+    IsolationForest, KMedoids, NMF, or TruncatedSVD model to compact
+    JSON text.
 
     The result contains no whitespace and no trailing newline. Integers
     (``n_clusters``, ``max_iter``, ``seed``, ``n_features_in``) are emitted
@@ -22344,6 +22533,22 @@ def dumps(model):
     ``float`` first; negative zero becomes ``0.000000000000``); the
     quantized ``tol`` must remain positive and every fixed text must
     convert back with ``float`` to a finite value.
+
+    For TruncatedSVD the top-level keys are ``class``,
+    ``n_components``, ``max_iter``, ``tol``, ``n_features_in``,
+    ``components``, ``singular_values`` in that order; ``class`` is
+    ``"TruncatedSVD"``. ``n_components``, ``max_iter`` and
+    ``n_features_in`` are positive JSON integers. ``tol`` is a
+    strictly positive finite exact int/float (booleans rejected),
+    ``components`` is a non-empty rectangular ``n_components`` by
+    ``n_features_in`` matrix and ``singular_values`` is a vector of
+    length ``n_components`` whose entries are finite non-boolean exact
+    ints or floats, each strictly positive. ``tol`` and every array
+    element are quantized to 12 decimal places via
+    ``Decimal(str(v))`` with ROUND_HALF_UP (never through ``float``
+    first; negative zero becomes ``0.000000000000``); the quantized
+    ``tol`` must remain positive, and the fixed array text must
+    convert back with ``float`` to exactly the original value.
     """
     if isinstance(model, KMeans):
         try:
@@ -22553,6 +22758,14 @@ def dumps(model):
         except Exception as exc:
             raise ValueError("invalid NMF state") from exc
 
+    if isinstance(model, TruncatedSVD):
+        try:
+            return _dumps_truncated_svd(model)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("invalid TruncatedSVD state") from exc
+
     raise ValueError(
         "dumps only supports fitted KMeans, PCA, LinearRegression, "
         "LogisticRegression, LassoRegression, ElasticNetRegression, "
@@ -22564,7 +22777,7 @@ def dumps(model):
         "GradientBoostingClassifier, "
         "GaussianMixture, KNeighborsRegressor, "
         "KNeighborsClassifier, AgglomerativeClustering, DBSCAN, "
-        "IsolationForest, KMedoids, and NMF models"
+        "IsolationForest, KMedoids, NMF, and TruncatedSVD models"
     )
 
 
@@ -25233,6 +25446,81 @@ def _load_nmf(pairs):
     return model
 
 
+def _load_truncated_svd(pairs):
+    keys = tuple(key for key, _ in pairs)
+    if keys != _SERIAL_KEYS_TRUNCATED_SVD:
+        raise ValueError(
+            "TruncatedSVD JSON must have exactly the serialized keys "
+            "in the serialized order"
+        )
+    data = _convert(pairs)
+
+    class_name = data["class"]
+    if not isinstance(class_name, str) or class_name != "TruncatedSVD":
+        raise ValueError('class must be "TruncatedSVD"')
+
+    n_components = _expect_int(data["n_components"], "n_components")
+    max_iter = _expect_int(data["max_iter"], "max_iter")
+    n_features = _expect_int(data["n_features_in"], "n_features_in")
+    if n_components <= 0:
+        raise ValueError("n_components must be greater than 0")
+    if max_iter <= 0:
+        raise ValueError("max_iter must be greater than 0")
+    if n_features <= 0:
+        raise ValueError("n_features_in must be greater than 0")
+
+    tol = _expect_fixed12(data["tol"], "tol")
+    if tol <= 0.0:
+        raise ValueError("tol must be greater than 0")
+
+    components_node = data["components"]
+    if not isinstance(
+        components_node, list
+    ) or len(components_node) != n_components:
+        raise ValueError("components must have n_components rows")
+    components = []
+    for row in components_node:
+        if not isinstance(row, list) or len(row) != n_features:
+            raise ValueError(
+                "components must be a rectangular n_components by "
+                "n_features_in matrix"
+            )
+        components.append(
+            [
+                _expect_fixed12(value, "components element")
+                for value in row
+            ]
+        )
+
+    singular_node = data["singular_values"]
+    if not isinstance(singular_node, list) or len(
+        singular_node
+    ) != n_components:
+        raise ValueError(
+            "singular_values must have n_components entries"
+        )
+    singular_values = []
+    for value in singular_node:
+        singular = _expect_fixed12(value, "singular_values element")
+        if singular <= 0.0:
+            raise ValueError(
+                "singular_values elements must be greater than 0"
+            )
+        singular_values.append(singular)
+
+    model = TruncatedSVD(
+        n_components=n_components,
+        max_iter=max_iter,
+        tol=tol,
+    )
+    # Fresh nested lists so the fitted state never shares storage with the
+    # parsed payload.
+    model.components_ = [list(row) for row in components]
+    model.singular_values_ = list(singular_values)
+    model.n_features_in_ = n_features
+    return model
+
+
 def _load_knn_regressor(pairs):
     keys = tuple(key for key, _ in pairs)
     if keys != _SERIAL_KEYS_KNN_REGRESSOR:
@@ -25478,14 +25766,15 @@ def loads(text):
     RandomForestRegressor, ExtraTreesRegressor, AdaBoostClassifier,
     GradientBoostingRegressor, GradientBoostingClassifier,
     GaussianMixture, KNeighborsRegressor, KNeighborsClassifier,
-    AgglomerativeClustering, DBSCAN, IsolationForest, KMedoids, or NMF
+    AgglomerativeClustering, DBSCAN, IsolationForest, KMedoids, NMF, or
+    TruncatedSVD
     from text produced by dumps.
 
     Only the exact byte format emitted by :func:`dumps` is accepted: a
     ``str`` holding compact JSON with no whitespace, no duplicate keys,
     the exact key sets in order, JSON integers for integer parameters,
     10-decimal fixed-point numbers for floats (12-decimal for
-    GaussianMixture and NMF), and consistent array shapes. Anything else --
+    GaussianMixture, NMF, and TruncatedSVD), and consistent array shapes. Anything else --
     including non-str input (str subclasses included), empty strings,
     parse failures, booleans, exponent notation, non-finite values, or
     illegal parameters -- raises ValueError. The returned model is
@@ -25546,6 +25835,16 @@ def loads(text):
     matrix whose elements are finite non-negative fixed 12-decimal
     numbers; the restored model is fitted and its rows are copied
     rather than shared, so ``transform`` works and mutating the parsed
+    data can never reach the model.
+    TruncatedSVD is reconstructed from ``n_components``, ``max_iter``,
+    and ``n_features_in`` (all positive JSON integers), a strictly
+    positive fixed 12-decimal ``tol``, a fresh rectangular
+    ``n_components`` by ``n_features_in`` ``components`` matrix of
+    finite fixed 12-decimal numbers, and a fresh ``singular_values``
+    vector of length ``n_components`` whose entries are strictly
+    positive fixed 12-decimal numbers; the restored model is fitted
+    and its lists are copied rather than shared, so
+    ``transform``/``inverse_transform`` work and mutating the parsed
     data can never reach the model.
     The argument is not modified.
     """
@@ -25747,6 +26046,13 @@ def loads(text):
     if class_entry == "NMF":
         try:
             return _load_nmf(pairs)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("malformed serialized model") from exc
+    if class_entry == "TruncatedSVD":
+        try:
+            return _load_truncated_svd(pairs)
         except ValueError:
             raise
         except Exception as exc:
