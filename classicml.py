@@ -225,6 +225,9 @@ Exports:
     nmf -- deterministic non-negative matrix factorization of a
         non-negative finite real matrix by multiplicative updates from
         a seeded random initialization.
+    truncated_svd -- deterministic truncated singular value
+        decomposition of a finite real matrix by power iteration on
+        the Gram matrix with deflation.
     dumps -- serialize a fitted KMeans/PCA/linear/scaler/tree/forest
         model (including MultinomialLogisticRegression,
         AgglomerativeClustering, and DBSCAN) to whitespace-free JSON
@@ -369,6 +372,7 @@ __all__ = [
     "local_outlier_factor_score",
     "optics_clustering",
     "nmf",
+    "truncated_svd",
     "dumps",
     "loads",
 ]
@@ -2973,6 +2977,39 @@ def _check_nmf_matrix(X):
     return width
 
 
+def _check_svd_matrix(X):
+    """Validate a non-empty rectangular matrix of exact ints or finite
+    floats (booleans and subclasses are rejected); an int too large for
+    the finiteness check raises ValueError from the OverflowError it
+    triggers."""
+    if not isinstance(X, list) or len(X) == 0:
+        raise ValueError("X must be a non-empty list of rows")
+    width = None
+    for row in X:
+        if not isinstance(row, list) or len(row) == 0:
+            raise ValueError("X rows must be non-empty lists")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError("X must be rectangular")
+        for value in row:
+            if type(value) not in (int, float):
+                raise ValueError(
+                    "X must contain only finite non-boolean numbers"
+                )
+            try:
+                finite = math.isfinite(value)
+            except OverflowError as exc:
+                raise ValueError(
+                    "X must contain only finite non-boolean numbers"
+                ) from exc
+            if not finite:
+                raise ValueError(
+                    "X must contain only finite non-boolean numbers"
+                )
+    return width
+
+
 def nmf(X, n_components=2, max_iter=200, tol=1e-6, seed=0) -> tuple:
     """Return the tuple ``(W, H)`` of a non-negative matrix
     factorization of ``X``.
@@ -3132,6 +3169,189 @@ def nmf(X, n_components=2, max_iter=200, tol=1e-6, seed=0) -> tuple:
     except (OverflowError, ValueError) as exc:
         raise FloatingPointError(
             "non-finite value encountered during nmf"
+        ) from exc
+
+
+class _SVDValueError(Exception):
+    """Internal carrier for the ``truncated_svd`` conditions that must
+    surface as ValueError rather than FloatingPointError."""
+
+
+def truncated_svd(X, n_components=2, max_iter=100, tol=1e-8) -> tuple:
+    """Return the tuple ``(Z, S, V)`` of a truncated singular value
+    decomposition of ``X``.
+
+    ``X`` must be a non-empty rectangular matrix whose rows are
+    non-empty lists and whose elements have type exactly ``int`` or are
+    finite values of type exactly ``float`` (booleans and subclasses
+    are rejected); an integer too large for the finiteness check raises
+    ValueError from the OverflowError it triggers. ``n_components``
+    and ``max_iter`` must be exact positive integers with
+    ``n_components <= min(len(X), width)``, and ``tol`` must be a
+    finite non-boolean positive number; any violation raises
+    ValueError.
+
+    Let ``n`` and ``p`` be the shape of ``X``, ``r = n_components``
+    and ``F = math.fsum`` with every index summed in ascending order.
+    The Gram matrix is ``B[j][k] = F(X[i][j] * X[i][k] for i)``. Each
+    of the ``r`` components starts from ``v = e_s`` where ``s`` is the
+    smallest index of the largest diagonal entry of ``B`` (no positive
+    diagonal entry raises ValueError). Each round forms
+    ``u_j = F(B[j][k] * v[k] for k)``, divides by
+    ``sqrt(F(u_j ** 2 for j))`` (a zero norm raises ValueError), and
+    flips the sign so that the largest-absolute-value coordinate
+    (smallest index on ties) is positive; a round ends the iteration
+    when the largest absolute coordinate change is at most ``tol``,
+    and at most ``max_iter`` rounds run. With the final ``v`` the
+    unnormalized ``u`` is recomputed, ``lam = F(v_j * u_j for j)`` (a
+    non-positive ``lam`` raises ValueError), and ``v`` and
+    ``sqrt(lam)`` are saved before the synchronous deflation
+    ``B[j][k] -= lam * v[j] * v[k]``. Finally
+    ``Z[i][k] = F(X[i][j] * V[k][j] for j)`` with zero written as
+    ``+0.0``; ``Z`` is ``n`` by ``r``, ``S`` has ``r`` entries and
+    ``V`` is ``r`` by ``p``, all floats. Any OverflowError, ValueError
+    or ZeroDivisionError after validation, or any non-finite value,
+    raises FloatingPointError. ``X`` is not modified, only the
+    standard library is used, and the same arguments always give the
+    same result.
+    """
+    if type(n_components) is not int:
+        raise ValueError("n_components must be an integer")
+    if n_components <= 0:
+        raise ValueError("n_components must be greater than 0")
+    if type(max_iter) is not int:
+        raise ValueError("max_iter must be an integer")
+    if max_iter <= 0:
+        raise ValueError("max_iter must be greater than 0")
+    tol = _checked_parameter(tol, "tol")
+    if tol <= 0:
+        raise ValueError("tol must be greater than 0")
+    width = _check_svd_matrix(X)
+    if n_components > min(len(X), width):
+        raise ValueError(
+            "n_components must not exceed min(len(X), width)"
+        )
+
+    try:
+        n = len(X)
+        p = width
+        B = [
+            [
+                math.fsum(X[i][j] * X[i][k] for i in range(n))
+                for k in range(p)
+            ]
+            for j in range(p)
+        ]
+        for row in B:
+            for value in row:
+                if not math.isfinite(value):
+                    raise FloatingPointError(
+                        "non-finite value encountered "
+                        "during truncated_svd"
+                    )
+        V = []
+        S = []
+        for _ in range(n_components):
+            s = 0
+            for j in range(1, p):
+                if B[j][j] > B[s][s]:
+                    s = j
+            if B[s][s] <= 0.0:
+                raise _SVDValueError(
+                    "B must have a positive diagonal entry"
+                )
+            v = [0.0] * p
+            v[s] = 1.0
+            for _ in range(max_iter):
+                u = [
+                    math.fsum(B[j][k] * v[k] for k in range(p))
+                    for j in range(p)
+                ]
+                for value in u:
+                    if not math.isfinite(value):
+                        raise FloatingPointError(
+                            "non-finite value encountered "
+                            "during truncated_svd"
+                        )
+                norm = math.sqrt(
+                    math.fsum(u[j] ** 2 for j in range(p))
+                )
+                if not math.isfinite(norm):
+                    raise FloatingPointError(
+                        "non-finite value encountered "
+                        "during truncated_svd"
+                    )
+                if norm == 0.0:
+                    raise _SVDValueError(
+                        "zero norm encountered during truncated_svd"
+                    )
+                new_v = [u[j] / norm for j in range(p)]
+                t = 0
+                for j in range(1, p):
+                    if abs(new_v[j]) > abs(new_v[t]):
+                        t = j
+                if new_v[t] < 0.0:
+                    new_v = [-value for value in new_v]
+                delta = 0.0
+                for j in range(p):
+                    change = abs(new_v[j] - v[j])
+                    if change > delta:
+                        delta = change
+                v = new_v
+                if delta <= tol:
+                    break
+            u = [
+                math.fsum(B[j][k] * v[k] for k in range(p))
+                for j in range(p)
+            ]
+            for value in u:
+                if not math.isfinite(value):
+                    raise FloatingPointError(
+                        "non-finite value encountered "
+                        "during truncated_svd"
+                    )
+            lam = math.fsum(v[j] * u[j] for j in range(p))
+            if not math.isfinite(lam):
+                raise FloatingPointError(
+                    "non-finite value encountered "
+                    "during truncated_svd"
+                )
+            if lam <= 0.0:
+                raise _SVDValueError(
+                    "non-positive eigenvalue encountered "
+                    "during truncated_svd"
+                )
+            V.append(v)
+            S.append(math.sqrt(lam))
+            B = [
+                [B[j][k] - lam * v[j] * v[k] for k in range(p)]
+                for j in range(p)
+            ]
+            for row in B:
+                for value in row:
+                    if not math.isfinite(value):
+                        raise FloatingPointError(
+                            "non-finite value encountered "
+                            "during truncated_svd"
+                        )
+        Z = []
+        for i in range(n):
+            row = []
+            for k in range(n_components):
+                value = math.fsum(X[i][j] * V[k][j] for j in range(p))
+                if not math.isfinite(value):
+                    raise FloatingPointError(
+                        "non-finite value encountered "
+                        "during truncated_svd"
+                    )
+                row.append(_positive_zero(value))
+            Z.append(row)
+        return (Z, S, V)
+    except _SVDValueError as exc:
+        raise ValueError(str(exc)) from None
+    except (OverflowError, ValueError, ZeroDivisionError) as exc:
+        raise FloatingPointError(
+            "non-finite value encountered during truncated_svd"
         ) from exc
 
 
@@ -21556,7 +21776,8 @@ def _quantize_nmf_number(value, name, positive=False):
     The value must have type exactly ``int`` or ``float`` (booleans and
     subclasses rejected); a float must be finite and (when ``positive``)
     strictly greater than zero, while an int may have arbitrary magnitude
-    but must be non-negative (or strictly positive). Quantization is
+    but must be non-negative (or strictly positive). A negative value is
+    rejected before quantization. Quantization is
     ``Decimal(str(v)).quantize(1E-12, ROUND_HALF_UP)`` with the value
     never passed through ``float`` first; negative zero normalizes to
     ``0.000000000000``. The fixed text must convert back with ``float``
@@ -21574,6 +21795,8 @@ def _quantize_nmf_number(value, name, positive=False):
             raise ValueError("%s must be greater than 0" % name)
     elif positive and value <= 0:
         raise ValueError("%s must be greater than 0" % name)
+    if not positive and value < 0:
+        raise ValueError("%s must be non-negative" % name)
     token = str(value)
     try:
         with localcontext() as ctx:
