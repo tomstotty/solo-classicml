@@ -42,6 +42,10 @@ Exports:
         single, complete, or average linkage.
     GaussianMixture -- deterministic one-dimensional Gaussian mixture
         model fitted by expectation-maximization from sorted initial means.
+    GaussianNB -- deterministic Gaussian naive Bayes classifier whose
+        per-class, per-feature Gaussian means and population variances
+        are summed with ``math.fsum`` and stabilized by a shared
+        variance smoothing term.
     IsolationForest -- reusable deterministic isolation-forest anomaly
         detector with fit/score_samples/predict and a contamination-
         derived score threshold.
@@ -288,6 +292,7 @@ __all__ = [
     "DBSCAN",
     "AgglomerativeClustering",
     "GaussianMixture",
+    "GaussianNB",
     "IsolationForest",
     "NMF",
     "TruncatedSVD",
@@ -7153,6 +7158,367 @@ class GaussianMixture:
                 "model must be fitted before bic is called"
             )
         return self._information_criterion(X, math.log)
+
+
+class GaussianNB:
+    """Deterministic Gaussian naive Bayes classifier.
+
+    The distinct training labels are taken in ascending class order. For
+    every class and feature column, the mean ``mu`` and population
+    variance ``v`` are accumulated over the rows of that class in input
+    order via ``math.fsum``::
+
+        mu = fsum(x_i) / k
+        v = fsum((x_i - mu) ** 2) / k
+
+    The per-feature variances ``v_all`` of all training rows together
+    are computed the same way, and the shared smoothing term is
+
+        e = var_smoothing * max(1.0, max_j v_all[j]).
+
+    A successful fit stores, in ascending class order, the means, the
+    smoothed variances ``v + e``, the priors ``class_count / n``, and the
+    number of feature columns. ``fit`` clears any previous state first,
+    so a failed fit leaves the model unfitted.
+
+    For a prediction row ``x`` the log posterior of each class (tried in
+    ascending class order) is
+
+        l = log(prior) - 0.5 * fsum_j(log(2*pi*v_j) + (x_j - mu_j)**2 / v_j)
+
+    with the per-column terms accumulated with ``math.fsum`` in column
+    order; the class with the largest ``l`` is returned, with ties going
+    to the smaller class.
+
+    ``var_smoothing`` must be a finite non-boolean number of exactly
+    ``int`` or ``float`` type and strictly greater than zero; any
+    violation (including the ``OverflowError`` raised while checking the
+    finiteness of a huge integer) raises ValueError. Training and
+    prediction matrices must be non-empty lists of non-empty, equally
+    wide lists whose items are exactly ``int`` or finite ``float``; the
+    labels must be a same-length list of exact ``int`` values spanning at
+    least two distinct classes. Predicting from an unfitted model, with
+    an invalid matrix, or with the wrong number of columns raises
+    ValueError. After validation, any conversion or arithmetic
+    (``+``/``-``/``*``/``/``), squaring, ``math.log``, or
+    ``math.fsum`` that raises ``OverflowError``/``ValueError``/
+    ``ZeroDivisionError`` or yields a non-finite value raises
+    FloatingPointError; an exact zero is kept as positive ``0.0``.
+    Inputs are never modified, and the same inputs always give the same
+    result.
+    """
+
+    def __init__(self, var_smoothing=1e-9):
+        if type(var_smoothing) not in (int, float):
+            raise ValueError(
+                "var_smoothing must be a finite non-boolean int or float "
+                "greater than 0"
+            )
+        try:
+            finite = math.isfinite(var_smoothing)
+        except OverflowError as exc:
+            raise ValueError(
+                "var_smoothing must be a finite non-boolean int or float "
+                "greater than 0"
+            ) from exc
+        if not finite or var_smoothing <= 0:
+            raise ValueError(
+                "var_smoothing must be a finite non-boolean int or float "
+                "greater than 0"
+            )
+        self.var_smoothing = var_smoothing
+        self.classes_ = None
+        self.n_features_in_ = None
+        self.priors_ = None
+        self.means_ = None
+        self.variances_ = None
+
+    @staticmethod
+    def _check_matrix(X):
+        """Validate a non-empty rectangular matrix whose items have type
+        exactly ``int`` or ``float`` (booleans and subclasses rejected)
+        and are finite; an ``OverflowError`` raised while checking
+        finiteness of a huge integer is reported as ValueError too."""
+        if not isinstance(X, list) or len(X) == 0:
+            raise ValueError("X must be a non-empty list of rows")
+        width = None
+        for row in X:
+            if not isinstance(row, list) or len(row) == 0:
+                raise ValueError("X rows must be non-empty lists")
+            if width is None:
+                width = len(row)
+            elif len(row) != width:
+                raise ValueError("X must be rectangular")
+            for value in row:
+                if type(value) not in (int, float):
+                    raise ValueError(
+                        "X must contain only finite int or float elements"
+                    )
+                try:
+                    finite = math.isfinite(value)
+                except OverflowError as exc:
+                    raise ValueError(
+                        "X must contain only finite int or float elements"
+                    ) from exc
+                if not finite:
+                    raise ValueError(
+                        "X must contain only finite int or float elements"
+                    )
+        return width
+
+    @staticmethod
+    def _check_labels(y, n):
+        """Validate an integer class-label vector with the same length as
+        X; every element must have type exactly ``int`` (booleans
+        rejected)."""
+        if not isinstance(y, list) or len(y) != n:
+            raise ValueError("y must be a list with the same length as X")
+        for value in y:
+            if type(value) is not int:
+                raise ValueError("y must contain only integers")
+
+    @staticmethod
+    def _mean_and_variance(values):
+        """Return the ``math.fsum`` mean and population variance (sum of
+        squared deviations divided by the count) of values already in
+        input order; any arithmetic failure or non-finite result raises
+        FloatingPointError, and an exact zero is positive ``0.0``."""
+        count = len(values)
+        try:
+            mean = math.fsum(values) / count
+        except (
+            OverflowError,
+            ValueError,
+            ZeroDivisionError,
+        ) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during fitting"
+            ) from exc
+        if not math.isfinite(mean):
+            raise FloatingPointError(
+                "non-finite value encountered during fitting"
+            )
+        if mean == 0.0:
+            mean = 0.0
+        try:
+            variance = (
+                math.fsum((value - mean) ** 2 for value in values) / count
+            )
+        except (
+            OverflowError,
+            ValueError,
+            ZeroDivisionError,
+        ) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during fitting"
+            ) from exc
+        if not math.isfinite(variance) or variance < 0.0:
+            raise FloatingPointError(
+                "non-finite value encountered during fitting"
+            )
+        if variance == 0.0:
+            variance = 0.0
+        return mean, variance
+
+    def fit(self, X, y):
+        # Reset first so a failed fit leaves the model unfitted.
+        self.classes_ = None
+        self.n_features_in_ = None
+        self.priors_ = None
+        self.means_ = None
+        self.variances_ = None
+
+        width = self._check_matrix(X)
+        n = len(X)
+        self._check_labels(y, n)
+        classes = sorted(set(y))
+        if len(classes) < 2:
+            raise ValueError("y must contain at least two distinct classes")
+
+        # Convert only after validation; the inputs are never modified.
+        try:
+            Xf = [[float(value) for value in row] for row in X]
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during fitting"
+            ) from exc
+
+        members = {label: [] for label in classes}
+        for i, label in enumerate(y):
+            members[label].append(i)
+
+        priors = []
+        means = []
+        variances = []
+        for label in classes:
+            indices = members[label]
+            try:
+                prior = len(indices) / n
+            except (
+                OverflowError,
+                ValueError,
+                ZeroDivisionError,
+            ) as exc:
+                raise FloatingPointError(
+                    "non-finite value encountered during fitting"
+                ) from exc
+            if not math.isfinite(prior) or prior <= 0.0:
+                raise FloatingPointError(
+                    "non-finite value encountered during fitting"
+                )
+            priors.append(prior)
+
+            class_means = []
+            class_variances = []
+            for j in range(width):
+                column = [Xf[i][j] for i in indices]
+                mean, variance = self._mean_and_variance(column)
+                class_means.append(mean)
+                class_variances.append(variance)
+            means.append(class_means)
+            variances.append(class_variances)
+
+        global_variances = []
+        for j in range(width):
+            column = [Xf[i][j] for i in range(n)]
+            _, global_variance = self._mean_and_variance(column)
+            global_variances.append(global_variance)
+
+        try:
+            smoothing = float(self.var_smoothing) * max(
+                [1.0] + global_variances
+            )
+        except (
+            OverflowError,
+            ValueError,
+            ZeroDivisionError,
+        ) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during fitting"
+            ) from exc
+        if not math.isfinite(smoothing) or smoothing <= 0.0:
+            raise FloatingPointError(
+                "non-finite value encountered during fitting"
+            )
+
+        smoothed = []
+        for class_variances in variances:
+            smoothed_row = []
+            for variance in class_variances:
+                try:
+                    value = variance + smoothing
+                except (
+                    OverflowError,
+                    ValueError,
+                    ZeroDivisionError,
+                ) as exc:
+                    raise FloatingPointError(
+                        "non-finite value encountered during fitting"
+                    ) from exc
+                if not math.isfinite(value) or value <= 0.0:
+                    raise FloatingPointError(
+                        "non-finite value encountered during fitting"
+                    )
+                smoothed_row.append(value)
+            smoothed.append(smoothed_row)
+
+        self.classes_ = classes
+        self.n_features_in_ = width
+        self.priors_ = priors
+        self.means_ = means
+        self.variances_ = smoothed
+        return self
+
+    def predict(self, X) -> list[int]:
+        """Return the predicted integer class of each row of ``X`` in
+        input order.
+
+        For each row and each fitted class (in ascending class order) the
+        log posterior is
+
+            l = log(prior) - 0.5 * fsum_j(
+                log(2*pi*v_j) + (x_j - mu_j)**2 / v_j
+            )
+
+        with the per-column terms built in column order; the class with
+        the largest ``l`` wins, ties going to the smaller class. The
+        model must be fitted and ``X`` must pass the same validation as
+        in :meth:`fit` with the same number of columns, otherwise
+        ValueError is raised. Any arithmetic failure or non-finite value
+        raises FloatingPointError. The input is not modified.
+        """
+        if self.classes_ is None:
+            raise ValueError("model must be fitted before predict is called")
+        width = self._check_matrix(X)
+        if width != self.n_features_in_:
+            raise ValueError(
+                "X must have the same number of features as the training data"
+            )
+
+        try:
+            Xf = [[float(value) for value in row] for row in X]
+        except (OverflowError, ValueError) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during prediction"
+            ) from exc
+
+        classes = self.classes_
+        priors = self.priors_
+        means = self.means_
+        variances = self.variances_
+
+        try:
+            log_priors = [math.log(prior) for prior in priors]
+        except (
+            OverflowError,
+            ValueError,
+            ZeroDivisionError,
+        ) as exc:
+            raise FloatingPointError(
+                "non-finite value encountered during prediction"
+            ) from exc
+        for log_prior in log_priors:
+            if not math.isfinite(log_prior):
+                raise FloatingPointError(
+                    "non-finite value encountered during prediction"
+                )
+
+        predictions = []
+        for row in Xf:
+            best_class = None
+            best_score = None
+            for c, label in enumerate(classes):
+                try:
+                    terms = []
+                    for j in range(width):
+                        diff = row[j] - means[c][j]
+                        terms.append(
+                            math.log(
+                                2.0 * math.pi * variances[c][j]
+                            )
+                            + diff ** 2 / variances[c][j]
+                        )
+                    score = log_priors[c] - 0.5 * math.fsum(terms)
+                except (
+                    OverflowError,
+                    ValueError,
+                    ZeroDivisionError,
+                ) as exc:
+                    raise FloatingPointError(
+                        "non-finite value encountered during prediction"
+                    ) from exc
+                if not math.isfinite(score):
+                    raise FloatingPointError(
+                        "non-finite value encountered during prediction"
+                    )
+                if score == 0.0:
+                    score = 0.0
+                # Strict comparison preserves the smaller class on ties.
+                if best_score is None or score > best_score:
+                    best_score = score
+                    best_class = label
+            predictions.append(best_class)
+        return predictions
 
 
 def _check_metric_vectors(y_true, y_pred):
